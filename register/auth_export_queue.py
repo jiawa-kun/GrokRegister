@@ -219,6 +219,16 @@ def _run_sso_push_g2(
     log: LogFn,
     durable: bool = True,
 ) -> dict[str, Any]:
+    # 已成功推送过的账号跳过（account_tags.push_sso_g2_ok）
+    try:
+        from account_tags import is_push_ok
+
+        if is_push_ok(channel="sso_g2", email=email or "", sso=sso or ""):
+            log(f"[auth-queue] 跳过 SSO→grok2api（已推送）email={email or '-'}")
+            return {"attempted": False, "ok": True, "skipped": True, "reason": "already_pushed"}
+    except Exception as te:
+        log(f"[auth-queue] push-tag check skip: {te}")
+
     job_id = ""
     sso_fp = ""
     try:
@@ -293,6 +303,18 @@ def _run_sso_push_g2(
                     pass
             return {"attempted": False, "ok": False, "skipped": True}
         log(f"[auth-queue] ✔ SSO→grok2api 成功 mode={up.get('mode')}")
+        try:
+            from account_tags import set_push_tag
+
+            set_push_tag(
+                channel="sso_g2",
+                ok=True,
+                email=email or "",
+                sso=sso or "",
+                detail={"mode": up.get("mode")},
+            )
+        except Exception as te:
+            log(f"[auth-queue] sso_g2 tag write skip: {te}")
         if job_id:
             try:
                 from delivery_store import mark_success
@@ -303,6 +325,18 @@ def _run_sso_push_g2(
         return {"attempted": True, "ok": True, "mode": up.get("mode"), "result": up}
     except Exception as e:
         log(f"[auth-queue] ✘ SSO→grok2api 失败: {e}")
+        try:
+            from account_tags import set_push_tag
+
+            set_push_tag(
+                channel="sso_g2",
+                ok=False,
+                email=email or "",
+                sso=sso or "",
+                error=str(e)[:300],
+            )
+        except Exception:
+            pass
         if job_id:
             try:
                 from delivery_store import mark_failed
@@ -552,19 +586,51 @@ def _maybe_nsfw_and_sub2api(
     except Exception as e:
         log(f"[auth-queue] sub2api export skip: {e}")
     try:
+        from account_tags import is_push_ok, set_push_tag, patch_auth_file_push
         from sub2api_push import push_after_cpa_result
 
-        pr = push_after_cpa_result(mint_result, config=conf, log=log)
-        if pr and pr.get("ok"):
-            log(
-                f"[auth-queue] ✔ Auth→sub2api 推送 OK "
-                f"ok={pr.get('ok_count')} fail={pr.get('failed')}"
-            )
-        elif pr and not pr.get("skipped") and not pr.get("ok"):
-            log(
-                f"[auth-queue] ✘ Auth→sub2api 推送失败 "
-                f"ok={pr.get('ok_count')} fail={pr.get('failed')}"
-            )
+        email_v = str(mint_result.get("email") or "")
+        sso_v = str(sso or "")
+        if is_push_ok(channel="auth_sub2api", email=email_v, sso=sso_v):
+            log(f"[auth-queue] 跳过 Auth→sub2api（已推送）email={email_v or '-'}")
+        else:
+            pr = push_after_cpa_result(mint_result, config=conf, log=log)
+            if pr and pr.get("ok"):
+                log(
+                    f"[auth-queue] ✔ Auth→sub2api 推送 OK "
+                    f"ok={pr.get('ok_count')} fail={pr.get('failed')}"
+                )
+                try:
+                    set_push_tag(
+                        channel="auth_sub2api",
+                        ok=True,
+                        email=email_v,
+                        sso=sso_v,
+                        detail={"ok_count": pr.get("ok_count")},
+                    )
+                    for _p in (
+                        mint_result.get("paths")
+                        or ([mint_result.get("path")] if mint_result.get("path") else [])
+                    ):
+                        if _p:
+                            patch_auth_file_push(_p, channel="auth_sub2api", ok=True)
+                except Exception as te:
+                    log(f"[auth-queue] auth_sub2api tag write skip: {te}")
+            elif pr and not pr.get("skipped") and not pr.get("ok"):
+                log(
+                    f"[auth-queue] ✘ Auth→sub2api 推送失败 "
+                    f"ok={pr.get('ok_count')} fail={pr.get('failed')}"
+                )
+                try:
+                    set_push_tag(
+                        channel="auth_sub2api",
+                        ok=False,
+                        email=email_v,
+                        sso=sso_v,
+                        error=f"ok={pr.get('ok_count')} fail={pr.get('failed')}",
+                    )
+                except Exception:
+                    pass
     except Exception as e:
         log(f"[auth-queue] sub2api push skip: {e}")
 
@@ -587,8 +653,19 @@ def _run_mint_and_auth_push(
         # skip_remote=False 时 mint 成功会按 config 推 CPA；
         # 若未开自动推 CPA，则 skip_remote=True 只写本地
         # require_grok_45=True：无 grok-4.5 的假活 token 不推 CPA
+        # 已推送成功过的账号：仍 mint 本地 auth，但跳过 CPA 远程推送
+        push_cpa_effective = bool(push_cpa)
+        if push_cpa_effective:
+            try:
+                from account_tags import is_push_ok
+
+                if is_push_ok(channel="auth_cpa", email=email or "", sso=sso or ""):
+                    log(f"[auth-queue] 跳过 Auth→CPA 远程推送（已推送）email={email or '-'}")
+                    push_cpa_effective = False
+            except Exception as te:
+                log(f"[auth-queue] cpa push-tag check skip: {te}")
         cpa_job_id = ""
-        if push_cpa and durable:
+        if push_cpa_effective and durable:
             try:
                 from delivery_store import create_job, ensure_retry_worker
                 from sso_ledger import sso_fingerprint
@@ -625,7 +702,7 @@ def _run_mint_and_auth_push(
             email=email,
             proxy=proxy,
             mint_mode=mint_mode,
-            skip_remote=not push_cpa,
+            skip_remote=not push_cpa_effective,
             require_grok_45=True,
             cloudflare_cookies=cloudflare_cookies or "",
             log=log,
@@ -639,9 +716,24 @@ def _run_mint_and_auth_push(
                 f"files={', '.join(str(p) for p in paths if p) or r.get('filename') or '-'}"
             )
             remote = r.get("remote")
-            if push_cpa:
+            if push_cpa_effective:
                 if remote and remote.get("ok"):
                     log(f"[auth-queue] ✔ Auth→CPA 推送 OK name={remote.get('name')}")
+                    try:
+                        from account_tags import set_push_tag, patch_auth_file_push
+
+                        set_push_tag(
+                            channel="auth_cpa",
+                            ok=True,
+                            email=str(r.get("email") or email or ""),
+                            sso=sso or "",
+                            detail={"name": remote.get("name")},
+                        )
+                        for _p in (r.get("paths") or ([r.get("path")] if r.get("path") else [])):
+                            if _p:
+                                patch_auth_file_push(_p, channel="auth_cpa", ok=True)
+                    except Exception as te:
+                        log(f"[auth-queue] auth_cpa tag write skip: {te}")
                     if cpa_job_id:
                         try:
                             from delivery_store import mark_success
@@ -651,6 +743,18 @@ def _run_mint_and_auth_push(
                             pass
                 elif remote and not remote.get("ok"):
                     log(f"[auth-queue] ✘ Auth→CPA 推送失败: {remote.get('error')}")
+                    try:
+                        from account_tags import set_push_tag
+
+                        set_push_tag(
+                            channel="auth_cpa",
+                            ok=False,
+                            email=str(r.get("email") or email or ""),
+                            sso=sso or "",
+                            error=str(remote.get("error") or "cpa push fail")[:300],
+                        )
+                    except Exception:
+                        pass
                     if cpa_job_id:
                         try:
                             from delivery_store import mark_failed
@@ -710,7 +814,7 @@ def _run_mint_and_auth_push(
                         email=email,
                         sso=sso,
                         proxy=proxy,
-                        skip_remote=not push_cpa,
+                        skip_remote=not push_cpa_effective,
                         require_grok_45=True,
                         mint_channel="browser_device",
                         log=log,

@@ -23,6 +23,7 @@ import { Switch } from '@renderer/components/ui/Switch';
 import { PaginationBar } from '@renderer/components/ui/PaginationBar';
 import { BotFlagBadge } from '@renderer/components/domain/BotFlagBadge';
 import { NsfwBadge } from '@renderer/components/domain/NsfwBadge';
+import { PushBadge } from '@renderer/components/domain/PushBadge';
 import { ZdrBadge } from '@renderer/components/domain/ZdrBadge';
 import { useClientPagination } from '@renderer/hooks/useClientPagination';
 import { useToastStore } from '@renderer/store/toastStore';
@@ -109,12 +110,26 @@ type TaskProgress = {
 const PAGE_SIZE_KEY = 'gra-auth-page-size';
 const META_FILTER_KEY = 'gra-auth-meta-filter';
 const STATUS_FILTER_KEY = 'gra-auth-status-filter';
+const PUSH_FILTER_KEY = 'gra-auth-push-filter';
 
 /** 行内标记筛选：全部 / 无sso / 无邮箱 / 待补全 */
 type MetaFilter = 'all' | 'no_sso' | 'no_email' | 'need_fill';
 
 /** 状态列（HTTP）筛选：全部 / 未测 / 200 / 401 / 403 / 其它错误 */
 type StatusFilter = 'all' | 'unprobed' | '200' | '401' | '403' | 'other_err';
+
+/**
+ * 推送状态筛选：
+ * all / cpa_none|ok|fail / s2a_none|ok|fail
+ */
+type PushFilter =
+  | 'all'
+  | 'cpa_none'
+  | 'cpa_ok'
+  | 'cpa_fail'
+  | 's2a_none'
+  | 's2a_ok'
+  | 's2a_fail';
 
 function loadMetaFilter(): MetaFilter {
   try {
@@ -143,6 +158,59 @@ function loadStatusFilter(): StatusFilter {
     /* ignore */
   }
   return 'all';
+}
+
+function loadPushFilter(): PushFilter {
+  try {
+    const v = localStorage.getItem(PUSH_FILTER_KEY);
+    if (
+      v === 'all' ||
+      v === 'cpa_none' ||
+      v === 'cpa_ok' ||
+      v === 'cpa_fail' ||
+      v === 's2a_none' ||
+      v === 's2a_ok' ||
+      v === 's2a_fail'
+    ) {
+      return v;
+    }
+  } catch {
+    /* ignore */
+  }
+  return 'all';
+}
+
+/** 推送 mode 中文标签（toast 用） */
+const PUSH_MODE_LABELS: Record<string, string> = {
+  uploaded: '已上传',
+  reuploaded: '重推',
+  already_pushed: '已推跳过',
+  http_error: 'HTTP错误',
+  biz_error: '业务错误',
+  convert_error: '格式转换失败',
+  missing_file: '缺文件',
+  invalid_json: 'JSON无效',
+  error: '异常'
+};
+
+function formatModeCounts(counts?: Record<string, number> | null): string {
+  if (!counts) return '';
+  const parts = Object.entries(counts)
+    .filter(([, n]) => Number(n) > 0)
+    .sort((a, b) => Number(b[1]) - Number(a[1]))
+    .map(([k, n]) => `${PUSH_MODE_LABELS[k] || k} ${n}`);
+  return parts.length ? parts.join(' · ') : '';
+}
+
+function mergeModeCounts(
+  acc: Record<string, number>,
+  next?: Record<string, number> | null
+): void {
+  if (!next) return;
+  for (const [k, n] of Object.entries(next)) {
+    const v = Number(n) || 0;
+    if (v) acc[k] = (acc[k] || 0) + v;
+  }
 }
 
 export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
@@ -266,6 +334,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   const [emailMasked, setEmailMasked] = useState(() => loadEmailPrivacyMask());
   const [metaFilter, setMetaFilter] = useState<MetaFilter>(() => loadMetaFilter());
   const [statusFilter, setStatusFilter] = useState<StatusFilter>(() => loadStatusFilter());
+  const [pushFilter, setPushFilter] = useState<PushFilter>(() => loadPushFilter());
 
   /** 写入单行重登 stage（列表 + 进度条共用） */
   const setRowReloginStage = useCallback(
@@ -455,8 +524,30 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     if (statusFilter !== 'all') {
       list = list.filter((i) => matchStatusFilter(i, statusFilter));
     }
+    if (pushFilter !== 'all') {
+      list = list.filter((i) => {
+        const cpa = i.authCpaStatus ?? 'none';
+        const s2a = i.authSub2apiStatus ?? 'none';
+        switch (pushFilter) {
+          case 'cpa_none':
+            return cpa === 'none';
+          case 'cpa_ok':
+            return cpa === 'ok';
+          case 'cpa_fail':
+            return cpa === 'fail';
+          case 's2a_none':
+            return s2a === 'none';
+          case 's2a_ok':
+            return s2a === 'ok';
+          case 's2a_fail':
+            return s2a === 'fail';
+          default:
+            return true;
+        }
+      });
+    }
     return list;
-  }, [items, metaFilter, statusFilter, matchStatusFilter]);
+  }, [items, metaFilter, statusFilter, pushFilter, matchStatusFilter]);
 
   const {
     pageSize,
@@ -485,6 +576,16 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     resetPage();
     try {
       localStorage.setItem(STATUS_FILTER_KEY, f);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const changePushFilter = (f: PushFilter) => {
+    setPushFilter(f);
+    resetPage();
+    try {
+      localStorage.setItem(PUSH_FILTER_KEY, f);
     } catch {
       /* ignore */
     }
@@ -1254,7 +1355,8 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     }
   };
 
-  const pushRemoteBatch = async () => {
+  const pushRemoteBatch = async (opts?: { force?: boolean }) => {
+    const force = Boolean(opts?.force);
     const filenames = targetNames();
     if (filenames.length === 0) {
       push({ tone: 'warn', title: '没有可推送的文件' });
@@ -1267,6 +1369,13 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
         description: '请在设置中填写「远程 CPA 地址」与「管理密钥」'
       });
       return;
+    }
+    if (force) {
+      const ok = window.confirm(
+        `【强制重推 CPA】将忽略「已推送」标记，重新上传 ${filenames.length} 条。\n\n` +
+          `成功/失败都会更新推送状态。\n\n继续？`
+      );
+      if (!ok) return;
     }
     const signal = beginBatch('push');
     setProg({
@@ -1283,8 +1392,10 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       const CHUNK = 12;
       let ok = 0;
       let failed = 0;
+      let skipped = 0;
       let remoteUrl = '';
       let cancelled = false;
+      const modeCounts: Record<string, number> = {};
       for (let i = 0; i < filenames.length; i += CHUNK) {
         throwIfAborted(signal);
         const chunk = filenames.slice(i, i + CHUNK);
@@ -1292,10 +1403,13 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
         try {
           const r = await window.api.pushCpaAuthRemote({
             filenames: chunk,
-            concurrency: Math.min(4, chunk.length)
+            concurrency: Math.min(4, chunk.length),
+            force
           });
           ok += r.ok || 0;
           failed += r.failed || 0;
+          skipped += Number(r.skipped || 0);
+          mergeModeCounts(modeCounts, r.modeCounts);
           if (r.remoteUrl) remoteUrl = r.remoteUrl;
         } catch (err) {
           if (isAbortError(err) || signal.aborted) {
@@ -1320,26 +1434,29 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
           current: chunk[chunk.length - 1]
         });
       }
+      const modes = formatModeCounts(modeCounts);
+      const modesHint = modes ? ` · ${modes}` : '';
       if (cancelled || signal.aborted) {
         push({
           tone: 'warn',
-          title: '推送 CPA 已取消',
-          description: `已处理 ${ok + failed}/${filenames.length} · 成功 ${ok} · 失败 ${failed}`
+          title: force ? '强制重推 CPA 已取消' : '推送 CPA 已取消',
+          description: `已处理 ${ok + failed}/${filenames.length} · 成功 ${ok} · 跳过 ${skipped} · 失败 ${failed}${modesHint}`
         });
       } else {
         push({
           tone: failed > 0 ? 'warn' : 'ok',
-          title: '推送 CPA 完成',
-          description: `成功 ${ok} · 失败 ${failed}${remoteUrl ? ` · ${remoteUrl}` : ''}`
+          title: force ? '强制重推 CPA 完成' : '推送 CPA 完成',
+          description: `成功 ${ok} · 跳过 ${skipped} · 失败 ${failed}${modesHint}${remoteUrl ? ` · ${remoteUrl}` : ''}`
         });
       }
+      await reload();
     } catch (err) {
       if (isAbortError(err) || signal.aborted) {
-        push({ tone: 'warn', title: '推送 CPA 已取消' });
+        push({ tone: 'warn', title: force ? '强制重推 CPA 已取消' : '推送 CPA 已取消' });
       } else {
         push({
           tone: 'danger',
-          title: '推送 CPA 失败',
+          title: force ? '强制重推 CPA 失败' : '推送 CPA 失败',
           description: err instanceof Error ? err.message : String(err)
         });
       }
@@ -1349,7 +1466,8 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     }
   };
 
-  const pushSub2apiBatch = async () => {
+  const pushSub2apiBatch = async (opts?: { force?: boolean }) => {
+    const force = Boolean(opts?.force);
     const filenames = targetNames();
     if (filenames.length === 0) {
       push({ tone: 'warn', title: '没有可推送的文件' });
@@ -1362,6 +1480,13 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
         description: '请在设置「推送设置」开启 Auth→sub2api 并填写地址与 Admin Token'
       });
       return;
+    }
+    if (force) {
+      const ok = window.confirm(
+        `【强制重推 S2A】将忽略「已推送」标记，重新上传 ${filenames.length} 条。\n\n` +
+          `成功/失败都会更新推送状态。\n\n继续？`
+      );
+      if (!ok) return;
     }
     const signal = beginBatch('pushS2a');
     setProg({
@@ -1378,8 +1503,10 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       const CHUNK = 12;
       let ok = 0;
       let failed = 0;
+      let skipped = 0;
       let remoteUrl = '';
       let cancelled = false;
+      const modeCounts: Record<string, number> = {};
       for (let i = 0; i < filenames.length; i += CHUNK) {
         throwIfAborted(signal);
         const chunk = filenames.slice(i, i + CHUNK);
@@ -1387,10 +1514,13 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
         try {
           const r = await window.api.pushSub2apiAuthRemote({
             filenames: chunk,
-            concurrency: Math.min(4, chunk.length)
+            concurrency: Math.min(4, chunk.length),
+            force
           });
           ok += r.ok || 0;
           failed += r.failed || 0;
+          skipped += Number(r.skipped || 0);
+          mergeModeCounts(modeCounts, r.modeCounts);
           if (r.remoteUrl) remoteUrl = r.remoteUrl;
         } catch (err) {
           if (isAbortError(err) || signal.aborted) {
@@ -1415,26 +1545,29 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
           current: chunk[chunk.length - 1]
         });
       }
+      const modes = formatModeCounts(modeCounts);
+      const modesHint = modes ? ` · ${modes}` : '';
       if (cancelled || signal.aborted) {
         push({
           tone: 'warn',
-          title: '推送 S2A 已取消',
-          description: `已处理 ${ok + failed}/${filenames.length} · 成功 ${ok} · 失败 ${failed}`
+          title: force ? '强制重推 S2A 已取消' : '推送 S2A 已取消',
+          description: `已处理 ${ok + failed}/${filenames.length} · 成功 ${ok} · 跳过 ${skipped} · 失败 ${failed}${modesHint}`
         });
       } else {
         push({
           tone: failed > 0 ? 'warn' : 'ok',
-          title: '推送 S2A 完成',
-          description: `成功 ${ok} · 失败 ${failed}${remoteUrl ? ` · ${remoteUrl}` : ''}（已转 grok 格式）`
+          title: force ? '强制重推 S2A 完成' : '推送 S2A 完成',
+          description: `成功 ${ok} · 跳过 ${skipped} · 失败 ${failed}${modesHint}${remoteUrl ? ` · ${remoteUrl}` : ''}（已转 grok 格式）`
         });
       }
+      await reload();
     } catch (err) {
       if (isAbortError(err) || signal.aborted) {
-        push({ tone: 'warn', title: '推送 S2A 已取消' });
+        push({ tone: 'warn', title: force ? '强制重推 S2A 已取消' : '推送 S2A 已取消' });
       } else {
         push({
           tone: 'danger',
-          title: '推送 S2A 失败',
+          title: force ? '强制重推 S2A 失败' : '推送 S2A 失败',
           description: err instanceof Error ? err.message : String(err)
         });
       }
@@ -1442,6 +1575,50 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       endBatch('pushS2a');
       window.setTimeout(() => setProg(null), 3000);
     }
+  };
+
+  /** 长按「推送 CPA / S2A」约 650ms → force 重推 */
+  const pushHoldRef = useRef<{
+    timer: ReturnType<typeof setTimeout> | null;
+    fired: boolean;
+    kind: 'push' | 'pushS2a' | null;
+  }>({ timer: null, fired: false, kind: null });
+
+  const clearPushHold = () => {
+    if (pushHoldRef.current.timer) {
+      clearTimeout(pushHoldRef.current.timer);
+      pushHoldRef.current.timer = null;
+    }
+  };
+
+  const onPushPointerDown = (kind: 'push' | 'pushS2a') => {
+    if (busy || filteredItems.length === 0) return;
+    if (kind === 'push' && !remoteReady) return;
+    if (kind === 'pushS2a' && !sub2RemoteReady) return;
+    clearPushHold();
+    pushHoldRef.current.fired = false;
+    pushHoldRef.current.kind = kind;
+    pushHoldRef.current.timer = setTimeout(() => {
+      pushHoldRef.current.fired = true;
+      pushHoldRef.current.timer = null;
+      if (kind === 'push') void pushRemoteBatch({ force: true });
+      else void pushSub2apiBatch({ force: true });
+    }, 650);
+  };
+
+  const onPushPointerUp = (kind: 'push' | 'pushS2a') => {
+    const wasHold = pushHoldRef.current.fired && pushHoldRef.current.kind === kind;
+    clearPushHold();
+    pushHoldRef.current.kind = null;
+    if (wasHold) return;
+    if (busy || filteredItems.length === 0) return;
+    if (kind === 'push') void pushRemoteBatch({ force: false });
+    else void pushSub2apiBatch({ force: false });
+  };
+
+  const onPushPointerLeave = () => {
+    clearPushHold();
+    pushHoldRef.current.kind = null;
   };
 
 
@@ -1817,9 +1994,30 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     }
     return { unprobed, c200, c401, c403, other };
   }, [items, resolveProbe]);
+  const pushCounts = useMemo(() => {
+    let cpaNone = 0;
+    let cpaOk = 0;
+    let cpaFail = 0;
+    let s2aNone = 0;
+    let s2aOk = 0;
+    let s2aFail = 0;
+    for (const i of items) {
+      const cpa = i.authCpaStatus ?? 'none';
+      const s2a = i.authSub2apiStatus ?? 'none';
+      if (cpa === 'ok') cpaOk += 1;
+      else if (cpa === 'fail') cpaFail += 1;
+      else cpaNone += 1;
+      if (s2a === 'ok') s2aOk += 1;
+      else if (s2a === 'fail') s2aFail += 1;
+      else s2aNone += 1;
+    }
+    return { cpaNone, cpaOk, cpaFail, s2aNone, s2aOk, s2aFail };
+  }, [items]);
   const hasActiveMetaFilter = metaFilter !== 'all';
   const hasActiveStatusFilter = statusFilter !== 'all';
-  const hasActiveFilter = hasActiveMetaFilter || hasActiveStatusFilter;
+  const hasActivePushFilter = pushFilter !== 'all';
+  const hasActiveFilter =
+    hasActiveMetaFilter || hasActiveStatusFilter || hasActivePushFilter;
 
   /** 长按「回填SSO」进入 force 覆盖（约 650ms） */
   const backfillHoldRef = useRef<{
@@ -2174,6 +2372,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
             onClear={() => {
               clearMetaFilter();
               changeStatusFilter('all');
+              changePushFilter('all');
             }}
           >
             <FilterSegmentGroup
@@ -2198,6 +2397,56 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 { id: '401', label: '401', count: statusCounts.c401, title: 'HTTP 401 未授权 · 可死者苏生', tone: 'danger' },
                 { id: '403', label: '403', count: statusCounts.c403, title: 'HTTP 403 · 可密码重登', tone: 'danger' },
                 { id: 'other_err', label: '其它', count: statusCounts.other, title: '其它错误码或失败', tone: 'warn' }
+              ]}
+            />
+            <FilterSegmentGroup
+              label="推送"
+              value={pushFilter}
+              onChange={changePushFilter}
+              options={[
+                { id: 'all', label: '全部', count: items.length, title: '不限制推送状态' },
+                {
+                  id: 'cpa_none',
+                  label: 'CPA未推',
+                  count: pushCounts.cpaNone,
+                  title: '尚未推送到 CPA',
+                  tone: 'muted'
+                },
+                {
+                  id: 'cpa_ok',
+                  label: 'CPA已推',
+                  count: pushCounts.cpaOk,
+                  title: 'CPA 推送成功（普通推送会跳过；长按强制重推）',
+                  tone: 'ok'
+                },
+                {
+                  id: 'cpa_fail',
+                  label: 'CPA失败',
+                  count: pushCounts.cpaFail,
+                  title: 'CPA 推送失败，可再次推送',
+                  tone: 'danger'
+                },
+                {
+                  id: 's2a_none',
+                  label: 'S2A未推',
+                  count: pushCounts.s2aNone,
+                  title: '尚未推送到 S2A',
+                  tone: 'muted'
+                },
+                {
+                  id: 's2a_ok',
+                  label: 'S2A已推',
+                  count: pushCounts.s2aOk,
+                  title: 'S2A 推送成功（普通推送会跳过；长按强制重推）',
+                  tone: 'ok'
+                },
+                {
+                  id: 's2a_fail',
+                  label: 'S2A失败',
+                  count: pushCounts.s2aFail,
+                  title: 'S2A 推送失败，可再次推送',
+                  tone: 'danger'
+                }
               ]}
             />
           </FilterBar>
@@ -2378,20 +2627,34 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
               <Button
                 size="sm"
                 className="min-w-[5rem] justify-center tabular-nums"
-                {...batchBtnProps('push', () => void pushRemoteBatch())}
                 disabled={
                   (Boolean(busy) && batchBusy !== 'push') ||
                   (batchBusy !== 'push' && filteredItems.length === 0)
                 }
+                onClick={() => {
+                  if (batchBusy === 'push') cancelBatch('push');
+                }}
+                onPointerDown={(e) => {
+                  if (batchBusy === 'push') return;
+                  if (e.button !== 0) return;
+                  onPushPointerDown('push');
+                }}
+                onPointerUp={() => {
+                  if (batchBusy === 'push') return;
+                  onPushPointerUp('push');
+                }}
+                onPointerLeave={onPushPointerLeave}
+                onPointerCancel={onPushPointerLeave}
                 title={
                   batchBusy === 'push'
                     ? '取消推送 CPA'
                     : remoteReady
-                      ? selected.size > 0
-                        ? `推送 CPA · 已选 ${selected.size} 条`
-                        : hasActiveFilter
-                          ? `推送 CPA · 筛选 ${filteredItems.length} 条`
-                          : '推送 CPA'
+                      ? (selected.size > 0
+                          ? `推送 CPA · 已选 ${selected.size} 条`
+                          : hasActiveFilter
+                            ? `推送 CPA · 筛选 ${filteredItems.length} 条`
+                            : '推送 CPA') +
+                        ' · 长按约 0.6 秒强制重推（忽略已推）'
                       : '请先在设置中配置远程 CPA 地址与密钥'
                 }
               >
@@ -2413,17 +2676,28 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 }
                 onClick={() => {
                   if (batchBusy === 'pushS2a') cancelBatch('pushS2a');
-                  else void pushSub2apiBatch();
                 }}
+                onPointerDown={(e) => {
+                  if (batchBusy === 'pushS2a') return;
+                  if (e.button !== 0) return;
+                  onPushPointerDown('pushS2a');
+                }}
+                onPointerUp={() => {
+                  if (batchBusy === 'pushS2a') return;
+                  onPushPointerUp('pushS2a');
+                }}
+                onPointerLeave={onPushPointerLeave}
+                onPointerCancel={onPushPointerLeave}
                 title={
                   batchBusy === 'pushS2a'
                     ? '取消推送 S2A'
                     : sub2RemoteReady
-                      ? selected.size > 0
-                        ? `推送 S2A · 已选 ${selected.size}`
-                        : hasActiveFilter
-                          ? `推送 S2A · 筛选 ${filteredItems.length}`
-                          : 'CPA auth → 转 grok 格式 → S2A（sub2api）'
+                      ? (selected.size > 0
+                          ? `推送 S2A · 已选 ${selected.size}`
+                          : hasActiveFilter
+                            ? `推送 S2A · 筛选 ${filteredItems.length}`
+                            : 'CPA auth → 转 grok 格式 → S2A（sub2api）') +
+                        ' · 长按约 0.6 秒强制重推（忽略已推）'
                       : '请在设置开启 Auth→sub2api 并填写地址与 Token'
                 }
               >
@@ -2612,6 +2886,19 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                           : statusFilter === 'other_err'
                             ? ' 没有其它错误状态。'
                             : ''}
+          {pushFilter === 'cpa_none'
+            ? ' 没有 CPA 未推送。'
+            : pushFilter === 'cpa_ok'
+              ? ' 没有 CPA 已推送。'
+              : pushFilter === 'cpa_fail'
+                ? ' 没有 CPA 推送失败。'
+                : pushFilter === 's2a_none'
+                  ? ' 没有 S2A 未推送。'
+                  : pushFilter === 's2a_ok'
+                    ? ' 没有 S2A 已推送。'
+                    : pushFilter === 's2a_fail'
+                      ? ' 没有 S2A 推送失败。'
+                      : ''}
           </p>
           {hasActiveFilter && (
             <div className="mt-3">
@@ -2621,6 +2908,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 onClick={() => {
                   clearMetaFilter();
                   changeStatusFilter('all');
+                  changePushFilter('all');
                 }}
               >
                 清空筛选
@@ -2646,6 +2934,24 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 {/* ZDR 列已隐藏
                 <th className="w-[3.5rem] px-2 py-2.5 font-medium">ZDR</th>
                 */}
+                <th
+                  className="w-[2.75rem] px-1 py-2.5 text-center font-medium"
+                  title="SSO → grok2api"
+                >
+                  G2
+                </th>
+                <th
+                  className="w-[2.75rem] px-1 py-2.5 text-center font-medium"
+                  title="Auth → CPA Management"
+                >
+                  CPA
+                </th>
+                <th
+                  className="w-[2.75rem] px-1 py-2.5 text-center font-medium"
+                  title="Auth → sub2api"
+                >
+                  S2A
+                </th>
                 <th className="w-[4.5rem] px-3 py-2.5 font-medium">bot_flag</th>
                 {/* 固定窄列仅放 O/X，避免测活后邻列横向跳动 */}
                 <th className="w-10 whitespace-nowrap px-2 py-2.5 text-center font-medium">
@@ -2795,6 +3101,30 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                       />
                     </td>
                     */}
+                    <td className="w-[2.75rem] min-w-[2.75rem] px-1 py-2.5 text-center">
+                      <PushBadge
+                        label="G2"
+                        status={item.ssoG2Status ?? 'none'}
+                        error={item.ssoG2Error}
+                        at={item.ssoG2At}
+                      />
+                    </td>
+                    <td className="w-[2.75rem] min-w-[2.75rem] px-1 py-2.5 text-center">
+                      <PushBadge
+                        label="CPA"
+                        status={item.authCpaStatus ?? 'none'}
+                        error={item.authCpaError}
+                        at={item.authCpaAt}
+                      />
+                    </td>
+                    <td className="w-[2.75rem] min-w-[2.75rem] px-1 py-2.5 text-center">
+                      <PushBadge
+                        label="S2A"
+                        status={item.authSub2apiStatus ?? 'none'}
+                        error={item.authSub2apiError}
+                        at={item.authSub2apiAt}
+                      />
+                    </td>
                     <td className="w-[4.5rem] min-w-[4.5rem] px-3 py-2.5">
                       <BotFlagBadge
                         flag={

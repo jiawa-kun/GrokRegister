@@ -306,3 +306,165 @@ def patch_auth_file_zdr(path: str | Path, *, closed: bool, error: str = "") -> b
         return True
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# 推送渠道标签：成功后打标，后续同渠道不再重复推送
+# 渠道:
+#   sso_g2        — SSO → grok2api
+#   auth_cpa      — Auth → CPA Management API
+#   auth_sub2api  — Auth → sub2api
+# ---------------------------------------------------------------------------
+PUSH_CHANNELS = ("sso_g2", "auth_cpa", "auth_sub2api")
+
+
+def _push_ok_key(channel: str) -> str:
+    return f"push_{channel}_ok"
+
+
+def _push_at_key(channel: str) -> str:
+    return f"push_{channel}_at"
+
+
+def _push_attempted_key(channel: str) -> str:
+    return f"push_{channel}_attempted"
+
+
+def _push_error_key(channel: str) -> str:
+    return f"push_{channel}_error"
+
+
+def _normalize_push_channel(channel: str) -> str:
+    c = str(channel or "").strip().lower()
+    aliases = {
+        "sso_g2": "sso_g2",
+        "sso-g2": "sso_g2",
+        "grok2api": "sso_g2",
+        "g2": "sso_g2",
+        "auth_cpa": "auth_cpa",
+        "cpa": "auth_cpa",
+        "auth-cpa": "auth_cpa",
+        "auth_sub2api": "auth_sub2api",
+        "sub2api": "auth_sub2api",
+        "auth-sub2api": "auth_sub2api",
+        "s2a": "auth_sub2api",
+    }
+    return aliases.get(c, c)
+
+
+def is_push_ok(*, channel: str, email: str = "", sso: str = "") -> bool:
+    """True = 该渠道已成功推送过，应跳过。"""
+    ch = _normalize_push_channel(channel)
+    if not ch:
+        return False
+    tag = get_tag(email=email, sso=sso)
+    return tag.get(_push_ok_key(ch)) is True
+
+
+def set_push_tag(
+    *,
+    channel: str,
+    ok: bool,
+    email: str = "",
+    sso: str = "",
+    error: str = "",
+    detail: Any = None,
+) -> dict[str, Any]:
+    """写入推送结果。ok=True 后 is_push_ok 为真，后续跳过同渠道推送。"""
+    ch = _normalize_push_channel(channel)
+    if not ch:
+        raise ValueError("set_push_tag requires channel")
+    tag = {
+        _push_ok_key(ch): bool(ok),
+        _push_attempted_key(ch): True,
+        _push_at_key(ch): _now_iso(),
+        _push_error_key(ch): (error or "")[:300] if not ok else "",
+    }
+    if detail is not None:
+        try:
+            tag[f"push_{ch}_detail"] = detail
+        except Exception:
+            pass
+    with _LOCK:
+        data = _load()
+        email_k = str(email or "").strip().lower()
+        if email_k:
+            prev = dict(data["by_email"].get(email_k) or {})
+            prev.update(tag)
+            data["by_email"][email_k] = prev
+        h = sso_hash(sso)
+        if h:
+            prev = dict(data["by_sso_hash"].get(h) or {})
+            prev.update(tag)
+            data["by_sso_hash"][h] = prev
+        if not email_k and not h:
+            raise ValueError("set_push_tag requires email or sso")
+        written = _save(data)
+        tag["_written_to"] = str(written)
+        tag["channel"] = ch
+    return tag
+
+
+def patch_auth_file_push(
+    path: str | Path,
+    *,
+    channel: str,
+    ok: bool,
+    error: str = "",
+) -> bool:
+    """把推送标签写回 CPA auth JSON（不挡主流程）。"""
+    ch = _normalize_push_channel(channel)
+    p = Path(path)
+    if not p.is_file() or not ch:
+        return False
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            return False
+        doc[_push_ok_key(ch)] = bool(ok)
+        doc[_push_attempted_key(ch)] = True
+        doc[_push_at_key(ch)] = _now_iso()
+        if not ok and error:
+            doc[_push_error_key(ch)] = str(error)[:300]
+        elif ok:
+            doc.pop(_push_error_key(ch), None)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(p)
+        return True
+    except Exception:
+        return False
+
+
+def clear_push_tag(*, channel: str, email: str = "", sso: str = "") -> bool:
+    """清除某渠道成功标记（需要强制重推时用）。"""
+    ch = _normalize_push_channel(channel)
+    keys = [
+        _push_ok_key(ch),
+        _push_attempted_key(ch),
+        _push_at_key(ch),
+        _push_error_key(ch),
+        f"push_{ch}_detail",
+    ]
+    with _LOCK:
+        data = _load()
+        changed = False
+        email_k = str(email or "").strip().lower()
+        if email_k and email_k in data.get("by_email", {}):
+            prev = dict(data["by_email"][email_k] or {})
+            for k in keys:
+                if k in prev:
+                    prev.pop(k, None)
+                    changed = True
+            data["by_email"][email_k] = prev
+        h = sso_hash(sso)
+        if h and h in data.get("by_sso_hash", {}):
+            prev = dict(data["by_sso_hash"][h] or {})
+            for k in keys:
+                if k in prev:
+                    prev.pop(k, None)
+                    changed = True
+            data["by_sso_hash"][h] = prev
+        if changed:
+            _save(data)
+        return changed

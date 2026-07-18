@@ -145,6 +145,16 @@ export interface CpaAuthItem {
   zdrError?: string | null;
   /** closed | open | none */
   zdrStatus?: 'closed' | 'open' | 'none';
+  /** 推送状态：ok=成功 / fail=失败 / none=未推送 */
+  ssoG2Status?: 'ok' | 'fail' | 'none';
+  authCpaStatus?: 'ok' | 'fail' | 'none';
+  authSub2apiStatus?: 'ok' | 'fail' | 'none';
+  ssoG2At?: string | null;
+  authCpaAt?: string | null;
+  authSub2apiAt?: string | null;
+  ssoG2Error?: string | null;
+  authCpaError?: string | null;
+  authSub2apiError?: string | null;
 }
 
 export interface CpaAuthListResult {
@@ -208,7 +218,7 @@ export interface CpaAuthBatchResult {
   total: number;
   ok: number;
   failed: number;
-  /** mint 预检跳过（dead/banned/bot_flag） */
+  /** mint 预检跳过（dead/banned/bot_flag）或 already_pushed */
   skipped?: number;
   /** 通过预检进入 mint 的数量 */
   alive?: number;
@@ -225,6 +235,8 @@ export interface CpaAuthBatchResult {
   keep?: number;
   /** 测活死号同步删除的号池 SSO 数 */
   ssoDeleted?: number;
+  /** 推送 mode 分布：uploaded / already_pushed / http_error / … */
+  modeCounts?: Record<string, number>;
   results: CpaAuthBatchResultItem[];
 }
 
@@ -401,18 +413,32 @@ export interface RendererApi {
       filename?: string;
     }
   >;
-  /** 批量推送已有 auth 到远程 CPA（不重新 mint） */
+  /** 批量推送已有 auth 到远程 CPA（不重新 mint）；force=true 忽略 already_pushed */
   pushCpaAuthRemote(input: {
     filenames?: string[];
     paths?: string[];
     concurrency?: number;
-  }): Promise<CpaAuthBatchResult & { remoteConfigured?: boolean; remoteUrl?: string }>;
-  /** 批量推送已有 auth 到 sub2api（先转官方格式再 POST） */
+    force?: boolean;
+  }): Promise<
+    CpaAuthBatchResult & {
+      remoteConfigured?: boolean;
+      remoteUrl?: string;
+      modeCounts?: Record<string, number>;
+    }
+  >;
+  /** 批量推送已有 auth 到 sub2api（先转官方格式再 POST）；force=true 忽略 already_pushed */
   pushSub2apiAuthRemote(input: {
     filenames?: string[];
     paths?: string[];
     concurrency?: number;
-  }): Promise<CpaAuthBatchResult & { remoteConfigured?: boolean; remoteUrl?: string }>;
+    force?: boolean;
+  }): Promise<
+    CpaAuthBatchResult & {
+      remoteConfigured?: boolean;
+      remoteUrl?: string;
+      modeCounts?: Record<string, number>;
+    }
+  >;
   /** 批量删除 CPA auth 文件 */
   deleteCpaAuth(input: {
     filenames?: string[];

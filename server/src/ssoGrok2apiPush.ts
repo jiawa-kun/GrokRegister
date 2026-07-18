@@ -4,6 +4,7 @@
  */
 import { loadSettings } from './settingsStore.js';
 import { resolveRegisterRuntime } from './bot/registerRuntime.js';
+import { setPushTag, loadAccountTags, lookupNsfwTag, isPushOkFromTag } from './accountTags.js';
 import { spawn } from 'child_process';
 
 export type SsoG2PushItem = {
@@ -142,6 +143,7 @@ except Exception as e:
   let ok = 0;
   let failed = 0;
   let skipped = 0;
+  const pushTagsSnapshot = loadAccountTags();
 
   let idx = 0;
   async function worker() {
@@ -161,6 +163,22 @@ except Exception as e:
         failed++;
         continue;
       }
+      // 已成功推送过则跳过（与 Python is_push_ok 对齐）
+      {
+        const tag = lookupNsfwTag(pushTagsSnapshot, { email, sso });
+        if (isPushOkFromTag(tag, 'sso_g2')) {
+          skipped++;
+          results[i] = {
+            ok: true,
+            skipped: true,
+            error: 'already_pushed',
+            email,
+            id,
+            mode: 'already_pushed'
+          };
+          continue;
+        }
+      }
       try {
         const r = await runPythonJson(
           runtime!.pythonPath,
@@ -170,6 +188,11 @@ except Exception as e:
         );
         if (r.ok === true) {
           ok++;
+          try {
+            setPushTag({ channel: 'sso_g2', ok: true, email, sso });
+          } catch {
+            /* ignore */
+          }
           results[i] = {
             ok: true,
             email,
@@ -187,6 +210,17 @@ except Exception as e:
           };
         } else {
           failed++;
+          try {
+            setPushTag({
+              channel: 'sso_g2',
+              ok: false,
+              email,
+              sso,
+              error: String(r.error || 'push failed')
+            });
+          } catch {
+            /* ignore */
+          }
           results[i] = {
             ok: false,
             error: String(r.error || 'push failed'),
@@ -196,9 +230,15 @@ except Exception as e:
         }
       } catch (err) {
         failed++;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        try {
+          setPushTag({ channel: 'sso_g2', ok: false, email, sso, error: errMsg });
+        } catch {
+          /* ignore */
+        }
         results[i] = {
           ok: false,
-          error: err instanceof Error ? err.message : String(err),
+          error: errMsg,
           email,
           id
         };

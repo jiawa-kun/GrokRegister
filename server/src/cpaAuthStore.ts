@@ -17,8 +17,12 @@ import {
   loadAccountTags,
   lookupNsfwTag,
   zdrStatusFromTag,
-  nsfwStatusFromTag
+  nsfwStatusFromTag,
+  allPushStatusesFromTag,
+  isPushOkFromTag,
+  setPushTag
 } from './accountTags.js';
+import type { AccountTagEntry } from './accountTags.js';
 
 /**
  * Normalize Admin secret pasted from sub2api UI.
@@ -117,6 +121,16 @@ export interface CpaAuthItem {
   zdrError?: string | null;
   /** closed | open | none */
   zdrStatus?: 'closed' | 'open' | 'none';
+  /** 推送状态：ok=成功 / fail=失败 / none=未推送 */
+  ssoG2Status?: 'ok' | 'fail' | 'none';
+  authCpaStatus?: 'ok' | 'fail' | 'none';
+  authSub2apiStatus?: 'ok' | 'fail' | 'none';
+  ssoG2At?: string | null;
+  authCpaAt?: string | null;
+  authSub2apiAt?: string | null;
+  ssoG2Error?: string | null;
+  authCpaError?: string | null;
+  authSub2apiError?: string | null;
 }
 
 /** 规范化 SSO cookie / JWT 文本后做 SHA-256 hex */
@@ -506,6 +520,41 @@ export async function listCpaAuth(): Promise<{ dir: string; items: CpaAuthItem[]
         : zdrClosed
           ? 'closed'
           : 'open';
+      const sideTag = lookupNsfwTag(accountTags, {
+        email: emailStr,
+        ssoHash: ssoHash || undefined
+      });
+      // auth JSON 内 push_* 字段作回退（侧车优先）
+      const fileTag: AccountTagEntry = {
+        push_sso_g2_ok: data.push_sso_g2_ok === true,
+        push_sso_g2_attempted: data.push_sso_g2_attempted === true,
+        push_sso_g2_at:
+          typeof data.push_sso_g2_at === 'string' ? data.push_sso_g2_at : undefined,
+        push_sso_g2_error:
+          typeof data.push_sso_g2_error === 'string'
+            ? data.push_sso_g2_error
+            : undefined,
+        push_auth_cpa_ok: data.push_auth_cpa_ok === true,
+        push_auth_cpa_attempted: data.push_auth_cpa_attempted === true,
+        push_auth_cpa_at:
+          typeof data.push_auth_cpa_at === 'string' ? data.push_auth_cpa_at : undefined,
+        push_auth_cpa_error:
+          typeof data.push_auth_cpa_error === 'string'
+            ? data.push_auth_cpa_error
+            : undefined,
+        push_auth_sub2api_ok: data.push_auth_sub2api_ok === true,
+        push_auth_sub2api_attempted: data.push_auth_sub2api_attempted === true,
+        push_auth_sub2api_at:
+          typeof data.push_auth_sub2api_at === 'string'
+            ? data.push_auth_sub2api_at
+            : undefined,
+        push_auth_sub2api_error:
+          typeof data.push_auth_sub2api_error === 'string'
+            ? data.push_auth_sub2api_error
+            : undefined
+      };
+      const mergedPushTag: AccountTagEntry = { ...fileTag, ...(sideTag || {}) };
+      const pushSt = allPushStatusesFromTag(mergedPushTag);
       items.push({
         filename: name,
         path: full,
@@ -534,6 +583,15 @@ export async function listCpaAuth(): Promise<{ dir: string; items: CpaAuthItem[]
         zdrAt,
         zdrError,
         zdrStatus,
+        ssoG2Status: pushSt.ssoG2Status,
+        authCpaStatus: pushSt.authCpaStatus,
+        authSub2apiStatus: pushSt.authSub2apiStatus,
+        ssoG2At: pushSt.ssoG2At || null,
+        authCpaAt: pushSt.authCpaAt || null,
+        authSub2apiAt: pushSt.authSub2apiAt || null,
+        ssoG2Error: pushSt.ssoG2Error || null,
+        authCpaError: pushSt.authCpaError || null,
+        authSub2apiError: pushSt.authSub2apiError || null,
         ...flags
       });
     } catch {
@@ -958,12 +1016,17 @@ export async function pushCpaAuthRemoteBatch(input: {
   filenames?: string[];
   paths?: string[];
   concurrency?: number;
+  /** true：忽略 already_pushed，强制重新上传 */
+  force?: boolean;
 }): Promise<{
   total: number;
   ok: number;
   failed: number;
+  skipped?: number;
   remoteConfigured: boolean;
   remoteUrl?: string;
+  /** mode 分布：uploaded / already_pushed / http_error / … */
+  modeCounts?: Record<string, number>;
   results: CpaAuthBatchResultItem[];
 }> {
   const settings = await loadSettings();
@@ -1007,8 +1070,11 @@ export async function pushCpaAuthRemoteBatch(input: {
   if (unique.length > 200) throw new Error('单次远程推送最多 200 个');
 
   const concurrency = Math.min(6, Math.max(1, Number(input.concurrency) || 3));
+  const force = Boolean(input.force);
   const results: CpaAuthBatchResultItem[] = [];
   let idx = 0;
+  // 批次开始时快照侧车标签，用于 already_pushed 跳过（force 时忽略）
+  const pushTagsSnapshot = loadAccountTags();
 
   async function worker() {
     while (idx < unique.length) {
@@ -1021,7 +1087,8 @@ export async function pushCpaAuthRemoteBatch(input: {
             ok: false,
             remoteOk: false,
             error: '文件不存在',
-            remoteError: '文件不存在'
+            remoteError: '文件不存在',
+            mode: 'missing_file'
           });
           continue;
         }
@@ -1035,14 +1102,32 @@ export async function pushCpaAuthRemoteBatch(input: {
             ok: false,
             remoteOk: false,
             error: 'JSON 解析失败',
-            remoteError: 'JSON 解析失败'
+            remoteError: 'JSON 解析失败',
+            mode: 'invalid_json'
           });
           continue;
         }
         const email = String(data.email || '');
+        const sso = String(data.sso || '');
         const uploadName = job.filename.endsWith('.json')
           ? job.filename
           : `${job.filename}.json`;
+        // 已成功推送过则跳过（force 时强制重推；与 Python is_push_ok 对齐）
+        if (!force) {
+          const tag = lookupNsfwTag(pushTagsSnapshot, { email, sso });
+          if (isPushOkFromTag(tag, 'auth_cpa')) {
+            results.push({
+              filename: job.filename,
+              email,
+              ok: true,
+              skipped: true,
+              mode: 'already_pushed',
+              remoteOk: true,
+              remoteName: uploadName
+            });
+            continue;
+          }
+        }
         const url = `${base}/v0/management/auth-files?name=${encodeURIComponent(uploadName)}`;
         // 优先直连，失败再走代理（与 sub2api / mail 一致）
         const proxy = resolveHttpProxy(settings);
@@ -1064,6 +1149,11 @@ export async function pushCpaAuthRemoteBatch(input: {
                 ? JSON.stringify(res.data)
                 : '';
           const msg = `HTTP ${res.status}${body ? `: ${body.slice(0, 200)}` : ''}`;
+          try {
+            setPushTag({ channel: 'auth_cpa', ok: false, email, sso, error: msg });
+          } catch {
+            /* ignore */
+          }
           results.push({
             filename: job.filename,
             email,
@@ -1071,25 +1161,39 @@ export async function pushCpaAuthRemoteBatch(input: {
             remoteOk: false,
             remoteError: msg,
             error: msg,
-            remoteName: uploadName
+            remoteName: uploadName,
+            mode: 'http_error'
           });
         } else {
+          try {
+            setPushTag({ channel: 'auth_cpa', ok: true, email, sso });
+          } catch {
+            /* ignore */
+          }
           results.push({
             filename: job.filename,
             email,
             ok: true,
             remoteOk: true,
-            remoteName: uploadName
+            remoteName: uploadName,
+            mode: force ? 'reuploaded' : 'uploaded'
           });
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        try {
+          // email may be unavailable if parse failed earlier
+          setPushTag({ channel: 'auth_cpa', ok: false, email: '', error: msg });
+        } catch {
+          /* ignore */
+        }
         results.push({
           filename: job.filename,
           ok: false,
           remoteOk: false,
           error: msg,
-          remoteError: msg
+          remoteError: msg,
+          mode: 'error'
         });
       }
     }
@@ -1097,12 +1201,24 @@ export async function pushCpaAuthRemoteBatch(input: {
 
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
   const ok = results.filter((r) => r.ok).length;
+  const skipped = results.filter((r) => r.skipped).length;
+  const modeCounts: Record<string, number> = {};
+  for (const r of results) {
+    const m = r.mode || (r.ok ? (r.skipped ? 'already_pushed' : 'uploaded') : 'error');
+    modeCounts[m] = (modeCounts[m] || 0) + 1;
+  }
+  console.log(
+    `[cpa-auth] push-remote total=${results.length} ok=${ok} skipped=${skipped} ` +
+      `failed=${results.length - ok} force=${force} modes=${JSON.stringify(modeCounts)}`
+  );
   return {
     total: results.length,
     ok,
     failed: results.length - ok,
+    skipped,
     remoteConfigured: true,
     remoteUrl: base,
+    modeCounts,
     results
   };
 }
@@ -1116,12 +1232,16 @@ export async function pushSub2apiAuthRemoteBatch(input: {
   filenames?: string[];
   paths?: string[];
   concurrency?: number;
+  /** true：忽略 already_pushed，强制重新上传 */
+  force?: boolean;
 }): Promise<{
   total: number;
   ok: number;
   failed: number;
+  skipped?: number;
   remoteConfigured: boolean;
   remoteUrl?: string;
+  modeCounts?: Record<string, number>;
   results: CpaAuthBatchResultItem[];
 }> {
   const settings = await loadSettings();
@@ -1167,8 +1287,10 @@ export async function pushSub2apiAuthRemoteBatch(input: {
   if (unique.length > 200) throw new Error('单次远程推送最多 200 个');
 
   const concurrency = Math.min(6, Math.max(1, Number(input.concurrency) || 3));
+  const force = Boolean(input.force);
   const results: CpaAuthBatchResultItem[] = [];
   let idx = 0;
+  const pushTagsSnapshot = loadAccountTags();
 
   function normalizeExpiresAt(raw: unknown): string {
     if (raw == null || raw === '') return '';
@@ -1241,7 +1363,8 @@ export async function pushSub2apiAuthRemoteBatch(input: {
             ok: false,
             remoteOk: false,
             error: '文件不存在',
-            remoteError: '文件不存在'
+            remoteError: '文件不存在',
+            mode: 'missing_file'
           });
           continue;
         }
@@ -1255,9 +1378,27 @@ export async function pushSub2apiAuthRemoteBatch(input: {
             ok: false,
             remoteOk: false,
             error: 'JSON 解析失败',
-            remoteError: 'JSON 解析失败'
+            remoteError: 'JSON 解析失败',
+            mode: 'invalid_json'
           });
           continue;
+        }
+        const emailEarly = String(data.email || '');
+        const ssoEarly = String(data.sso || '');
+        if (!force) {
+          const tag = lookupNsfwTag(pushTagsSnapshot, { email: emailEarly, sso: ssoEarly });
+          if (isPushOkFromTag(tag, 'auth_sub2api')) {
+            results.push({
+              filename: job.filename,
+              email: emailEarly,
+              ok: true,
+              skipped: true,
+              mode: 'already_pushed',
+              remoteOk: true,
+              remoteName: emailEarly || job.filename
+            });
+            continue;
+          }
         }
         let body: Record<string, unknown>;
         try {
@@ -1270,7 +1411,8 @@ export async function pushSub2apiAuthRemoteBatch(input: {
             ok: false,
             remoteOk: false,
             error: `格式转换失败: ${msg}`,
-            remoteError: `格式转换失败: ${msg}`
+            remoteError: `格式转换失败: ${msg}`,
+            mode: 'convert_error'
           });
           continue;
         }
@@ -1312,31 +1454,60 @@ export async function pushSub2apiAuthRemoteBatch(input: {
           const msg = !httpOk
             ? `HTTP ${res.status}${respBody ? `: ${respBody.slice(0, 200)}` : ''}`
             : `sub2api code=${bizCode}${bizMsg ? `: ${bizMsg.slice(0, 180)}` : ''}`;
+          try {
+            setPushTag({
+              channel: 'auth_sub2api',
+              ok: false,
+              email,
+              sso: ssoEarly,
+              error: msg
+            });
+          } catch {
+            /* ignore */
+          }
           results.push({
             filename: job.filename,
             email,
             ok: false,
             remoteOk: false,
             remoteError: msg,
-            error: msg
+            error: msg,
+            mode: !httpOk ? 'http_error' : 'biz_error'
           });
         } else {
+          try {
+            setPushTag({
+              channel: 'auth_sub2api',
+              ok: true,
+              email,
+              sso: ssoEarly
+            });
+          } catch {
+            /* ignore */
+          }
           results.push({
             filename: job.filename,
             email,
             ok: true,
             remoteOk: true,
-            remoteName: String(body.name || '')
+            remoteName: String(body.name || ''),
+            mode: force ? 'reuploaded' : 'uploaded'
           });
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        try {
+          setPushTag({ channel: 'auth_sub2api', ok: false, email: '', error: msg });
+        } catch {
+          /* ignore */
+        }
         results.push({
           filename: job.filename,
           ok: false,
           remoteOk: false,
           error: msg,
-          remoteError: msg
+          remoteError: msg,
+          mode: 'error'
         });
       }
     }
@@ -1344,12 +1515,24 @@ export async function pushSub2apiAuthRemoteBatch(input: {
 
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
   const ok = results.filter((r) => r.ok).length;
+  const skipped = results.filter((r) => r.skipped).length;
+  const modeCounts: Record<string, number> = {};
+  for (const r of results) {
+    const m = r.mode || (r.ok ? (r.skipped ? 'already_pushed' : 'uploaded') : 'error');
+    modeCounts[m] = (modeCounts[m] || 0) + 1;
+  }
+  console.log(
+    `[cpa-auth] push-sub2api total=${results.length} ok=${ok} skipped=${skipped} ` +
+      `failed=${results.length - ok} force=${force} modes=${JSON.stringify(modeCounts)}`
+  );
   return {
     total: results.length,
     ok,
     failed: results.length - ok,
+    skipped,
     remoteConfigured: true,
     remoteUrl: base,
+    modeCounts,
     results
   };
 }

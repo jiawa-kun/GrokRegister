@@ -229,26 +229,64 @@ def push_cpa_file(
     token: str = "",
     config: dict[str, Any] | None = None,
     log: Optional[LogFn] = None,
+    force: bool = False,
 ) -> dict[str, Any]:
-    """Convert one CPA auth file and POST to sub2api."""
+    """Convert one CPA auth file and POST to sub2api.
+
+    force=False 时若 account_tags 已标记 push_auth_sub2api_ok 则跳过。
+    """
     log = log or (lambda m: None)
     cfg = config if config is not None else _load_conf()
     url, tok = read_sub2api_remote_config(cfg)
     if base_url:
-        url = _normalize_sub2api_base_url(base_url)
+        url = base_url.strip().rstrip("/")
     if token:
-        tok = _normalize_admin_secret(token)
+        tok = token.strip()
     try:
         body = cpa_path_to_create_body(cpa_path)
     except Exception as e:
         return {"ok": False, "error": f"convert fail: {e}", "path": str(cpa_path)}
+    email = str(body.get("name") or "").strip()
+    if not force:
+        try:
+            from account_tags import is_push_ok, set_push_tag, patch_auth_file_push
+
+            if is_push_ok(channel="auth_sub2api", email=email):
+                log(f"[sub2api] skip already pushed name={email}")
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "already_pushed",
+                    "path": str(cpa_path),
+                    "name": email,
+                }
+        except Exception as te:
+            log(f"[sub2api] push-tag check skip: {te}")
     r = push_account_body(body, base_url=url, token=tok)
     r["path"] = str(cpa_path)
     r["name"] = body.get("name")
     if r.get("ok"):
         log(f"[sub2api] push OK name={body.get('name')} -> {url}")
+        try:
+            from account_tags import set_push_tag, patch_auth_file_push
+
+            set_push_tag(channel="auth_sub2api", ok=True, email=email)
+            patch_auth_file_push(cpa_path, channel="auth_sub2api", ok=True)
+        except Exception as te:
+            log(f"[sub2api] tag write skip: {te}")
     else:
         log(f"[sub2api] push FAIL name={body.get('name')}: {r.get('error')}")
+        try:
+            from account_tags import set_push_tag
+
+            set_push_tag(
+                channel="auth_sub2api",
+                ok=False,
+                email=email,
+                error=str(r.get("error") or "")[:300],
+            )
+        except Exception:
+            pass
     return r
 
 
