@@ -31,7 +31,7 @@
 git clone -b beta https://github.com/MurasameCyan/GrokRegisterAgent.git
 cd GrokRegisterAgent
 cp .env.example .env
-# 按需编辑 .env：邮件 / 端口 / Solver 等
+# 按需编辑 .env：邮件 / 端口 / 初始密码 / 存储加密 / Solver 等
 docker compose up -d --pull always --remove-orphans
 ```
 
@@ -58,13 +58,17 @@ docker compose --profile solver up -d
 http://你的服务器IP:6657
 ```
 
-初始 Web 登录（用户名/密码会打印在日志中，默认常见为 `admin` / `admin`）：
+初始 Web 登录：
+
+- 用户名默认是 `admin`
+- 若设置 `GRA_INITIAL_PASSWORD`，首次密码直接取该值
+- 若未设置 `GRA_INITIAL_PASSWORD`，服务端首次启动会随机生成初始密码，打印到日志，并落盘到 `/data/auth-bootstrap.json`
 
 ```bash
 docker logs grok-register-agent
 ```
 
-首次登录后请修改默认用户名和密码。
+首次登录后必须修改用户名和密码。公网部署建议同时设置 `GRA_MASTER_KEY`，避免敏感配置和账号凭据明文落盘。
 直接用 `http://IP:6657` 访问时，`COOKIE_SECURE` 请留空
 仅 HTTPS 反代时建议 `COOKIE_SECURE=1`
 
@@ -83,6 +87,9 @@ docker logs grok-register-agent
 | `MAIL_DOMAIN` | 可收信域名 |
 | `HTTP_PROXY` / `BROWSER_PROXY` | 可选全局代理（更推荐在 Web「配置」里用 Sing-Box） |
 | `COOKIE_SECURE` | HTTPS 反代时设 `1`；纯 HTTP 留空 |
+| `GRA_INITIAL_PASSWORD` | 可选。指定 Web 控制台首次启动的初始密码；不填则自动生成并写入 `/data/auth-bootstrap.json` |
+| `GRA_MASTER_KEY` | 可选但强烈建议。用于加密 `/data/config.json`、`/data/accounts.json` 中的敏感字段 |
+| `GRA_CONFIG_PATH` | 内部运行时变量。每个注册任务启动时自动指向独立临时配置文件，通常不要在 `.env` 中手工设置 |
 | `TURNSTILE_SOLVER_ENABLED` | `1` 启用外置 Solver 客户端 |
 | `TURNSTILE_SOLVER_URL` | 默认 `http://turnstile-solver:5072` |
 | `TURNSTILE_SOLVER_THREADS` / `BROWSER` | Solver 容器线程与浏览器类型 |
@@ -170,10 +177,20 @@ Plan C  harvest Castle/CF → CreateEmail（可无 castle 继续）→ 邮件码
 | 容器内数据目录 | `/data`（`DATA_DIR`） |
 | 宿主机数据（GHCR compose） | `./data` |
 | 宿主机数据（本地 build） | `docker/data` |
+| Web 初始密码引导文件 | `/data/auth-bootstrap.json` |
+| 服务端设置持久化 | `/data/config.json` |
 | 账号主库 | `/data/accounts.json` |
 | NSFW 侧车标签 | `/data/account_tags.json` |
 | SSO 输出 | `./data/sso` 或 `docker/data/sso` |
-| 配置 | `/app/register/config.json` |
+| Python 基础配置模板 | `/app/register/config.json` |
+| Python 运行时临时配置 | `/app/register/config.runtime.*.json`（由 `GRA_CONFIG_PATH` 指向，任务结束自动清理） |
+
+### 并发运行配置
+
+- Web 设置保存在 `/data/config.json`
+- Python 仍以 `/app/register/config.json` 作为基础模板
+- 每次点击“开始注册”时，Node 会为该次任务生成独立的 `config.runtime.*.json`
+- 子进程通过 `GRA_CONFIG_PATH` 读取这份临时配置，避免并行任务互相覆盖轮数、代理或邮件配置
 
 ---
 

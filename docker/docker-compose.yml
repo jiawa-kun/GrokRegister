@@ -35,6 +35,8 @@ services:
       BROWSER_PROXY: "${BROWSER_PROXY:-}"
       BROWSER_PATH: "/usr/bin/chromium"
       COOKIE_SECURE: "${COOKIE_SECURE:-}"
+      GRA_INITIAL_PASSWORD: "${GRA_INITIAL_PASSWORD:-}"
+      GRA_MASTER_KEY: "${GRA_MASTER_KEY:-}"
       DISPLAY: ":99"
     volumes:
       - ./data:/data
