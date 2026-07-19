@@ -1180,6 +1180,39 @@ def start_browser(*, max_proxy_tries: int | None = None):
 _local_forward_port = 0
 
 
+def _reap_children() -> int:
+    """收掉本进程已退出的子进程（含 defunct chromium），返回收尸次数。"""
+    reaped = 0
+    if platform.system() == "Windows":
+        return 0
+    while True:
+        try:
+            wpid, _st = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        except Exception:
+            break
+        if not wpid:
+            break
+        reaped += 1
+    return reaped
+
+
+def _pid_alive(pid: int) -> bool:
+    pid = int(pid or 0)
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
 def _kill_pid_tree(pid: int) -> None:
     """尽量杀掉本 worker 的 Chromium 树；仅限本进程记录的 pid，避免误杀其它并行任务。"""
     pid = int(pid or 0)
@@ -1198,37 +1231,35 @@ def _kill_pid_tree(pid: int) -> None:
         except Exception:
             pass
         return
+    # 先杀进程组（Drission 启动的 chromium 常成组），再杀主 pid
     try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
+        os.killpg(pid, signal.SIGTERM)
     except Exception:
-        pass
-    deadline = time.time() + 2.0
-    while time.time() < deadline:
         try:
-            os.kill(pid, 0)
+            os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
+            _reap_children()
             return
         except Exception:
-            break
+            pass
+    deadline = time.time() + 2.5
+    while time.time() < deadline:
+        _reap_children()
+        if not _pid_alive(pid):
+            return
         time.sleep(0.05)
     try:
-        os.kill(pid, signal.SIGKILL)
+        os.killpg(pid, signal.SIGKILL)
     except Exception:
-        pass
-    # 收尸，避免 <defunct> 占着 parent
-    for _ in range(10):
         try:
-            wpid, _st = os.waitpid(pid, os.WNOHANG)
-            if wpid == 0:
-                time.sleep(0.05)
-                continue
-            break
-        except ChildProcessError:
-            break
+            os.kill(pid, signal.SIGKILL)
         except Exception:
-            break
+            pass
+    for _ in range(20):
+        _reap_children()
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.05)
 
 
 def stop_browser():
@@ -1241,6 +1272,7 @@ def stop_browser():
             pid = int(getattr(browser, "process_id", 0) or 0)
         except Exception:
             pid = 0
+    profile_dir = str(_chrome_temp_dir or "").strip()
     if browser is not None:
         try:
             # force=True：CDP close 失败时仍按进程杀，避免并行下僵尸残留
@@ -1256,6 +1288,8 @@ def stop_browser():
     page = None
     if pid:
         _kill_pid_tree(pid)
+    else:
+        _reap_children()
     _chrome_process_pid = 0
     _chrome_debug_port = 0
     # 仅停本轮本地代理转发（按 port），避免并发任务互相关闭
@@ -1267,9 +1301,19 @@ def stop_browser():
         _local_forward_port = 0
     except Exception:
         _local_forward_port = 0
-    if _chrome_temp_dir and os.path.isdir(_chrome_temp_dir):
-        shutil.rmtree(_chrome_temp_dir, ignore_errors=True)
+    # profile 可能仍被半死进程占用，重试删除
+    if profile_dir and os.path.isdir(profile_dir):
+        for _ in range(5):
+            try:
+                shutil.rmtree(profile_dir, ignore_errors=False)
+                break
+            except Exception:
+                time.sleep(0.08)
+                _reap_children()
+        else:
+            shutil.rmtree(profile_dir, ignore_errors=True)
     _chrome_temp_dir = ""
+    _reap_children()
 
 
 def restart_browser():

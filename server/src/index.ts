@@ -1818,9 +1818,15 @@ function sLikeEnabled(st: { domain?: string; running?: boolean; lastError?: stri
 async function buildSystemHealth(): Promise<SystemHealth> {
   const checks: SystemHealthCheck[] = [];
   const pushCheck = (check: SystemHealthCheck) => checks.push(check);
+  const settings = await loadSettings();
 
-  pushCheck(await checkRegisterScript());
+  pushCheck(await checkRegisterScript(settings));
   pushCheck(await checkDataDirWritable());
+  pushCheck(await checkDiskSpace());
+  pushCheck(await checkMailConfig(settings));
+  pushCheck(await checkSingBoxHealth(settings));
+  pushCheck(await checkChromiumBinary());
+  pushCheck(checkRegisterJobs());
 
   const summary = checks.reduce(
     (acc, check) => {
@@ -1838,9 +1844,9 @@ async function buildSystemHealth(): Promise<SystemHealth> {
   };
 }
 
-async function checkRegisterScript(): Promise<SystemHealthCheck> {
-  const settings = await loadSettings();
-  const registerDir = registerBot.resolveRegisterDir(settings.registerDir);
+async function checkRegisterScript(settings?: AppSettings): Promise<SystemHealthCheck> {
+  const s = settings || (await loadSettings());
+  const registerDir = registerBot.resolveRegisterDir(s.registerDir);
   const scriptPath = registerDir ? join(registerDir, 'runner.py') : '';
   const legacyScriptPath = registerDir ? join(registerDir, 'DrissionPage_example.py') : '';
   if ((scriptPath && existsSync(scriptPath)) || (legacyScriptPath && existsSync(legacyScriptPath))) {
@@ -1857,7 +1863,7 @@ async function checkRegisterScript(): Promise<SystemHealthCheck> {
     label: 'Python 注册机',
     level: 'warn',
     message: '未找到内置注册脚本，请检查镜像或项目 register/ 目录',
-    detail: settings.registerDir || process.env.REGISTER_DIR || '(未配置 registerDir)'
+    detail: s.registerDir || process.env.REGISTER_DIR || '(未配置 registerDir)'
   };
 }
 
@@ -1881,6 +1887,212 @@ async function checkDataDirWritable(): Promise<SystemHealthCheck> {
       label: '数据目录',
       level: 'error',
       message: '数据目录不可写',
+      detail: err instanceof Error ? err.message : String(err)
+    };
+  }
+}
+
+async function checkDiskSpace(): Promise<SystemHealthCheck> {
+  const targetDir = dataDir();
+  try {
+    const st = await fsp.statfs(targetDir);
+    const bsize = Number(st.bsize || 0);
+    const bavail = Number(st.bavail || 0);
+    const blocks = Number(st.blocks || 0);
+    const freeBytes = bsize > 0 ? bavail * bsize : 0;
+    const totalBytes = bsize > 0 ? blocks * bsize : 0;
+    const freeGb = freeBytes / (1024 * 1024 * 1024);
+    const totalGb = totalBytes / (1024 * 1024 * 1024);
+    const usedPct =
+      totalBytes > 0 ? Math.round(((totalBytes - freeBytes) / totalBytes) * 100) : 0;
+    const detail = `${targetDir} · 剩余 ${freeGb.toFixed(1)}G / 共 ${totalGb.toFixed(1)}G · 已用 ${usedPct}%`;
+    if (freeGb < 1) {
+      return {
+        id: 'disk',
+        label: '磁盘空间',
+        level: 'error',
+        message: `剩余不足 1GB（${freeGb.toFixed(2)}G）`,
+        detail
+      };
+    }
+    if (freeGb < 3 || usedPct >= 90) {
+      return {
+        id: 'disk',
+        label: '磁盘空间',
+        level: 'warn',
+        message: `空间偏紧：剩余 ${freeGb.toFixed(1)}G`,
+        detail
+      };
+    }
+    return {
+      id: 'disk',
+      label: '磁盘空间',
+      level: 'ok',
+      message: `剩余 ${freeGb.toFixed(1)}G`,
+      detail
+    };
+  } catch (err) {
+    return {
+      id: 'disk',
+      label: '磁盘空间',
+      level: 'warn',
+      message: '无法检测磁盘空间',
+      detail: err instanceof Error ? err.message : String(err)
+    };
+  }
+}
+
+async function checkMailConfig(settings: AppSettings): Promise<SystemHealthCheck> {
+  const provider = String(settings.mailProvider || 'cloudflare').toLowerCase();
+  const base = String(settings.mail?.apiBase || '').trim();
+  const auth = String(settings.mail?.adminAuth || '').trim();
+  const domain =
+    String(settings.mail?.domain || '').trim() ||
+    String(settings.mailDomains || '').trim();
+  if (!base) {
+    return {
+      id: 'mail',
+      label: '邮箱后端',
+      level: 'warn',
+      message: '未配置邮箱 API 地址',
+      detail: `provider=${provider}`
+    };
+  }
+  // cloudflare 通常要 adminAuth；其它提供方可能匿名/token 形态不同
+  if (provider === 'cloudflare' && !auth) {
+    return {
+      id: 'mail',
+      label: '邮箱后端',
+      level: 'warn',
+      message: 'Cloudflare 邮箱未填 adminAuth',
+      detail: base
+    };
+  }
+  if (!domain && provider === 'cloudflare') {
+    return {
+      id: 'mail',
+      label: '邮箱后端',
+      level: 'warn',
+      message: '未配置域名/域名池',
+      detail: base
+    };
+  }
+  return {
+    id: 'mail',
+    label: '邮箱后端',
+    level: 'ok',
+    message: `已配置 · ${provider}`,
+    detail: `${base}${domain ? ` · domain=${domain.split(/[\n,]/)[0]}` : ''}`
+  };
+}
+
+async function checkSingBoxHealth(settings: AppSettings): Promise<SystemHealthCheck> {
+  try {
+    const st = getSingBoxStatus(settings);
+    if (!settings.singBoxEnabled) {
+      return {
+        id: 'singbox',
+        label: 'Sing-Box',
+        level: 'ok',
+        message: '未启用（直连）',
+        detail: st.localUrl || undefined
+      };
+    }
+    if (st.running) {
+      return {
+        id: 'singbox',
+        label: 'Sing-Box',
+        level: 'ok',
+        message: `运行中 · ${st.selectedName || st.selected || 'node'}`,
+        detail: `port=${st.port} pid=${st.pid ?? '-'}`
+      };
+    }
+    return {
+      id: 'singbox',
+      label: 'Sing-Box',
+      level: 'warn',
+      message: st.lastError || '已开启但未运行',
+      detail: st.binary || undefined
+    };
+  } catch (err) {
+    return {
+      id: 'singbox',
+      label: 'Sing-Box',
+      level: 'warn',
+      message: '状态读取失败',
+      detail: err instanceof Error ? err.message : String(err)
+    };
+  }
+}
+
+async function checkChromiumBinary(): Promise<SystemHealthCheck> {
+  const candidates = [
+    process.env.CHROME_PATH,
+    process.env.CHROMIUM_PATH,
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable'
+  ].filter(Boolean) as string[];
+  for (const p of candidates) {
+    if (existsSync(p)) {
+      return {
+        id: 'chromium',
+        label: 'Chromium',
+        level: 'ok',
+        message: '浏览器二进制可用',
+        detail: p
+      };
+    }
+  }
+  // Windows 开发机常见路径
+  if (process.platform === 'win32') {
+    return {
+      id: 'chromium',
+      label: 'Chromium',
+      level: 'ok',
+      message: 'Windows 环境（由本机 Chrome 提供）',
+      detail: process.platform
+    };
+  }
+  return {
+    id: 'chromium',
+    label: 'Chromium',
+    level: 'warn',
+    message: '未找到 chromium/chrome 可执行文件',
+    detail: candidates.join(' | ') || '(empty)'
+  };
+}
+
+function checkRegisterJobs(): SystemHealthCheck {
+  try {
+    const jobs = registerBot.listJobs();
+    const active = jobs.filter(
+      (j) => j.phase === 'starting' || j.phase === 'running'
+    ).length;
+    const failed = jobs.reduce((n, j) => n + (j.failed || 0), 0);
+    const success = jobs.reduce((n, j) => n + (j.success || 0), 0);
+    return {
+      id: 'register-jobs',
+      label: '注册任务',
+      level: active > 0 ? 'ok' : 'ok',
+      message:
+        active > 0
+          ? `活跃 ${active} · 成功 ${success} · 失败 ${failed}`
+          : jobs.length
+            ? `无活跃 · 最近 ${jobs.length} 任务 · 成功 ${success} · 失败 ${failed}`
+            : '当前无注册任务',
+      detail: jobs
+        .slice(0, 3)
+        .map((j) => `${j.runId.slice(0, 8)}:${j.phase}`)
+        .join(', ')
+    };
+  } catch (err) {
+    return {
+      id: 'register-jobs',
+      label: '注册任务',
+      level: 'warn',
+      message: '无法读取任务状态',
       detail: err instanceof Error ? err.message : String(err)
     };
   }
