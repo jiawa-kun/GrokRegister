@@ -35,6 +35,8 @@ services:
       COOKIE_SECURE: "${COOKIE_SECURE:-}"
       GRA_INITIAL_PASSWORD: "${GRA_INITIAL_PASSWORD:-}"
       GRA_MASTER_KEY: "${GRA_MASTER_KEY:-}"
+      # 生产建议 1：未设置 GRA_MASTER_KEY 时拒绝启动（避免明文落盘）
+      GRA_REQUIRE_MASTER_KEY: "${GRA_REQUIRE_MASTER_KEY:-1}"
       DISPLAY: ":99"
       # 可选外置 Turnstile Solver（compose --profile solver 时建议打开）
       TURNSTILE_SOLVER_ENABLED: "${TURNSTILE_SOLVER_ENABLED:-0}"

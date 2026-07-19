@@ -22,6 +22,7 @@ import os
 import re
 import secrets
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -29,6 +30,9 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# OAuth redirect_uri 固定端口：并发 browser consent 串行占用 callback
+_OAUTH_CALLBACK_LOCK = threading.Lock()
 
 from curl_cffi import requests
 
@@ -481,6 +485,48 @@ def sso_to_token_via_browser_consent(
         log(f"  ❌ browser consent: DrissionPage unavailable: {e}")
         return None
 
+    # redirect_uri 端口固定（xAI 客户端注册），并发时串行占用 callback 端口
+    got_lock = _OAUTH_CALLBACK_LOCK.acquire(
+        timeout=max(35.0, float(timeout or 55.0) + 5.0)
+    )
+    if not got_lock:
+        log("  ❌ browser consent: OAuth callback port busy (lock timeout)")
+        return None
+    try:
+        return _browser_consent_locked(
+            sso_cookie=sso_cookie,
+            proxy=proxy,
+            headless=headless,
+            timeout=timeout,
+            log=log,
+            cloudflare_cookies=cloudflare_cookies,
+            Chromium=Chromium,
+            ChromiumOptions=ChromiumOptions,
+            BaseHTTPRequestHandler=BaseHTTPRequestHandler,
+            HTTPServer=HTTPServer,
+        )
+    finally:
+        try:
+            _OAUTH_CALLBACK_LOCK.release()
+        except Exception:
+            pass
+
+
+def _browser_consent_locked(
+    *,
+    sso_cookie: str,
+    proxy: str,
+    headless: bool,
+    timeout: float,
+    log,
+    cloudflare_cookies: str,
+    Chromium,
+    ChromiumOptions,
+    BaseHTTPRequestHandler,
+    HTTPServer,
+) -> dict | None:
+    import threading
+
     verifier, challenge, state, nonce = _gen_pkce()
     authorize_params = urllib.parse.urlencode(
         {
@@ -709,6 +755,7 @@ def sso_to_token_via_browser_consent(
     # 代理：禁止裸 set_proxy(user:pass)——Drission 会静默直连 → auth.x.ai 必被 CF 硬拦
     proxy_s = str(proxy or "").strip()
     proxy_mode = "none"
+    local_fwd_port = 0
     if proxy_s:
         applied = False
         try:
@@ -733,8 +780,13 @@ def sso_to_token_via_browser_consent(
                 prefer_local_forward=pref_local,
             )
             proxy_mode = str((res or {}).get("mode") or "unknown")
-            applied = bool(res and res.get("mode"))
+            applied = bool(res and res.get("mode") and res.get("mode") != "error")
             if applied:
+                if proxy_mode == "local_forward":
+                    try:
+                        local_fwd_port = int((res or {}).get("port") or 0)
+                    except Exception:
+                        local_fwd_port = 0
                 log(
                     f"  🔑 browser consent proxy mode={proxy_mode} "
                     f"via={str((res or {}).get('local_proxy') or (res or {}).get('proxy') or '')[:80]}"
@@ -760,6 +812,10 @@ def sso_to_token_via_browser_consent(
                         co.set_proxy(lp)
                         proxy_mode = "local_forward"
                         applied = True
+                        try:
+                            local_fwd_port = int((fr or {}).get("port") or 0)
+                        except Exception:
+                            local_fwd_port = 0
                         log(f"  🔑 browser consent proxy mode=local_forward {lp}")
                 except Exception as e:
                     log(f"  ⚠ browser consent local_forward: {e}")
@@ -1276,6 +1332,13 @@ return (t.innerText || t.value || 'Allow').trim().slice(0, 32);
         if browser is not None:
             try:
                 browser.quit()
+            except Exception:
+                pass
+        if local_fwd_port:
+            try:
+                from proxy_local_forward import stop_local_forward
+
+                stop_local_forward(local_fwd_port)
             except Exception:
                 pass
         try:

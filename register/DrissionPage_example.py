@@ -722,12 +722,14 @@ def _start_browser_once():
     # 每轮从全新浏览器开始，使用独立临时 profile 目录避免 Cookie/Session 复用。
     # 注意：带 user:pass 的代理必须用扩展注入，co.set_proxy 会静默忽略（DrissionPage 限制）。
     global browser, page, _chrome_temp_dir, _current_fingerprint, _browser_proxy, co
+    global _local_forward_port
     if _IS_LINUX:
         _ensure_virtual_display()
 
     # 每轮新 ChromiumOptions，避免认证扩展/指纹在全局对象上累积
     co = _new_chromium_options()
     proxy_apply_result = None
+    _local_forward_port = 0
 
     # 代理池：每轮取一个（先创建 profile 目录，auth 扩展写在其下）
     _chrome_temp_dir = tempfile.mkdtemp(prefix="chrome_run_")
@@ -854,6 +856,10 @@ def _start_browser_once():
                         flush=True,
                     )
                 elif mode == "local_forward":
+                    try:
+                        _local_forward_port = int(proxy_apply_result.get("port") or 0)
+                    except Exception:
+                        _local_forward_port = 0
                     print(
                         f"[proxy] 浏览器代理(本轮/本地转发): "
                         f"{proxy_apply_result.get('local_proxy')} "
@@ -884,6 +890,10 @@ def _start_browser_once():
                     fr = start_local_forward(picked)
                     if fr.get("ok"):
                         try:
+                            _local_forward_port = int(fr.get("port") or 0)
+                        except Exception:
+                            _local_forward_port = 0
+                        try:
                             co.set_proxy(fr["local_proxy"])
                         except Exception:
                             co.set_argument("--proxy-server", fr["local_proxy"])
@@ -895,6 +905,7 @@ def _start_browser_once():
                         proxy_apply_result = {
                             "mode": "local_forward",
                             "local_proxy": fr.get("local_proxy"),
+                            "port": fr.get("port"),
                             "proxy": log_proxy,
                         }
                     else:
@@ -1088,9 +1099,13 @@ def start_browser(*, max_proxy_tries: int | None = None):
     return info["browser"], info["page"]
 
 
+# 本进程当前浏览器绑定的本地转发端口（并发任务互不关闭对方）
+_local_forward_port = 0
+
+
 def stop_browser():
     # 完整关闭整个浏览器实例，并清理本轮临时 profile，供下一轮重新拉起。
-    global browser, page, _chrome_temp_dir
+    global browser, page, _chrome_temp_dir, _local_forward_port
     if browser is not None:
         try:
             browser.quit()
@@ -1098,13 +1113,15 @@ def stop_browser():
             pass
     browser = None
     page = None
-    # 停掉本轮本地代理转发（若有）
+    # 仅停本轮本地代理转发（按 port），避免并发任务互相关闭
     try:
         from proxy_local_forward import stop_local_forward
 
-        stop_local_forward()
+        if _local_forward_port:
+            stop_local_forward(_local_forward_port)
+        _local_forward_port = 0
     except Exception:
-        pass
+        _local_forward_port = 0
     if _chrome_temp_dir and os.path.isdir(_chrome_temp_dir):
         shutil.rmtree(_chrome_temp_dir, ignore_errors=True)
     _chrome_temp_dir = ""

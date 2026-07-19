@@ -16,12 +16,11 @@ from typing import Any
 
 from proxy_auth_ext import parse_proxy_url
 
-_active: dict[str, Any] = {
-    "thread": None,
-    "sock": None,
-    "port": 0,
-    "upstream": "",
-}
+# 多实例：并发注册/mint 各持一个本地转发，互不 stop 对方
+_instances: dict[int, dict[str, Any]] = {}
+_instances_lock = threading.RLock()
+# 兼容旧 API：记录「最近启动」的 port
+_last_port: int = 0
 
 
 def _relay(a: socket.socket, b: socket.socket) -> None:
@@ -139,24 +138,51 @@ def _handle_client(client: socket.socket, upstream: dict[str, Any]) -> None:
             pass
 
 
-def stop_local_forward() -> None:
-    """停止当前本地转发（若有）。"""
-    global _active
-    sock = _active.get("sock")
+def _stop_instance(port: int) -> None:
+    with _instances_lock:
+        inst = _instances.pop(int(port), None)
+    if not inst:
+        return
+    stop_flag = inst.get("stop_flag")
+    if stop_flag is not None:
+        try:
+            stop_flag.set()
+        except Exception:
+            pass
+    sock = inst.get("sock")
     if sock is not None:
         try:
             sock.close()
         except Exception:
             pass
-    _active = {"thread": None, "sock": None, "port": 0, "upstream": ""}
+
+
+def stop_local_forward(port: int | None = None) -> None:
+    """停止本地转发。
+
+    - port 指定：只停该实例（推荐，并发安全）
+    - port 省略：停全部实例（兼容旧调用；浏览器 stop 时用）
+    """
+    global _last_port
+    if port is not None:
+        _stop_instance(int(port))
+        if _last_port == int(port):
+            _last_port = 0
+        return
+    with _instances_lock:
+        ports = list(_instances.keys())
+    for p in ports:
+        _stop_instance(p)
+    _last_port = 0
 
 
 def start_local_forward(upstream_proxy_url: str) -> dict[str, Any]:
     """
     启动本地 127.0.0.1:port 无认证代理，转发到带认证上游。
     返回 {ok, local_proxy, port, error?}
+    不关闭其它实例，支持并发任务各持一条转发。
     """
-    stop_local_forward()
+    global _last_port
     parsed = parse_proxy_url(upstream_proxy_url)
     if not parsed:
         return {"ok": False, "error": "无法解析上游代理"}
@@ -203,21 +229,27 @@ def start_local_forward(upstream_proxy_url: str) -> dict[str, Any]:
             except Exception:
                 continue
 
-    th = threading.Thread(target=accept_loop, daemon=True)
+    th = threading.Thread(target=accept_loop, name=f"proxy-fwd-{port}", daemon=True)
     th.start()
-    _active["thread"] = th
-    _active["sock"] = server
-    _active["port"] = port
-    _active["upstream"] = (
+    upstream = (
         f"{parsed['scheme']}://{parsed['username'][:8]}…:***@"
         f"{parsed['host']}:{parsed['port']}"
     )
+    with _instances_lock:
+        _instances[port] = {
+            "thread": th,
+            "sock": server,
+            "port": port,
+            "upstream": upstream,
+            "stop_flag": stop_flag,
+        }
+        _last_port = port
     local = f"http://127.0.0.1:{port}"
     return {
         "ok": True,
         "local_proxy": local,
         "port": port,
-        "upstream": _active["upstream"],
+        "upstream": upstream,
     }
 
 

@@ -26,7 +26,13 @@ import {
 } from '@shared/settings';
 import type { RunEvent } from '@shared/runEvents';
 import { setAppEventBroadcast } from './appEvents.js';
-import { loadSettings, saveSettings, dataDir, isEncryptionAvailable } from './settingsStore.js';
+import {
+  loadSettings,
+  saveSettings,
+  dataDir,
+  isEncryptionAvailable,
+  maskSettingsForApi
+} from './settingsStore.js';
 import { registerBot } from './bot/registerBot.js';
 import {
   applyAccountSsoChecks,
@@ -285,7 +291,7 @@ app.use('/api', requireApiAuth);
 app.get(
   '/api/settings',
   asyncHandler(async (_req, res) => {
-    res.json(await loadSettings());
+    res.json(maskSettingsForApi(await loadSettings()));
   })
 );
 
@@ -1719,10 +1725,18 @@ httpServer.listen(PORT, HOST, () => {
   console.log(
     `[Grok Register Agent] static UI: ${existsSync(STATIC_ROOT) ? STATIC_ROOT : '(not built)'}`
   );
+  const requireMasterKey =
+    String(process.env.GRA_REQUIRE_MASTER_KEY || '').trim() === '1' ||
+    String(process.env.NODE_ENV || '').toLowerCase() === 'production' ||
+    String(process.env.GRA_ENV || '').toLowerCase() === 'production';
   if (!isEncryptionAvailable()) {
-    console.warn(
-      '[Grok Register Agent] GRA_MASTER_KEY is not set; saved settings/accounts secrets remain plaintext.'
-    );
+    const msg =
+      '[Grok Register Agent] GRA_MASTER_KEY is not set; saved settings/accounts secrets remain plaintext.';
+    if (requireMasterKey) {
+      console.error(msg + ' Refusing to start (GRA_REQUIRE_MASTER_KEY/production).');
+      process.exit(1);
+    }
+    console.warn(msg);
   }
   void authBootstrapInfo().then((info) => {
     console.log(`[Grok Register Agent] web account: ${info.username || info.defaultUsername}`);

@@ -37,6 +37,9 @@ const SECRET_SETTING_PATHS = [
   ['grok2apiPassword']
 ] as const;
 
+/** API 响应中密钥占位符（非空表示已配置；保存时忽略以免覆盖） */
+const SECRET_PLACEHOLDER = '********';
+
 type SecretPath = (typeof SECRET_SETTING_PATHS)[number];
 
 function cloneJson<T>(value: T): T {
@@ -553,7 +556,17 @@ export async function loadSettings(): Promise<AppSettings> {
 }
 
 export async function saveSettings(next: AppSettings): Promise<void> {
-  cache = merge(next);
+  // 合并前：占位符不覆盖已有密钥
+  const prev = cache ? cloneJson(cache) : await loadSettings();
+  const incoming = cloneJson(next) as unknown as Record<string, unknown>;
+  for (const path of SECRET_SETTING_PATHS) {
+    const v = readPath(incoming, path);
+    if (typeof v === 'string' && isSecretPlaceholder(v)) {
+      const keep = readPath(prev as unknown as Record<string, unknown>, path);
+      writePath(incoming, path, typeof keep === 'string' ? keep : '');
+    }
+  }
+  cache = merge(incoming as unknown as AppSettings);
   await fsp.mkdir(DATA_DIR, { recursive: true });
   const tmp = `${CONFIG_PATH}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   await fsp.writeFile(tmp, JSON.stringify(encryptSettingsForDisk(cache), null, 2), 'utf-8');
@@ -566,4 +579,20 @@ export function dataDir(): string {
 
 export function isEncryptionAvailable(): boolean {
   return isSecretEncryptionAvailable();
+}
+
+/** API 返回用：密钥字段脱敏，避免 GET /api/settings 泄露明文 */
+export function maskSettingsForApi(settings: AppSettings): AppSettings {
+  const doc = cloneJson(settings) as unknown as Record<string, unknown>;
+  for (const path of SECRET_SETTING_PATHS) {
+    const value = readPath(doc, path);
+    if (typeof value === 'string' && value.trim()) {
+      writePath(doc, path, SECRET_PLACEHOLDER);
+    }
+  }
+  return doc as unknown as AppSettings;
+}
+
+export function isSecretPlaceholder(value: unknown): boolean {
+  return typeof value === 'string' && value.trim() === SECRET_PLACEHOLDER;
 }
