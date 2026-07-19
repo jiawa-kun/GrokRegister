@@ -611,7 +611,7 @@ export class RegisterBot extends EventEmitter {
       /* ignore */
     }
 
-    const ssoOutDir = this.resolveSsoOutDir();
+    const ssoOutDir = this.resolveSsoRuntimeDir();
     if (!fs.existsSync(ssoOutDir)) {
       fs.mkdirSync(ssoOutDir, { recursive: true });
     }
@@ -963,11 +963,11 @@ export class RegisterBot extends EventEmitter {
     };
 
     this.push({ type: 'account', runId, record });
-    void this.persistAccountAndMaybeSsoCheck(runId, record);
+    void this.persistAccountAndMaybeSsoCheck(runId, record, job.currentSsoFile || '');
   }
 
   /** 写号池后可选自动 SSO 验活（不阻塞注册主流程） */
-  private async persistAccountAndMaybeSsoCheck(runId: string, record: AccountRecord) {
+  private async persistAccountAndMaybeSsoCheck(runId: string, record: AccountRecord, ssoFile: string) {
     // 号池稳定 id：append 可能因 sso 去重返回已有 id，后续验活必须用这个 id
     let stableId = record.id;
     try {
@@ -978,6 +978,11 @@ export class RegisterBot extends EventEmitter {
           runId,
           `[sso-check] 号池已有同 SSO，复用 id=${String(saved.id).slice(0, 8)}…（验活写回此 id）`
         );
+      }
+      if (ssoFile) {
+        if (this.copySsoToStandardDir(ssoFile)) {
+          this.cleanupRuntimeSsoFile(ssoFile);
+        }
       }
     } catch (e) {
       this.error(runId, `账号记录写入失败: ${e instanceof Error ? e.message : String(e)}`);
@@ -1098,14 +1103,13 @@ export class RegisterBot extends EventEmitter {
       }
       if (lines.length > 0) {
         this.log(runId, `共提取到 ${lines.length} 个 SSO token`);
-        this.copySsoToStandardDir(ssoFile);
       }
     } catch {
       /* ignore */
     }
   }
 
-  private copySsoToStandardDir(ssoFile: string) {
+  private copySsoToStandardDir(ssoFile: string): boolean {
     try {
       const outDir = this.resolveSsoOutDir();
       if (!fs.existsSync(outDir)) {
@@ -1116,9 +1120,27 @@ export class RegisterBot extends EventEmitter {
       if (path.resolve(ssoFile) !== path.resolve(dest)) {
         fs.copyFileSync(ssoFile, dest);
       }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private cleanupRuntimeSsoFile(ssoFile: string) {
+    try {
+      const runtimeDir = path.resolve(this.resolveSsoRuntimeDir());
+      const resolved = path.resolve(ssoFile);
+      if (path.dirname(resolved) !== runtimeDir) return;
+      if (fs.existsSync(resolved)) {
+        fs.unlinkSync(resolved);
+      }
     } catch {
       /* ignore */
     }
+  }
+
+  private resolveSsoRuntimeDir(): string {
+    return path.join(this.resolveSsoOutDir(), '.runtime');
   }
 
   private resolveSsoOutDir(): string {

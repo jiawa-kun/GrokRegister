@@ -28,6 +28,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.web.json",
+    "verify:concurrent-register": "tsc -p server/tsconfig.json && tsc-alias -p server/tsconfig.json && node scripts/verify-concurrent-register.mjs",
     "server:build": "vite build && tsc -p server/tsconfig.json && tsc-alias -p server/tsconfig.json",
     "server:dev": "tsx watch server/src/index.ts",
     "server:start": "node server/dist/server/src/index.js",

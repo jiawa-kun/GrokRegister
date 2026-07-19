@@ -77,7 +77,7 @@ function decryptSettingsForRuntime(raw: unknown): unknown {
 }
 
 function encryptSettingsForDisk(settings: AppSettings): Record<string, unknown> {
-  const doc = cloneJson(settings) as Record<string, unknown>;
+  const doc = cloneJson(settings) as unknown as Record<string, unknown>;
   let hasPlainSecret = false;
   for (const path of SECRET_SETTING_PATHS) {
     const value = readPath(doc, path);
