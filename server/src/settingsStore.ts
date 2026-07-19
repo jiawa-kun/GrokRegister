@@ -437,7 +437,12 @@ function merge(partial: unknown): AppSettings {
       if (!Number.isFinite(n) || n < 0) return DEFAULT_SETTINGS.proxyIpIntervalSec;
       return Math.min(Math.floor(n), 86400);
     })(),
-    maxParallelWorkers: 3, // 固定并行上限，不允许配置修改
+    maxParallelWorkers: (() => {
+      const n = Number((p as AppSettings).maxParallelWorkers);
+      if (!Number.isFinite(n) || n < 1) return DEFAULT_SETTINGS.maxParallelWorkers;
+      // 与 registerBot HARD_MAX_PARALLEL=8 对齐
+      return Math.min(Math.floor(n), 8);
+    })(),
     runCount: (() => {
       const n = Number((p as AppSettings).runCount);
       if (!Number.isFinite(n) || n < 1) return DEFAULT_SETTINGS.runCount;

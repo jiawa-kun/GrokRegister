@@ -43,7 +43,7 @@ export interface AppSettings {
   runCount: number;
   /**
    * 并行注册任务上限（同时 running/starting 的 worker 数）。
-   * 固定默认 3，首页不可改（normalize 会钳制为 3）。
+   * 默认 3，可配 1..8（与 registerBot HARD_MAX_PARALLEL 一致）。
    */
   maxParallelWorkers: number;
   /**
@@ -1229,13 +1229,12 @@ export function validateSettings(s: AppSettings): Record<string, string> {
   try {
     if (!Number.isInteger(s.runCount) || s.runCount < 1 || s.runCount > 721)
       errors.runCount = '数量必须在 1 到 721 之间';
-    // 并行上限固定 3，不在 UI 暴露；仍做宽松校验防止脏数据
     if (
       !Number.isInteger(s.maxParallelWorkers) ||
       s.maxParallelWorkers < 1 ||
       s.maxParallelWorkers > 8
     )
-      errors.maxParallelWorkers = '并行任务上限无效';
+      errors.maxParallelWorkers = '并行任务上限须在 1 到 8 之间';
     if (
       !Number.isInteger(s.turnstileAutoWaitMax) ||
       s.turnstileAutoWaitMax < 30 ||

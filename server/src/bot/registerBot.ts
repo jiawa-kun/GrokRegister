@@ -398,7 +398,7 @@ export class RegisterBot extends EventEmitter {
     const active = this.activeCount();
     if (active >= maxParallel) {
       throw new Error(
-        `并行任务已达上限 ${maxParallel}（当前活跃 ${active}）。请先停止部分任务，或在配置中提高并行上限。`
+        `并行任务已达上限 ${maxParallel}（当前活跃 ${active}）。请先停止部分任务，或在注册页「运行设置」提高并行上限（1–${HARD_MAX_PARALLEL}）。`
       );
     }
 

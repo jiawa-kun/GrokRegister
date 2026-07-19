@@ -24,7 +24,6 @@ import { PaginationBar } from '@renderer/components/ui/PaginationBar';
 import { BotFlagBadge } from '@renderer/components/domain/BotFlagBadge';
 import { NsfwBadge } from '@renderer/components/domain/NsfwBadge';
 import { PushBadge } from '@renderer/components/domain/PushBadge';
-import { ZdrBadge } from '@renderer/components/domain/ZdrBadge';
 import { useClientPagination } from '@renderer/hooks/useClientPagination';
 import { useToastStore } from '@renderer/store/toastStore';
 import { useSettingsStore } from '@renderer/store/settingsStore';

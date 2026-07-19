@@ -117,7 +117,7 @@ docker logs grok-register-agent
 | `cpa_mint_mode` | `pkce`（推荐）/ `device` / `double`（两通道各一份并分别测活） |
 | `require_grok_45` | mint 后无 grok-4.5 则不进 CPA |
 | `enable_nsfw` | mint 后尝试打开 NSFW  |
-| `enable_disable_zdr` | 尝试关闭 ZDR（施工中） |
+| `enable_disable_zdr` | 已从主流程断开（保留模块，当前不生效） |
 
 
 ### 代理
