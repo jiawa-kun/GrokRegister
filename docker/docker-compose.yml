@@ -36,10 +36,42 @@ services:
       BROWSER_PATH: "/usr/bin/chromium"
       COOKIE_SECURE: "${COOKIE_SECURE:-}"
       GRA_INITIAL_PASSWORD: "${GRA_INITIAL_PASSWORD:-}"
-      GRA_MASTER_KEY: "${GRA_MASTER_KEY:-}"
+      GRA_MASTER_KEY: "${GRA_MASTER_KEY:?请先在 docker/.env 中设置 GRA_MASTER_KEY，避免敏感配置和账号凭据明文落盘}"
       DISPLAY: ":99"
     volumes:
       - ./data:/data
       # 开发 compose 在 docker/ 目录下，register 在上一级
       - ../register:/opt/register-host:ro
     shm_size: "1gb"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - |
+          const http = require("node:http");
+          const port = process.env.PORT || 6657;
+          const req = http.get("http://127.0.0.1:" + port + "/api/auth/bootstrap", (res) => {
+            let body = "";
+            res.setEncoding("utf8");
+            res.on("data", (chunk) => {
+              body += chunk;
+            });
+            res.on("end", () => {
+              try {
+                JSON.parse(body);
+                process.exit(res.statusCode === 200 ? 0 : 1);
+              } catch {
+                process.exit(1);
+              }
+            });
+          });
+          req.on("error", () => process.exit(1));
+          req.setTimeout(3000, () => {
+            req.destroy();
+            process.exit(1);
+          });
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
