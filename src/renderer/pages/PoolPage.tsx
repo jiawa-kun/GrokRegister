@@ -25,7 +25,11 @@ import { PaginationBar } from '@renderer/components/ui/PaginationBar';
 import { AccountDetailDrawer } from '@renderer/components/domain/AccountDetailDrawer';
 import { BotFlagBadge } from '@renderer/components/domain/BotFlagBadge';
 import { NsfwBadge } from '@renderer/components/domain/NsfwBadge';
-import { useClientPagination } from '@renderer/hooks/useClientPagination';
+import {
+  DEFAULT_PAGE_SIZE,
+  loadStoredPageSize,
+  type PageSize
+} from '@renderer/components/ui/PaginationBar';
 import { useAccountsStore } from '@renderer/store/accountsStore';
 import { useSettingsStore } from '@renderer/store/settingsStore';
 import { useRunStore } from '@renderer/store/runStore';
@@ -124,15 +128,25 @@ export function PoolPage() {
   const accounts = useAccountsStore((s) => s.accounts);
   const loading = useAccountsStore((s) => s.loading);
   const reload = useAccountsStore((s) => s.reload);
+  const reloadPage = useAccountsStore((s) => s.reloadPage);
   const resync = useAccountsStore((s) => s.resync);
   const remove = useAccountsStore((s) => s.remove);
   const importText = useAccountsStore((s) => s.importText);
   const ssoMap = useAccountsStore((s) => s.ssoMap);
   const applySsoResults = useAccountsStore((s) => s.applySsoResults);
+  const listTotal = useAccountsStore((s) => s.listTotal);
+  const listPage = useAccountsStore((s) => s.listPage);
+  const listTotalPages = useAccountsStore((s) => s.listTotalPages);
+  const facets = useAccountsStore((s) => s.facets);
+  const fullListMode = useAccountsStore((s) => s.fullListMode);
   const phase = useRunStore((s) => s.status.phase);
   const push = useToastStore((s) => s.push);
   const settings = useSettingsStore((s) => s.data);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState<PageSize>(() =>
+    loadStoredPageSize(PAGE_SIZE_KEY, DEFAULT_PAGE_SIZE)
+  );
   const [verifying, setVerifying] = useState(false);
   const [pushingG2a, setPushingG2a] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -314,6 +328,25 @@ export function PoolPage() {
     }
   };
 
+  /** Auth 筛选需全量交叉匹配，其余走服务端分页 */
+  const needsFullList = authFilter !== 'all';
+
+  const fetchList = async (opts?: { page?: number; pageSize?: PageSize }) => {
+    const p = opts?.page ?? page;
+    const ps = opts?.pageSize ?? pageSize;
+    if (needsFullList) {
+      await reload();
+      return;
+    }
+    await reloadPage({
+      page: p,
+      pageSize: ps,
+      q: searchQuery.trim() || undefined,
+      sso: ssoFilter === 'all' ? undefined : ssoFilter,
+      alive: aliveFilter === 'all' ? undefined : aliveFilter
+    });
+  };
+
   const doReload = async (scanHistory = false) => {
     try {
       if (scanHistory) {
@@ -326,7 +359,7 @@ export function PoolPage() {
           });
         }
       } else {
-        await reload();
+        await fetchList();
       }
       await reloadAuthEmails();
     } catch (err) {
@@ -340,26 +373,31 @@ export function PoolPage() {
     }
   };
 
+  // 筛选/页码变化：拉服务端页（Auth 筛选时全量）
   useEffect(() => {
-    void doReload();
+    const t = window.setTimeout(() => {
+      void fetchList().then(() => reloadAuthEmails()).finally(() => {
+        setLastRefresh(new Date().toISOString());
+      });
+    }, searchQuery.trim() ? 280 : 0);
+    return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reload]);
+  }, [page, pageSize, ssoFilter, aliveFilter, authFilter, searchQuery]);
 
   useEffect(() => {
     if (phase === 'done') void doReload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase]);
 
-  // 注册运行中：轻量轮询号池，把后端自动验活写回的 ssoCheck 刷到徽章
-  // （仅靠 WS account 事件时，若用户切页/丢事件会一直「未验」）
+  // 注册运行中：轻量轮询当前页（不全量）
   useEffect(() => {
     if (phase !== 'running' && phase !== 'starting') return;
     const id = window.setInterval(() => {
-      void reload().catch(() => undefined);
+      void fetchList().catch(() => undefined);
     }, 8000);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, reload]);
+  }, [phase, page, pageSize, ssoFilter, aliveFilter, authFilter, searchQuery]);
 
   // 号池 SSO → hash（增量缓存：仅 id/sso 签名变化时重算）
   const accountsHashKey = useMemo(
@@ -438,7 +476,11 @@ export function PoolPage() {
     return r.alive ? 'alive' : 'dead';
   };
 
+  // 服务端分页：accounts 已是当前页；Auth 全量模式：本地再筛
   const filteredAccounts = useMemo(() => {
+    if (!needsFullList && !fullListMode) {
+      return accounts;
+    }
     let list = accounts;
     if (ssoFilter === 'has_sso') list = list.filter((a) => Boolean(String(a.sso || '').trim()));
     else if (ssoFilter === 'no_sso') list = list.filter((a) => !String(a.sso || '').trim());
@@ -453,19 +495,15 @@ export function PoolPage() {
         const email = String(a.email || '').toLowerCase();
         const sso = String(a.sso || '').toLowerCase();
         const id = String(a.id || '').toLowerCase();
-        const name = String((a as { name?: string }).name || '').toLowerCase();
-        return (
-          email.includes(q) ||
-          sso.includes(q) ||
-          id.includes(q) ||
-          name.includes(q)
-        );
+        return email.includes(q) || sso.includes(q) || id.includes(q);
       });
     }
     return list;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     accounts,
+    fullListMode,
+    needsFullList,
     authEmails,
     authSsoHashes,
     accountSsoHashes,
@@ -476,37 +514,45 @@ export function PoolPage() {
     searchQuery
   ]);
 
-  const convertedCount = useMemo(
-    () => accounts.filter((a) => isAuthConverted(a)).length,
+  // Auth 筛选仅在全量模式有精确计数；分页模式显示 —
+  const convertedCount = useMemo(() => {
+    if (!fullListMode && !needsFullList) return 0;
+    return accounts.filter((a) => isAuthConverted(a)).length;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [accounts, authEmails, authSsoHashes, accountSsoHashes]
-  );
-  const unconvertedCount = accounts.length - convertedCount;
+  }, [accounts, fullListMode, needsFullList, authEmails, authSsoHashes, accountSsoHashes]);
+  const unconvertedCount =
+    fullListMode || needsFullList ? Math.max(0, accounts.length - convertedCount) : 0;
 
-  const uncheckedCount = useMemo(
-    () => accounts.filter((a) => !ssoMap.has(a.id)).length,
-    [accounts, ssoMap]
-  );
-  const aliveOnlyCount = useMemo(
-    () => accounts.filter((a) => ssoMap.get(a.id)?.alive === true).length,
-    [accounts, ssoMap]
-  );
-  const deadOnlyCount = useMemo(
-    () => accounts.filter((a) => ssoMap.get(a.id)?.alive === false).length,
-    [accounts, ssoMap]
-  );
+  const uncheckedCount = facets.unchecked;
+  const aliveOnlyCount = facets.alive;
+  const deadOnlyCount = facets.dead;
 
-  const {
-    pageSize,
-    totalPages,
-    currentPage,
-    pageItems: pageAccounts,
-    rangeFrom,
-    rangeTo,
-    setPage,
-    changePageSize,
-    resetPage
-  } = useClientPagination(filteredAccounts, PAGE_SIZE_KEY);
+  // 服务端分页：当前页即 pageAccounts；Auth 全量：本地 slice
+  const serverPaged = !needsFullList && !fullListMode;
+  const totalForPager = serverPaged ? listTotal : filteredAccounts.length;
+  const totalPages = serverPaged
+    ? Math.max(1, listTotalPages)
+    : Math.max(1, Math.ceil(totalForPager / pageSize) || 1);
+  const currentPage = serverPaged
+    ? Math.min(page, totalPages)
+    : Math.min(page, totalPages);
+  const pageStart = (currentPage - 1) * pageSize;
+  const pageAccounts = serverPaged
+    ? accounts
+    : filteredAccounts.slice(pageStart, pageStart + pageSize);
+  const rangeFrom = totalForPager === 0 ? 0 : pageStart + 1;
+  const rangeTo = Math.min(pageStart + pageSize, totalForPager);
+
+  const resetPage = () => setPage(1);
+  const changePageSize = (size: PageSize) => {
+    setPageSize(size);
+    setPage(1);
+    try {
+      localStorage.setItem(PAGE_SIZE_KEY, String(size));
+    } catch {
+      /* ignore */
+    }
+  };
 
   const changeAuthFilter = (f: AuthFilter) => {
     setAuthFilter(f);
@@ -538,24 +584,28 @@ export function PoolPage() {
     }
   };
 
-  // 列表/筛选变化时清理无效选中
+  // 列表/筛选变化时清理无效选中（分页：只保留本页 + 仍存在的跨页已选）
   useEffect(() => {
+    const pageIds = new Set(pageAccounts.map((a) => a.id));
+    // 服务端分页时不强制清掉其它页的选中；仅在全量筛选列表上清理
+    if (serverPaged) return;
     const ids = new Set(filteredAccounts.map((a) => a.id));
     setSelected((prev) => {
       const next = new Set([...prev].filter((id) => ids.has(id)));
       return next.size === prev.size ? prev : next;
     });
-  }, [filteredAccounts]);
+    void pageIds;
+  }, [filteredAccounts, pageAccounts, serverPaged]);
 
-  const ssoCount = useMemo(
-    () => accounts.filter((a) => Boolean(String(a.sso || '').trim())).length,
-    [accounts]
-  );
-  const noSsoCount = accounts.length - ssoCount;
+  const ssoCount = facets.hasSso;
+  const noSsoCount = facets.noSso;
   const aliveCount = aliveOnlyCount;
+  const poolTotal = facets.all || listTotal || accounts.length;
 
   const allSelected =
-    filteredAccounts.length > 0 && selected.size === filteredAccounts.length;
+    !serverPaged &&
+    filteredAccounts.length > 0 &&
+    selected.size === filteredAccounts.length;
   const pageAllSelected =
     pageAccounts.length > 0 && pageAccounts.every((a) => selected.has(a.id));
 
@@ -567,8 +617,12 @@ export function PoolPage() {
       return next;
     });
 
-  /** 全选：当前筛选结果中的全部账号 */
+  /** 全选：全量模式=筛选结果；分页模式=仅本页（避免假全选） */
   const selectAll = () => {
+    if (serverPaged) {
+      selectPage();
+      return;
+    }
     if (filteredAccounts.length === 0) return;
     setSelected(
       allSelected ? new Set() : new Set(filteredAccounts.map((a) => a.id))
@@ -611,8 +665,17 @@ export function PoolPage() {
     applySsoResults(results);
   };
 
+  /** 操作池：有勾选用勾选；否则分页=本页、全量=筛选结果 */
+  const actionPool = () => {
+    if (selected.size > 0) {
+      // 分页模式下跨页勾选只覆盖已加载页；优先本页匹配
+      return accounts.filter((a) => selected.has(a.id));
+    }
+    return serverPaged ? accounts : filteredAccounts;
+  };
+
   const verifyBatch = async () => {
-    const pool = selected.size > 0 ? accounts.filter((a) => selected.has(a.id)) : filteredAccounts;
+    const pool = actionPool();
     const targets = pool.filter((a) => a.sso);
     if (targets.length === 0) {
       push({ tone: 'warn', title: '没有可验活的账号' });
@@ -625,9 +688,9 @@ export function PoolPage() {
         targets.map((a) => ({ id: a.id, sso: a.sso }))
       );
       applyResults(results);
-      // 服务端已按 SSO 补 email；再拉一次列表保证 UI 与库一致
+      // 服务端已按 SSO 补 email；再拉一次当前页/列表保证 UI 与库一致
       try {
-        await reload();
+        await fetchList();
       } catch {
         /* applySsoResults 已写内存 */
       }
@@ -695,7 +758,7 @@ export function PoolPage() {
 
   /** 号池 SSO → 预检存活后 CPA auth 补 mint；分块并显示进度 */
   const mintAuthFromSso = async () => {
-    const pool = selected.size > 0 ? accounts.filter((a) => selected.has(a.id)) : filteredAccounts;
+    const pool = actionPool();
     const targets = pool.filter((a) => a.sso);
     if (targets.length === 0) {
       push({ tone: 'warn', title: '没有可 mint 的 SSO' });
@@ -836,7 +899,7 @@ export function PoolPage() {
 
   /** 号池 SSO → grok2api（需推送设置开启 SSO→grok2api） */
   const pushG2aFromSso = async () => {
-    const pool = selected.size > 0 ? accounts.filter((a) => selected.has(a.id)) : filteredAccounts;
+    const pool = actionPool();
     const targets = pool.filter((a) => a.sso);
     if (targets.length === 0) {
       push({ tone: 'warn', title: '没有可推送的 SSO' });
@@ -908,9 +971,9 @@ export function PoolPage() {
   return (
     <div className="space-y-5">
       <section className="terminal-grid">
-        <PoolMetric label="账号总量" value={String(accounts.length)} Icon={Database} />
+        <PoolMetric label="账号总量" value={String(poolTotal)} Icon={Database} />
         <PoolMetric label="含 SSO" value={String(ssoCount)} Icon={KeyRound} />
-        <PoolMetric label="验活存活" value={ssoMap.size ? String(aliveCount) : '--'} Icon={ShieldCheck} />
+        <PoolMetric label="验活存活" value={aliveCount ? String(aliveCount) : '--'} Icon={ShieldCheck} />
         <PoolMetric
           label="最近时间"
           value={accounts[0] ? fmtBeijing(accounts[0].createdAt, false) : '--'}
@@ -955,8 +1018,9 @@ export function PoolPage() {
               <p className="mt-0.5 text-[12px] text-muted-foreground">
                 {selected.size > 0 ? `已选 ${selected.size} 项` : '未选择'}
                 {hasActiveFilter
-                  ? ` · 筛选 ${filteredAccounts.length}/${accounts.length}`
-                  : ` · 共 ${accounts.length}`}
+                  ? ` · 筛选 ${totalForPager}/${poolTotal}`
+                  : ` · 共 ${poolTotal}`}
+                {serverPaged ? ' · 服务端分页' : needsFullList ? ' · 全量(Auth筛选)' : ''}
                 {lastRefresh ? ` · 刷新于 ${fmtBeijingTime(lastRefresh)}` : ''}
               </p>
             </div>
@@ -1012,7 +1076,7 @@ export function PoolPage() {
               value={ssoFilter}
               onChange={changeSsoFilter}
               options={[
-                { id: 'all', label: '全部', count: accounts.length, title: '不限制是否有 SSO' },
+                { id: 'all', label: '全部', count: poolTotal, title: '不限制是否有 SSO' },
                 { id: 'has_sso', label: '有SSO', count: ssoCount, title: '含 SSO，可验活/补签 Auth' },
                 { id: 'no_sso', label: '无SSO', count: noSsoCount, title: '无 SSO 的账号' }
               ]}
@@ -1022,9 +1086,28 @@ export function PoolPage() {
               value={authFilter}
               onChange={changeAuthFilter}
               options={[
-                { id: 'all', label: '全部', count: accounts.length, title: '不限制 Auth 转换状态' },
-                { id: 'unconverted', label: '未转', count: unconvertedCount, title: '尚未转 Auth' },
-                { id: 'converted', label: '已转', count: convertedCount, title: '已匹配 Auth（email 或 SSO 哈希）' }
+                {
+                  id: 'all',
+                  label: '全部',
+                  count: poolTotal,
+                  title: '不限制 Auth 转换状态'
+                },
+                {
+                  id: 'unconverted',
+                  label: '未转',
+                  count: needsFullList || fullListMode ? unconvertedCount : undefined,
+                  title: needsFullList || fullListMode
+                    ? '尚未转 Auth'
+                    : '需选此筛选项后全量匹配（分页模式无精确计数）'
+                },
+                {
+                  id: 'converted',
+                  label: '已转',
+                  count: needsFullList || fullListMode ? convertedCount : undefined,
+                  title: needsFullList || fullListMode
+                    ? '已匹配 Auth（email 或 SSO 哈希）'
+                    : '需选此筛选项后全量匹配（分页模式无精确计数）'
+                }
               ]}
             />
             <FilterSegmentGroup
@@ -1032,7 +1115,7 @@ export function PoolPage() {
               value={aliveFilter}
               onChange={changeAliveFilter}
               options={[
-                { id: 'all', label: '全部', count: accounts.length, title: '不限制验活状态' },
+                { id: 'all', label: '全部', count: poolTotal, title: '不限制验活状态' },
                 { id: 'unchecked', label: 'None', count: uncheckedCount, title: '尚未验活', tone: 'muted' },
                 { id: 'alive', label: 'Live', count: aliveOnlyCount, title: '验活存活', tone: 'ok' },
                 { id: 'dead', label: 'Dead', count: deadOnlyCount, title: '验活失效', tone: 'danger' }
@@ -1048,15 +1131,25 @@ export function PoolPage() {
                 variant="secondary"
                 size="sm"
                 onClick={selectAll}
-                disabled={filteredAccounts.length === 0 || busy}
-                title="选择当前筛选结果全部"
+                disabled={(serverPaged ? pageAccounts.length === 0 : filteredAccounts.length === 0) || busy}
+                title={
+                  serverPaged
+                    ? '分页模式下「全选」= 本页（避免假全选）'
+                    : '选择当前筛选结果全部'
+                }
               >
-                {allSelected ? (
+                {allSelected || (serverPaged && pageAllSelected) ? (
                   <CheckSquare className="h-3.5 w-3.5" />
                 ) : (
                   <Square className="h-3.5 w-3.5" />
                 )}
-                {allSelected ? '取消全选' : '全选'}
+                {allSelected || (serverPaged && pageAllSelected)
+                  ? serverPaged
+                    ? '取消本页'
+                    : '取消全选'
+                  : serverPaged
+                    ? '本页全选'
+                    : '全选'}
               </Button>
               <Button
                 variant="secondary"
@@ -1073,22 +1166,24 @@ export function PoolPage() {
               <Button
                 size="sm"
                 onClick={() => void verifyBatch()}
-                disabled={busy || filteredAccounts.length === 0}
+                disabled={busy || (serverPaged ? pageAccounts.length === 0 : filteredAccounts.length === 0)}
               >
                 <ShieldCheck className={cn('h-3.5 w-3.5', verifying && 'animate-pulse')} />
                 {verifying
                   ? '验活中…'
                   : selected.size > 0
                     ? `验活(${selected.size})`
-                    : hasActiveFilter
-                      ? `验活(${filteredAccounts.length})`
-                      : '验活全部'}
+                    : serverPaged
+                      ? `验活本页(${pageAccounts.length})`
+                      : hasActiveFilter
+                        ? `验活(${filteredAccounts.length})`
+                        : '验活全部'}
               </Button>
               <Button
                 variant="secondary"
                 size="sm"
                 onClick={() => void mintAuthFromSso()}
-                disabled={busy || filteredAccounts.length === 0}
+                disabled={busy || (serverPaged ? pageAccounts.length === 0 : filteredAccounts.length === 0)}
                 title={
                   skipBotFlag1
                     ? '预检存活 + 跳过 bot_flag=1 后 mint'
@@ -1100,9 +1195,11 @@ export function PoolPage() {
                   ? `Mint ${mintProg?.done ?? 0}/${mintProg?.total ?? 0}`
                   : selected.size > 0
                     ? `补签 Auth(${picked.filter((a) => a.sso).length})`
-                    : hasActiveFilter
-                      ? `补签 Auth(${filteredAccounts.filter((a) => a.sso).length})`
-                      : '补签 Auth'}
+                    : serverPaged
+                      ? `补签本页(${pageAccounts.filter((a) => a.sso).length})`
+                      : hasActiveFilter
+                        ? `补签 Auth(${filteredAccounts.filter((a) => a.sso).length})`
+                        : '补签 Auth'}
               </Button>
               <Button
                 variant={skipBotFlag1 ? 'primary' : 'secondary'}
@@ -1156,8 +1253,12 @@ export function PoolPage() {
               <Button
                 variant="secondary"
                 size="sm"
-                onClick={() => exportAccounts(picked.length > 0 ? picked : filteredAccounts)}
-                disabled={filteredAccounts.length === 0 || busy}
+                onClick={() =>
+                  exportAccounts(
+                    picked.length > 0 ? picked : serverPaged ? accounts : filteredAccounts
+                  )
+                }
+                disabled={(serverPaged ? accounts.length === 0 : filteredAccounts.length === 0) || busy}
                 title={
                   picked.length > 0
                     ? `导出已选账号（email|password|sso，共 ${picked.length}）`
@@ -1189,11 +1290,11 @@ export function PoolPage() {
         </div>
       </div>
 
-      {accounts.length === 0 ? (
+      {poolTotal === 0 && accounts.length === 0 ? (
         <div className="rounded-[16px] border border-dashed border-border bg-card p-12 text-center text-[13px] text-muted-foreground">
           还没有账号。到「注册机」跑一轮任务即可出现在这里。
         </div>
-      ) : filteredAccounts.length === 0 ? (
+      ) : totalForPager === 0 ? (
         <div className="rounded-[16px] border border-dashed border-border bg-card p-12 text-center text-[13px] text-muted-foreground">
           <p>
             当前筛选下没有账号。
@@ -1253,7 +1354,7 @@ export function PoolPage() {
             totalPages={totalPages}
             rangeFrom={rangeFrom}
             rangeTo={rangeTo}
-            total={filteredAccounts.length}
+            total={totalForPager}
             pageSize={pageSize}
             onChange={setPage}
             onPageSizeChange={changePageSize}

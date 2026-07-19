@@ -344,6 +344,14 @@ export interface RendererApi {
     page: number;
     pageSize: number;
     totalPages: number;
+    facets?: {
+      all: number;
+      hasSso: number;
+      noSso: number;
+      unchecked: number;
+      alive: number;
+      dead: number;
+    };
   }>;
   /** 注册失败分阶段看板 */
   getFailStageBoard?(opts?: {

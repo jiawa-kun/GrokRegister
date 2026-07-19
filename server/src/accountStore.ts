@@ -446,12 +446,25 @@ export type AccountListQuery = {
   alive?: string;
 };
 
+export type AccountListFacets = {
+  /** 号池总量（未筛） */
+  all: number;
+  hasSso: number;
+  noSso: number;
+  unchecked: number;
+  alive: number;
+  dead: number;
+};
+
 export type AccountListPage = {
   items: AccountRecord[];
+  /** 当前筛选后的条数 */
   total: number;
   page: number;
   pageSize: number;
   totalPages: number;
+  /** 未筛选的全局分面（用于顶栏计数） */
+  facets: AccountListFacets;
 };
 
 function matchAccountQuery(a: AccountRecord, opts: AccountListQuery): boolean {
@@ -479,12 +492,36 @@ function matchAccountQuery(a: AccountRecord, opts: AccountListQuery): boolean {
   return true;
 }
 
+function buildFacets(all: AccountRecord[]): AccountListFacets {
+  let hasSso = 0;
+  let unchecked = 0;
+  let alive = 0;
+  let dead = 0;
+  for (const a of all) {
+    if (String(a.sso || '').trim()) hasSso++;
+    const c = a.ssoCheck;
+    if (!c || typeof c.alive !== 'boolean') unchecked++;
+    else if (c.alive) alive++;
+    else dead++;
+  }
+  return {
+    all: all.length,
+    hasSso,
+    noSso: all.length - hasSso,
+    unchecked,
+    alive,
+    dead
+  };
+}
+
 /** 服务端筛选 + 分页（主库仍为 accounts.json；为规模化铺路） */
 export async function queryAccounts(opts: AccountListQuery = {}): Promise<AccountListPage> {
   return withAccountsLock(async () => {
     const all = await loadAccountsWithTags();
+    const facets = buildFacets(all);
     const filtered = all.filter((a) => matchAccountQuery(a, opts));
-    const pageSize = Math.min(200, Math.max(1, Math.floor(Number(opts.pageSize) || 20)));
+    // 单页上限与前端 PaginationBar 对齐（最大 2000）；默认 20
+    const pageSize = Math.min(2000, Math.max(1, Math.floor(Number(opts.pageSize) || 20)));
     const total = filtered.length;
     const totalPages = Math.max(1, Math.ceil(total / pageSize) || 1);
     const page = Math.min(totalPages, Math.max(1, Math.floor(Number(opts.page) || 1)));
@@ -494,7 +531,8 @@ export async function queryAccounts(opts: AccountListQuery = {}): Promise<Accoun
       total,
       page,
       pageSize,
-      totalPages
+      totalPages,
+      facets
     };
   });
 }

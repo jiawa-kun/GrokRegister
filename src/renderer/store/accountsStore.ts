@@ -4,6 +4,23 @@ import type { SsoCheckResult } from '@shared/ipc';
 
 const SSO_CHECK_STORAGE_KEY = 'gra-pool-sso-check-v1';
 
+export type AccountListQuery = {
+  page?: number;
+  pageSize?: number;
+  q?: string;
+  sso?: string;
+  alive?: string;
+};
+
+export type AccountListFacets = {
+  all: number;
+  hasSso: number;
+  noSso: number;
+  unchecked: number;
+  alive: number;
+  dead: number;
+};
+
 function loadSsoMapFromStorage(): Map<string, SsoCheckResult> {
   try {
     const raw = localStorage.getItem(SSO_CHECK_STORAGE_KEY);
@@ -72,18 +89,19 @@ function resultFromAccount(a: AccountRecord): SsoCheckResult | null {
 /**
  * 合并本地缓存与服务端号池 ssoCheck：
  * - 同 id 取 checkedAt 更新的一方
- * - 服务端有而本地无 → 采用服务端
- * - 删除已不在号池的 id
+ * - 分页模式下不删本地「本页以外」的缓存
  */
 function mergeSsoMaps(
   local: Map<string, SsoCheckResult>,
-  accounts: AccountRecord[]
+  accounts: AccountRecord[],
+  opts?: { pruneMissing?: boolean }
 ): Map<string, SsoCheckResult> {
+  const prune = opts?.pruneMissing !== false;
   const keep = new Set(accounts.map((a) => a.id));
   const next = new Map<string, SsoCheckResult>();
 
   for (const [id, r] of local) {
-    if (keep.has(id)) next.set(id, r);
+    if (!prune || keep.has(id)) next.set(id, r);
   }
 
   for (const a of accounts) {
@@ -102,17 +120,31 @@ function mergeSsoMaps(
   return next;
 }
 
+function emptyFacets(): AccountListFacets {
+  return { all: 0, hasSso: 0, noSso: 0, unchecked: 0, alive: 0, dead: 0 };
+}
+
 interface AccountsState {
+  /** 当前页（或全量，取决于 lastQuery） */
   accounts: AccountRecord[];
   loading: boolean;
-  /** 号池 SSO 验活结果（服务端 accounts.json + localStorage 双写） */
+  /** 当前筛选后的总数（服务端 total） */
+  listTotal: number;
+  listPage: number;
+  listPageSize: number;
+  listTotalPages: number;
+  facets: AccountListFacets;
+  /** 最近一次分页查询参数 */
+  lastQuery: AccountListQuery | null;
+  /** true=当前 accounts 为全量 listAccounts */
+  fullListMode: boolean;
   ssoMap: Map<string, SsoCheckResult>;
+  /** 全量拉取（批量操作/Auth 筛选） */
   reload(): Promise<void>;
-  /** 主动扫描 SSO 历史文件后再列表 */
+  /** 服务端分页拉取 */
+  reloadPage(query?: AccountListQuery): Promise<void>;
   resync(): Promise<{ total: number; imported: number }>;
-  /** 按 id 批量删除号池账号 */
   remove(ids: string[]): Promise<{ deleted: number; remaining: number }>;
-  /** 文本导入 SSO */
   importText(
     text: string,
     source?: string
@@ -125,9 +157,7 @@ interface AccountsState {
     remaining: number;
   }>;
   applyAccount(record: AccountRecord): void;
-  /** 合并验活结果并落盘本地缓存（服务端由 /api/sso/check 自行写库） */
   applySsoResults(results: SsoCheckResult[]): void;
-  /** 删除账号时同步清理验活缓存 */
   pruneSsoMap(keepIds: Set<string>): void;
   clearSsoResults(): void;
 }
@@ -135,15 +165,110 @@ interface AccountsState {
 export const useAccountsStore = create<AccountsState>((set, get) => ({
   accounts: [],
   loading: false,
+  listTotal: 0,
+  listPage: 1,
+  listPageSize: 20,
+  listTotalPages: 1,
+  facets: emptyFacets(),
+  lastQuery: null,
+  fullListMode: true,
   ssoMap: loadSsoMapFromStorage(),
 
   reload: async () => {
     set({ loading: true });
     try {
       const accounts = await window.api.listAccounts();
-      const ssoMap = mergeSsoMaps(get().ssoMap, accounts);
+      const ssoMap = mergeSsoMaps(get().ssoMap, accounts, { pruneMissing: true });
       persistSsoMap(ssoMap);
-      set({ accounts, loading: false, ssoMap });
+      let hasSso = 0;
+      let unchecked = 0;
+      let alive = 0;
+      let dead = 0;
+      for (const a of accounts) {
+        if (String(a.sso || '').trim()) hasSso++;
+        const c = a.ssoCheck;
+        if (!c || typeof c.alive !== 'boolean') unchecked++;
+        else if (c.alive) alive++;
+        else dead++;
+      }
+      set({
+        accounts,
+        loading: false,
+        ssoMap,
+        listTotal: accounts.length,
+        listPage: 1,
+        listPageSize: accounts.length || 20,
+        listTotalPages: 1,
+        facets: {
+          all: accounts.length,
+          hasSso,
+          noSso: accounts.length - hasSso,
+          unchecked,
+          alive,
+          dead
+        },
+        lastQuery: null,
+        fullListMode: true
+      });
+    } catch {
+      set({ loading: false });
+    }
+  },
+
+  reloadPage: async (query = {}) => {
+    set({ loading: true });
+    try {
+      const api = window.api as {
+        listAccountsPage?: (q?: AccountListQuery) => Promise<{
+          items: AccountRecord[];
+          total: number;
+          page: number;
+          pageSize: number;
+          totalPages: number;
+          facets?: AccountListFacets;
+        }>;
+        listAccounts: () => Promise<AccountRecord[]>;
+      };
+      if (!api.listAccountsPage) {
+        await get().reload();
+        return;
+      }
+      const page = await api.listAccountsPage({
+        page: query.page ?? 1,
+        pageSize: query.pageSize ?? 20,
+        q: query.q || undefined,
+        sso: query.sso || undefined,
+        alive: query.alive || undefined
+      });
+      const accounts = page.items || [];
+      const ssoMap = mergeSsoMaps(get().ssoMap, accounts, { pruneMissing: false });
+      persistSsoMap(ssoMap);
+      const facets = page.facets || {
+        all: page.total,
+        hasSso: 0,
+        noSso: 0,
+        unchecked: 0,
+        alive: 0,
+        dead: 0
+      };
+      set({
+        accounts,
+        loading: false,
+        ssoMap,
+        listTotal: page.total,
+        listPage: page.page,
+        listPageSize: page.pageSize,
+        listTotalPages: page.totalPages,
+        facets,
+        lastQuery: {
+          page: page.page,
+          pageSize: page.pageSize,
+          q: query.q,
+          sso: query.sso,
+          alive: query.alive
+        },
+        fullListMode: false
+      });
     } catch {
       set({ loading: false });
     }
@@ -153,10 +278,12 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
     set({ loading: true });
     try {
       const result = await window.api.resyncAccounts();
-      const accounts = await window.api.listAccounts();
-      const ssoMap = mergeSsoMaps(get().ssoMap, accounts);
-      persistSsoMap(ssoMap);
-      set({ accounts, loading: false, ssoMap });
+      const q = get().lastQuery;
+      if (q && !get().fullListMode) {
+        await get().reloadPage(q);
+      } else {
+        await get().reload();
+      }
       return result;
     } catch (err) {
       set({ loading: false });
@@ -167,7 +294,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
   remove: async (ids) => {
     const list = (Array.isArray(ids) ? ids : []).map(String).filter(Boolean);
     if (list.length === 0) {
-      return { deleted: 0, remaining: get().accounts.length };
+      return { deleted: 0, remaining: get().listTotal || get().accounts.length };
     }
     const r = await window.api.deleteAccounts(list);
     const drop = new Set(list);
@@ -176,13 +303,20 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
     persistSsoMap(ssoMap);
     set((state) => ({
       accounts: state.accounts.filter((a) => !drop.has(a.id)),
-      ssoMap
+      ssoMap,
+      listTotal: Math.max(0, (state.listTotal || state.accounts.length) - r.deleted),
+      facets: {
+        ...state.facets,
+        all: Math.max(0, state.facets.all - r.deleted)
+      }
     }));
     try {
-      const accounts = await window.api.listAccounts();
-      const merged = mergeSsoMaps(get().ssoMap, accounts);
-      persistSsoMap(merged);
-      set({ accounts, ssoMap: merged });
+      const q = get().lastQuery;
+      if (q && !get().fullListMode) {
+        await get().reloadPage(q);
+      } else {
+        await get().reload();
+      }
     } catch {
       /* keep local filter */
     }
@@ -192,10 +326,12 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
   importText: async (text, source) => {
     const r = await window.api.importAccounts({ text, source });
     try {
-      const accounts = await window.api.listAccounts();
-      const ssoMap = mergeSsoMaps(get().ssoMap, accounts);
-      persistSsoMap(ssoMap);
-      set({ accounts, ssoMap });
+      const q = get().lastQuery;
+      if (q && !get().fullListMode) {
+        await get().reloadPage({ ...q, page: 1 });
+      } else {
+        await get().reload();
+      }
     } catch {
       /* ignore */
     }
@@ -203,12 +339,12 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
   },
 
   applyAccount: (record) => {
-    // 注册先推一次无 ssoCheck 的 account；自动验活后再推同 id + ssoCheck。
-    // 旧逻辑「id 已存在则整段忽略」会导致号池永远显示「未验」。
     const fromCheck = resultFromAccount(record);
     set((state) => {
       const byId = state.accounts.findIndex((a) => a.id === record.id);
       let accounts = state.accounts;
+      let listTotal = state.listTotal;
+      let facets = state.facets;
       if (byId >= 0) {
         const prev = state.accounts[byId]!;
         const merged: AccountRecord = {
@@ -222,7 +358,6 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
         accounts = state.accounts.slice();
         accounts[byId] = merged;
       } else if (record.sso && state.accounts.some((a) => a.sso && a.sso === record.sso)) {
-        // 同 sso 不同 id：更新已有行（验活补丁）
         const si = state.accounts.findIndex((a) => a.sso && a.sso === record.sso);
         if (si >= 0) {
           const prev = state.accounts[si]!;
@@ -234,28 +369,39 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
             email: String(record.email || '').trim() || prev.email,
             ssoCheck: record.ssoCheck ?? prev.ssoCheck
           };
-          if (fromCheck) {
-            // 用稳定 id 写 ssoMap
-            fromCheck.id = prev.id;
-          }
-        } else {
+          if (fromCheck) fromCheck.id = prev.id;
+        } else if (state.fullListMode || state.listPage <= 1) {
           accounts = [record, ...state.accounts];
+          listTotal = state.listTotal + 1;
+          facets = { ...state.facets, all: state.facets.all + 1 };
         }
-      } else {
+      } else if (state.fullListMode || state.listPage <= 1) {
+        // 分页模式：仅第 1 页插入新号，避免打乱其它页
         accounts = [record, ...state.accounts];
+        listTotal = state.listTotal + 1;
+        facets = {
+          ...state.facets,
+          all: state.facets.all + 1,
+          hasSso: state.facets.hasSso + (String(record.sso || '').trim() ? 1 : 0)
+        };
+      } else {
+        // 非首页：只更新计数，不插列表
+        listTotal = state.listTotal + 1;
+        facets = {
+          ...state.facets,
+          all: state.facets.all + 1,
+          hasSso: state.facets.hasSso + (String(record.sso || '').trim() ? 1 : 0)
+        };
       }
 
       let ssoMap = state.ssoMap;
       if (fromCheck) {
         ssoMap = new Map(state.ssoMap);
-        const mapId =
-          byId >= 0
-            ? record.id
-            : fromCheck.id || record.id;
+        const mapId = byId >= 0 ? record.id : fromCheck.id || record.id;
         ssoMap.set(mapId, { ...fromCheck, id: mapId });
         persistSsoMap(ssoMap);
       }
-      return { accounts, ssoMap };
+      return { accounts, ssoMap, listTotal, facets };
     });
   },
 
@@ -267,7 +413,6 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       ssoMap.set(r.id, r);
     }
     persistSsoMap(ssoMap);
-    // 同步到内存中的 accounts[].ssoCheck，避免刷新前 UI 与列表不一致
     set((state) => ({
       ssoMap,
       accounts: state.accounts.map((a) => {
