@@ -22,12 +22,14 @@ from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 import argparse
 import shutil
+import socket
 import tempfile
 import datetime
 import logging
 import time
 import secrets
 import platform
+import signal
 from pathlib import Path
 
 from email_register import get_email_and_token, get_oai_code
@@ -355,10 +357,61 @@ else:
     print(f"[Warn] Turnstile 扩展目录不存在: {EXTENSION_PATH}")
 
 
+def _pick_free_debug_port() -> int:
+    """为并行 worker 独占调试端口（跨进程，不依赖 DrissionPage 进程内 PortFinder）。"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
+    except Exception:
+        pass
+    import random
+
+    for _ in range(60):
+        p = random.randint(39000, 59000)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", p))
+                return p
+        except OSError:
+            continue
+    return 0
+
+
+def _bind_exclusive_debug_port(opts: ChromiumOptions, port: int | None = None) -> int:
+    """set_user_data_path 会关闭 auto_port；必须在其后显式 set_local_port，避免全员 9222 互附着。"""
+    p = int(port or 0)
+    if p <= 0:
+        p = _pick_free_debug_port()
+    if p <= 0:
+        try:
+            opts.auto_port()
+        except Exception:
+            pass
+        return 0
+    try:
+        opts.set_local_port(int(p))
+    except Exception:
+        try:
+            opts.set_address(f"127.0.0.1:{int(p)}")
+        except Exception:
+            pass
+    try:
+        opts.set_argument(f"--remote-debugging-port={int(p)}")
+    except Exception:
+        pass
+    return int(p)
+
+
 def _new_chromium_options() -> ChromiumOptions:
     """每轮新建 ChromiumOptions，避免代理扩展/指纹在全局 co 上累积。"""
     opts = ChromiumOptions()
-    opts.auto_port()
+    # 先 auto_port 清掉 ini 默认 9222；真正端口在 set_user_data_path 之后再独占绑定
+    try:
+        opts.auto_port()
+    except Exception:
+        pass
     try:
         opts.headless(False)
     except Exception:
@@ -415,6 +468,8 @@ print(
 )
 
 _chrome_temp_dir: str = ""
+_chrome_debug_port: int = 0
+_chrome_process_pid: int = 0
 browser = None
 page = None
 # 指纹探测是否已输出（必须模块级初始化，否则 NameError）
@@ -722,7 +777,7 @@ def _start_browser_once():
     # 每轮从全新浏览器开始，使用独立临时 profile 目录避免 Cookie/Session 复用。
     # 注意：带 user:pass 的代理必须用扩展注入，co.set_proxy 会静默忽略（DrissionPage 限制）。
     global browser, page, _chrome_temp_dir, _current_fingerprint, _browser_proxy, co
-    global _local_forward_port
+    global _local_forward_port, _chrome_debug_port, _chrome_process_pid
     if _IS_LINUX:
         _ensure_virtual_display()
 
@@ -730,6 +785,8 @@ def _start_browser_once():
     co = _new_chromium_options()
     proxy_apply_result = None
     _local_forward_port = 0
+    _chrome_debug_port = 0
+    _chrome_process_pid = 0
 
     # 代理池：每轮取一个（先创建 profile 目录，auth 扩展写在其下）
     _chrome_temp_dir = tempfile.mkdtemp(prefix="chrome_run_")
@@ -1011,8 +1068,28 @@ def _start_browser_once():
             print(f"[Warn] 指纹生成失败: {e}")
             _current_fingerprint = None
 
+    # 关键：set_user_data_path 会关闭 auto_port，若不再绑端口会回落到 9222，
+    # 并行 worker 会附着同一 Chromium，表现为只剩一个浏览器 + 僵尸进程。
     co.set_user_data_path(_chrome_temp_dir)
+    _chrome_debug_port = _bind_exclusive_debug_port(co)
+    try:
+        print(
+            f"[*] Chromium debug_port={_chrome_debug_port or 'auto'} "
+            f"profile={_chrome_temp_dir} pid_self={os.getpid()}",
+            flush=True,
+        )
+    except Exception:
+        pass
     browser = Chromium(co)
+    try:
+        _chrome_process_pid = int(getattr(browser, "process_id", 0) or 0)
+    except Exception:
+        _chrome_process_pid = 0
+    if _chrome_process_pid:
+        try:
+            print(f"[*] Chromium process_id={_chrome_process_pid}", flush=True)
+        except Exception:
+            pass
     tabs = browser.get_tabs()
     page = tabs[-1] if tabs else browser.new_tab()
     win_w = getattr(_current_fingerprint, "window_w", None) or _WINDOW_W
@@ -1103,16 +1180,84 @@ def start_browser(*, max_proxy_tries: int | None = None):
 _local_forward_port = 0
 
 
+def _kill_pid_tree(pid: int) -> None:
+    """尽量杀掉本 worker 的 Chromium 树；仅限本进程记录的 pid，避免误杀其它并行任务。"""
+    pid = int(pid or 0)
+    if pid <= 0 or pid == os.getpid():
+        return
+    if platform.system() == "Windows":
+        try:
+            import subprocess
+
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            pass
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        pass
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        except Exception:
+            break
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except Exception:
+        pass
+    # 收尸，避免 <defunct> 占着 parent
+    for _ in range(10):
+        try:
+            wpid, _st = os.waitpid(pid, os.WNOHANG)
+            if wpid == 0:
+                time.sleep(0.05)
+                continue
+            break
+        except ChildProcessError:
+            break
+        except Exception:
+            break
+
+
 def stop_browser():
     # 完整关闭整个浏览器实例，并清理本轮临时 profile，供下一轮重新拉起。
     global browser, page, _chrome_temp_dir, _local_forward_port
+    global _chrome_debug_port, _chrome_process_pid
+    pid = int(_chrome_process_pid or 0)
+    if not pid and browser is not None:
+        try:
+            pid = int(getattr(browser, "process_id", 0) or 0)
+        except Exception:
+            pid = 0
     if browser is not None:
         try:
-            browser.quit()
+            # force=True：CDP close 失败时仍按进程杀，避免并行下僵尸残留
+            browser.quit(timeout=3, force=True)
+        except TypeError:
+            try:
+                browser.quit()
+            except Exception:
+                pass
         except Exception:
             pass
     browser = None
     page = None
+    if pid:
+        _kill_pid_tree(pid)
+    _chrome_process_pid = 0
+    _chrome_debug_port = 0
     # 仅停本轮本地代理转发（按 port），避免并发任务互相关闭
     try:
         from proxy_local_forward import stop_local_forward
