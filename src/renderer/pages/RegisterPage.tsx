@@ -188,6 +188,7 @@ export function RegisterPage({ onOpenSettings }: { onOpenSettings(): void }) {
             {/* 原「运行设置」合并进实时状态 */}
             <RuntimeSettingsInline />
             <AuthQueueMetricsCard />
+            <FailStageBoardCard />
 
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <InfoBox label="轮数" value={String(settings?.runCount ?? '--')} />
@@ -482,6 +483,97 @@ function InfoBox({ label, value }: { label: string; value: string }) {
     <div className="rounded-xl border border-border/60 bg-card/70 p-3.5">
       <div className="field-label">{label}</div>
       <div className="mt-1.5 break-all text-[13px] font-medium">{value}</div>
+    </div>
+  );
+}
+
+/** 注册失败分阶段看板（启发式） */
+function FailStageBoardCard() {
+  const focusRunId = useRunStore((s) => s.focusRunId);
+  const jobsActive = useRunStore((s) => s.jobsActive);
+  const failed = useRunStore((s) => s.status.failed);
+  const [board, setBoard] = useState<{
+    totalFailed: number;
+    stages: { id: string; label: string; count: number }[];
+    recent: { ts: number; stage: string; message: string; round?: number }[];
+  } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const api = window.api as {
+          getFailStageBoard?: (opts?: {
+            runId?: string;
+            all?: boolean;
+          }) => Promise<{
+            totalFailed: number;
+            stages: { id: string; label: string; count: number }[];
+            recent: { ts: number; stage: string; message: string; round?: number }[];
+          }>;
+        };
+        if (!api.getFailStageBoard) return;
+        const r = await api.getFailStageBoard(
+          jobsActive > 1 ? { all: true } : focusRunId ? { runId: focusRunId } : { all: true }
+        );
+        if (!cancelled && r) setBoard(r);
+      } catch {
+        /* ignore */
+      }
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [focusRunId, jobsActive, failed]);
+
+  const stages = board?.stages || [];
+  const total = board?.totalFailed ?? 0;
+  const top = stages.slice(0, 6);
+  const maxCount = Math.max(1, ...top.map((s) => s.count));
+
+  return (
+    <div className="rounded-xl border border-border bg-card/80 p-3.5 shadow-[var(--ios-shadow)]">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[13px] font-semibold tracking-[-0.02em]">失败归因</div>
+        <span className="text-[10px] text-muted-foreground">
+          累计失败 {total}
+          {jobsActive > 1 ? ' · 全部任务' : ''}
+        </span>
+      </div>
+      {top.length === 0 ? (
+        <p className="mt-2 text-[11px] text-muted-foreground">暂无分阶段数据（成功或尚未失败）</p>
+      ) : (
+        <div className="mt-2 space-y-1.5">
+          {top.map((s) => (
+            <div key={s.id} className="flex items-center gap-2">
+              <div className="w-16 shrink-0 text-[11px] text-muted-foreground">{s.label}</div>
+              <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
+                <div
+                  className="h-full rounded-full bg-amber-500/80"
+                  style={{ width: `${Math.max(8, Math.round((s.count / maxCount) * 100))}%` }}
+                />
+              </div>
+              <div className="w-7 shrink-0 text-right text-[12px] font-semibold tabular-nums">
+                {s.count}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {(board?.recent || []).length > 0 ? (
+        <div className="mt-2 max-h-20 overflow-y-auto rounded-lg border border-border/50 bg-muted/40 px-2 py-1.5">
+          {(board?.recent || []).slice(0, 5).map((r, i) => (
+            <div key={`${r.ts}-${i}`} className="truncate text-[10px] text-muted-foreground">
+              {r.round ? `R${r.round} ` : ''}
+              <span className="text-foreground/80">{r.stage}</span>
+              {r.message ? ` · ${r.message}` : ''}
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }

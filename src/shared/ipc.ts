@@ -329,7 +329,38 @@ export interface RendererApi {
   onRegisterEvent(cb: (e: RunEvent) => void): () => void;
 
   // accounts
+  /** 全量号池（兼容旧调用） */
   listAccounts(): Promise<AccountRecord[]>;
+  /** 服务端分页/筛选号池 */
+  listAccountsPage?(query?: {
+    page?: number;
+    pageSize?: number;
+    q?: string;
+    sso?: string;
+    alive?: string;
+  }): Promise<{
+    items: AccountRecord[];
+    total: number;
+    page: number;
+    pageSize: number;
+    totalPages: number;
+  }>;
+  /** 注册失败分阶段看板 */
+  getFailStageBoard?(opts?: {
+    runId?: string;
+    all?: boolean;
+  }): Promise<{
+    runId: string | null;
+    totalFailed: number;
+    stages: { id: string; label: string; count: number }[];
+    recent: {
+      ts: number;
+      stage: string;
+      message: string;
+      round?: number;
+      runId?: string;
+    }[];
+  }>;
   /** 从 DATA_DIR/sso 与旧路径重新扫描导入历史 */
   resyncAccounts(): Promise<{ total: number; imported: number }>;
   /** 按 id 批量删除号池账号 */

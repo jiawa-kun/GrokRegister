@@ -163,6 +163,23 @@ const webApi: RendererApi = {
   },
 
   listAccounts: () => http('GET', '/api/accounts'),
+  listAccountsPage: (query) => {
+    const qs = new URLSearchParams();
+    qs.set('paged', '1');
+    if (query?.page != null) qs.set('page', String(query.page));
+    if (query?.pageSize != null) qs.set('pageSize', String(query.pageSize));
+    if (query?.q) qs.set('q', query.q);
+    if (query?.sso) qs.set('sso', query.sso);
+    if (query?.alive) qs.set('alive', query.alive);
+    return http('GET', `/api/accounts?${qs.toString()}`);
+  },
+  getFailStageBoard: (opts) => {
+    const qs = new URLSearchParams();
+    if (opts?.runId) qs.set('runId', opts.runId);
+    if (opts?.all) qs.set('all', '1');
+    const q = qs.toString();
+    return http('GET', q ? `/api/run/fail-stages?${q}` : '/api/run/fail-stages');
+  },
   resyncAccounts: () =>
     http<{ total: number; imported: number }>('POST', '/api/accounts/resync'),
   deleteAccounts: (ids) =>

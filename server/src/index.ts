@@ -40,6 +40,7 @@ import {
   deleteAccounts,
   importAccountsFromText,
   listAccounts,
+  queryAccounts,
   migrateAccountSecretStorage,
   resyncAccountsFromDisk
 } from './accountStore.js';
@@ -545,8 +546,41 @@ app.post('/api/run/jobs/clear-finished', asyncHandler(async (_req: Request, res:
   }
 }));
 
-app.get('/api/accounts', asyncHandler(async (_req, res) => {
-  res.json(await listAccounts());
+/** 注册失败分阶段看板（启发式归因） */
+app.get('/api/run/fail-stages', asyncHandler(async (req: Request, res: Response) => {
+  const runId = typeof req.query.runId === 'string' ? req.query.runId : '';
+  const all =
+    String(req.query.all || '') === '1' || String(req.query.all || '').toLowerCase() === 'true';
+  res.json(registerBot.getFailStageBoard({ runId: runId || undefined, all }));
+}));
+
+app.get('/api/accounts', asyncHandler(async (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q : '';
+  const sso = typeof req.query.sso === 'string' ? req.query.sso : '';
+  const alive = typeof req.query.alive === 'string' ? req.query.alive : '';
+  const pageRaw = req.query.page;
+  const pageSizeRaw = req.query.pageSize ?? req.query.limit;
+  const wantsPage =
+    pageRaw != null ||
+    pageSizeRaw != null ||
+    String(req.query.paged || '') === '1' ||
+    String(req.query.paged || '').toLowerCase() === 'true';
+  if (!wantsPage) {
+    // 兼容：无分页参数时仍返回全量数组（批量验活/导出/旧前端）
+    res.json(await listAccounts());
+    return;
+  }
+  const page = Number(pageRaw || 1);
+  const pageSize = Number(pageSizeRaw || 20);
+  res.json(
+    await queryAccounts({
+      page,
+      pageSize,
+      q,
+      sso,
+      alive
+    })
+  );
 }));
 
 /** 从 DATA_DIR/sso 与旧路径重新扫描导入历史账号 */

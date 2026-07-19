@@ -268,6 +268,21 @@ export const useRunStore = create<RunState>((set) => ({
             failed: event.failed,
             total: event.total
           });
+          // 有失败明细时补一行日志，便于看板与人工对照
+          if (event.message) {
+            const stage = event.failStage ? `[${event.failStage}] ` : '';
+            const text = `失败归因 ${stage}${event.message}`.slice(0, 400);
+            logs = [
+              ...logs,
+              {
+                id: `${Date.now()}-${seq++}`,
+                ts: Date.now(),
+                level: 'warn' as const,
+                text,
+                runId: event.runId
+              }
+            ].slice(-2000);
+          }
           break;
         case 'exit': {
           const phase = event.killed ? 'killed' : event.code === 0 ? 'done' : 'error';

@@ -366,72 +366,136 @@ export async function appendAccount(
   });
 }
 
-export async function listAccounts(): Promise<AccountRecord[]> {
-  return withAccountsLock(async () => {
-    const raw = await readAll();
-    let dirty = false;
-    const all = raw.map((a) => {
-      const fixed = repairAccountFields(a);
-      if (
-        fixed !== a &&
-        (fixed.email !== a.email || fixed.password !== a.password || fixed.sso !== a.sso)
-      ) {
-        dirty = true;
-      }
-      return fixed;
-    });
-    if (dirty) {
-      try {
-        await writeAll(all);
-        console.log('[accountStore] repaired hybrid email|password|sso rows in accounts.json');
-      } catch {
-        /* ignore */
-      }
+async function loadAccountsWithTags(): Promise<AccountRecord[]> {
+  const raw = await readAll();
+  let dirty = false;
+  const all = raw.map((a) => {
+    const fixed = repairAccountFields(a);
+    if (
+      fixed !== a &&
+      (fixed.email !== a.email || fixed.password !== a.password || fixed.sso !== a.sso)
+    ) {
+      dirty = true;
     }
-    // 合并 NSFW 侧车 tag（email / sso_hash）
-    let withTags = all;
+    return fixed;
+  });
+  if (dirty) {
     try {
-      const {
-        loadAccountTags,
-        lookupNsfwTag,
-        nsfwStatusFromTag,
-        zdrStatusFromTag,
-        ssoHashHex
-      } = await import('./accountTags.js');
-      const tags = loadAccountTags();
-      withTags = all.map((a) => {
-        const side = nsfwStatusFromTag(
-          lookupNsfwTag(tags, {
-            email: a.email,
-            sso: a.sso,
-            ssoHash: a.sso ? ssoHashHex(a.sso) : undefined
-          })
-        );
-        const zdr = zdrStatusFromTag(
-          lookupNsfwTag(tags, {
-            email: a.email,
-            sso: a.sso,
-            ssoHash: a.sso ? ssoHashHex(a.sso) : undefined
-          })
-        );
-        return {
-          ...a,
-          nsfwEnabled: side.nsfwEnabled,
-          nsfwAttempted: side.nsfwAttempted,
-          nsfwAt: side.nsfwAt,
-          nsfwError: side.nsfwError,
-          nsfwStatus: side.nsfwStatus,
-          zdrClosed: zdr.zdrClosed,
-          zdrAttempted: zdr.zdrAttempted,
-          zdrAt: zdr.zdrAt,
-          zdrError: zdr.zdrError,
-          zdrStatus: zdr.zdrStatus
-        } as AccountRecord;
-      });
+      await writeAll(all);
+      console.log('[accountStore] repaired hybrid email|password|sso rows in accounts.json');
     } catch {
-      /* tags optional */
+      /* ignore */
     }
-    return withTags.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+  let withTags = all;
+  try {
+    const {
+      loadAccountTags,
+      lookupNsfwTag,
+      nsfwStatusFromTag,
+      zdrStatusFromTag,
+      ssoHashHex
+    } = await import('./accountTags.js');
+    const tags = loadAccountTags();
+    withTags = all.map((a) => {
+      const side = nsfwStatusFromTag(
+        lookupNsfwTag(tags, {
+          email: a.email,
+          sso: a.sso,
+          ssoHash: a.sso ? ssoHashHex(a.sso) : undefined
+        })
+      );
+      const zdr = zdrStatusFromTag(
+        lookupNsfwTag(tags, {
+          email: a.email,
+          sso: a.sso,
+          ssoHash: a.sso ? ssoHashHex(a.sso) : undefined
+        })
+      );
+      return {
+        ...a,
+        nsfwEnabled: side.nsfwEnabled,
+        nsfwAttempted: side.nsfwAttempted,
+        nsfwAt: side.nsfwAt,
+        nsfwError: side.nsfwError,
+        nsfwStatus: side.nsfwStatus,
+        zdrClosed: zdr.zdrClosed,
+        zdrAttempted: zdr.zdrAttempted,
+        zdrAt: zdr.zdrAt,
+        zdrError: zdr.zdrError,
+        zdrStatus: zdr.zdrStatus
+      } as AccountRecord;
+    });
+  } catch {
+    /* tags optional */
+  }
+  return withTags.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export async function listAccounts(): Promise<AccountRecord[]> {
+  return withAccountsLock(() => loadAccountsWithTags());
+}
+
+export type AccountListQuery = {
+  page?: number;
+  pageSize?: number;
+  q?: string;
+  /** all | has_sso | no_sso */
+  sso?: string;
+  /** all | unchecked | alive | dead */
+  alive?: string;
+};
+
+export type AccountListPage = {
+  items: AccountRecord[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+};
+
+function matchAccountQuery(a: AccountRecord, opts: AccountListQuery): boolean {
+  const ssoMode = String(opts.sso || 'all').trim().toLowerCase();
+  const hasSso = Boolean(String(a.sso || '').trim());
+  if (ssoMode === 'has_sso' && !hasSso) return false;
+  if (ssoMode === 'no_sso' && hasSso) return false;
+
+  const aliveMode = String(opts.alive || 'all').trim().toLowerCase();
+  if (aliveMode === 'unchecked') {
+    if (a.ssoCheck && typeof a.ssoCheck.alive === 'boolean') return false;
+  } else if (aliveMode === 'alive') {
+    if (!a.ssoCheck || a.ssoCheck.alive !== true) return false;
+  } else if (aliveMode === 'dead') {
+    if (!a.ssoCheck || a.ssoCheck.alive !== false) return false;
+  }
+
+  const q = String(opts.q || '').trim().toLowerCase();
+  if (q) {
+    const email = String(a.email || '').toLowerCase();
+    const sso = String(a.sso || '').toLowerCase();
+    const id = String(a.id || '').toLowerCase();
+    if (!email.includes(q) && !sso.includes(q) && !id.includes(q)) return false;
+  }
+  return true;
+}
+
+/** 服务端筛选 + 分页（主库仍为 accounts.json；为规模化铺路） */
+export async function queryAccounts(opts: AccountListQuery = {}): Promise<AccountListPage> {
+  return withAccountsLock(async () => {
+    const all = await loadAccountsWithTags();
+    const filtered = all.filter((a) => matchAccountQuery(a, opts));
+    const pageSize = Math.min(200, Math.max(1, Math.floor(Number(opts.pageSize) || 20)));
+    const total = filtered.length;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize) || 1);
+    const page = Math.min(totalPages, Math.max(1, Math.floor(Number(opts.page) || 1)));
+    const start = (page - 1) * pageSize;
+    return {
+      items: filtered.slice(start, start + pageSize),
+      total,
+      page,
+      pageSize,
+      totalPages
+    };
   });
 }
 

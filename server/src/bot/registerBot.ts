@@ -13,6 +13,12 @@ import type {
 } from '@shared/runEvents';
 import { EMPTY_STATUS } from '@shared/runEvents';
 import type { AppSettings } from '@shared/settings';
+import {
+  bumpFailStage,
+  emptyFailStageCounts,
+  FAIL_STAGE_LABELS,
+  type FailStageId
+} from '@shared/failStages';
 import fs from 'fs';
 import path from 'path';
 import {
@@ -60,6 +66,10 @@ interface Job {
   structuredEventsSeen: boolean;
   countedResultRounds: Set<number>;
   pendingAccount: { email?: string; password?: string };
+  /** 本任务失败分阶段计数 */
+  failStages: Record<FailStageId, number>;
+  /** 最近若干失败明细（调试/看板） */
+  recentFails: { ts: number; stage: FailStageId; message: string; round?: number }[];
 }
 
 const DEFAULT_MAX_PARALLEL = 3;
@@ -225,6 +235,69 @@ export class RegisterBot extends EventEmitter {
       if (isActivePhase(j.status.phase)) n++;
     }
     return n;
+  }
+
+  /** 失败分阶段聚合（聚焦任务 / 全部任务） */
+  getFailStageBoard(opts?: { runId?: string; all?: boolean }): {
+    runId: string | null;
+    totalFailed: number;
+    stages: { id: string; label: string; count: number }[];
+    recent: { ts: number; stage: string; message: string; round?: number; runId?: string }[];
+  } {
+    const wantAll = opts?.all === true;
+    const rid = String(opts?.runId || '').trim();
+    const jobs = wantAll
+      ? [...this.jobs.values()]
+      : rid
+        ? [this.jobs.get(rid)].filter(Boolean) as Job[]
+        : [this.resolveFocusJob()].filter(Boolean) as Job[];
+
+    const counts = emptyFailStageCounts();
+    const recent: { ts: number; stage: string; message: string; round?: number; runId?: string }[] =
+      [];
+    let totalFailed = 0;
+    for (const j of jobs) {
+      totalFailed += j.status.failed || 0;
+      for (const k of Object.keys(counts) as FailStageId[]) {
+        counts[k] += j.failStages?.[k] || 0;
+      }
+      for (const r of j.recentFails || []) {
+        recent.push({ ...r, runId: j.runId });
+      }
+    }
+    recent.sort((a, b) => b.ts - a.ts);
+    const stages = (Object.keys(counts) as FailStageId[])
+      .map((id) => ({
+        id,
+        label: FAIL_STAGE_LABELS[id],
+        count: counts[id]
+      }))
+      .filter((x) => x.count > 0)
+      .sort((a, b) => b.count - a.count);
+    return {
+      runId: wantAll ? null : jobs[0]?.runId || rid || this.focusRunId,
+      totalFailed,
+      stages,
+      recent: recent.slice(0, 30)
+    };
+  }
+
+  private noteJobFail(
+    job: Job,
+    message: string,
+    extra?: { round?: number; plan?: string }
+  ): FailStageId {
+    const stage = bumpFailStage(job.failStages, message);
+    job.recentFails.push({
+      ts: Date.now(),
+      stage,
+      message: String(message || '').slice(0, 240),
+      round: extra?.round
+    });
+    if (job.recentFails.length > 40) {
+      job.recentFails = job.recentFails.slice(-40);
+    }
+    return stage;
   }
 
   /** 解析最终使用的注册脚本目录 */
@@ -421,7 +494,9 @@ export class RegisterBot extends EventEmitter {
       runtimeConfigPath: null,
       structuredEventsSeen: false,
       countedResultRounds: new Set<number>(),
-      pendingAccount: {}
+      pendingAccount: {},
+      failStages: emptyFailStageCounts(),
+      recentFails: []
     };
     this.jobs.set(runId, job);
     this.focusRunId = runId;
@@ -781,7 +856,22 @@ export class RegisterBot extends EventEmitter {
         job.status.failed = failed;
         job.status.total = nextTotal;
         job.pendingAccount = {};
-        this.push({ type: 'failed', runId, success, failed, total: nextTotal });
+        const message = String(payload.message || '').trim();
+        const stage = this.noteJobFail(job, message || 'failed', {
+          round: Number.isFinite(round) ? round : undefined,
+          plan: payload.plan ? String(payload.plan) : undefined
+        });
+        this.push({
+          type: 'failed',
+          runId,
+          success,
+          failed,
+          total: nextTotal,
+          message: message || undefined,
+          failStage: stage,
+          plan: payload.plan ? String(payload.plan) : undefined,
+          round: Number.isFinite(round) ? round : undefined
+        });
         return;
       }
       case 'log': {
@@ -876,12 +966,16 @@ export class RegisterBot extends EventEmitter {
         if (round) job.countedResultRounds.add(round);
         job.status.failed++;
         job.pendingAccount = {};
+        const stage = this.noteJobFail(job, msg, { round: round || undefined });
         this.push({
           type: 'failed',
           runId,
           success: job.status.success,
           failed: job.status.failed,
-          total
+          total,
+          message: msg.slice(0, 240),
+          failStage: stage,
+          round: round || undefined
         });
       }
     }
