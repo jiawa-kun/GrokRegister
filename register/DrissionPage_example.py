@@ -1165,6 +1165,17 @@ def start_browser(*, max_proxy_tries: int | None = None):
     代理已启用却注入失败时抛 RuntimeError（禁止静默直连）。
     """
     _ = max_proxy_tries
+    # 并行/失败重试时可能残留旧 Chromium：先强制收干净，避免同 worker 双浏览器
+    try:
+        if browser is not None or _chrome_process_pid or _chrome_temp_dir:
+            stop_browser()
+        else:
+            _reap_children()
+    except Exception:
+        try:
+            stop_browser()
+        except Exception:
+            pass
     info = _start_browser_once()
     if isinstance(info, tuple):
         return info
