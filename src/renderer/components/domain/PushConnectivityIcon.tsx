@@ -8,6 +8,12 @@ type Tone = 'idle' | 'loading' | 'ok' | 'bad';
 
 type Target = 'cpa' | 'g2' | 'sub2';
 
+const SECRET_PLACEHOLDER = '********';
+
+function savedSecret(value: string): string | undefined {
+  return value.trim() === SECRET_PLACEHOLDER ? undefined : value;
+}
+
 /**
  * 推送卡片右侧：仅图标的远程连通检测。
  * - 黄：未点「允许推送」/ 未测 / 目标已开但地址未填全
@@ -98,7 +104,7 @@ export function PushConnectivityIcon({ draft }: { draft: AppSettings }) {
       for (const t of targets) {
         if (id !== seq.current) return;
         if (t === 'cpa') {
-          const r = await window.api.testCpaRemote({ url: cpaUrl, key: cpaKey });
+          const r = await window.api.testCpaRemote({ url: cpaUrl, key: savedSecret(cpaKey) });
           if (r?.ok) parts.push('CPA OK');
           else {
             allOk = false;
@@ -108,7 +114,7 @@ export function PushConnectivityIcon({ draft }: { draft: AppSettings }) {
           const r = await window.api.testGrok2apiRemote({
             url: g2Url,
             username: g2User,
-            password: g2Pass
+            password: savedSecret(g2Pass)
           });
           if (r?.ok) parts.push('g2 OK');
           else {
@@ -118,7 +124,7 @@ export function PushConnectivityIcon({ draft }: { draft: AppSettings }) {
         } else {
           const r = await window.api.testSub2apiRemote({
             url: s2Url,
-            token: s2Token
+            token: savedSecret(s2Token)
           });
           if (r?.ok) parts.push('sub2 OK');
           else {

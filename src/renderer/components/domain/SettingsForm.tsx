@@ -78,6 +78,13 @@ const TEXTAREA_CLASS =
 const SELECT_CLASS =
   'flex h-11 w-full rounded-[12px] border border-input bg-muted/60 px-3.5 py-2 text-[15px] tracking-[-0.01em] transition-colors focus-visible:border-primary/40 focus-visible:bg-card focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50';
 
+const SECRET_PLACEHOLDER = '********';
+
+function savedSecret(value: unknown): string | undefined {
+  const text = String(value || '').trim();
+  return text === SECRET_PLACEHOLDER ? undefined : text;
+}
+
 function RepoLink({ href, label }: { href: string; label: string }) {
   return (
     <a
@@ -1638,7 +1645,7 @@ export function SettingsForm() {
                           onTest={() =>
                             window.api.testCpaRemote({
                               url: draft.cpaRemoteUrl,
-                              key: draft.cpaManagementKey
+                              key: savedSecret(draft.cpaManagementKey)
                             })
                           }
                         />
@@ -1713,7 +1720,7 @@ export function SettingsForm() {
                             window.api.testGrok2apiRemote({
                               url: draft.grok2apiUrl,
                               username: draft.grok2apiUsername,
-                              password: draft.grok2apiPassword
+                              password: savedSecret(draft.grok2apiPassword)
                             })
                           }
                         />
@@ -1780,7 +1787,7 @@ export function SettingsForm() {
                           onTest={() =>
                             window.api.testSub2apiRemote({
                               url: draft.sub2apiRemoteUrl,
-                              token: draft.sub2apiAdminToken
+                              token: savedSecret(draft.sub2apiAdminToken)
                             })
                           }
                         />

@@ -6,7 +6,7 @@ import { promises as fsp, existsSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { loadSettings, dataDir } from './settingsStore.js';
+import { loadSettings, dataDir, isSecretPlaceholder } from './settingsStore.js';
 import { resolveHttpProxy } from './resolveHttpProxy.js';
 import { resolveRegisterRuntime } from './bot/registerRuntime.js';
 import { readBotFlagFromAuthRecord, readBotFlagFromToken } from './jwtBotFlag.js';
@@ -1577,7 +1577,7 @@ export async function testSub2apiRemoteConnectivity(input?: {
   );
   const token = normalizeSub2apiAdminSecret(
     String(
-      input?.token ??
+      (isSecretPlaceholder(input?.token) ? undefined : input?.token) ??
         (settings as { sub2apiAdminToken?: string }).sub2apiAdminToken ??
         ''
     )
@@ -1689,7 +1689,11 @@ export async function testCpaRemoteConnectivity(input?: {
   let base = String(input?.url ?? settings.cpaRemoteUrl ?? '')
     .trim()
     .replace(/\/+$/, '');
-  const key = String(input?.key ?? settings.cpaManagementKey ?? '').trim();
+  const key = String(
+    (isSecretPlaceholder(input?.key) ? undefined : input?.key) ??
+      settings.cpaManagementKey ??
+      ''
+  ).trim();
   if (base.endsWith('/v1')) base = base.slice(0, -3).replace(/\/+$/, '');
   if (!base) {
     return { ok: false, message: '请先填写远程 CPA 地址' };

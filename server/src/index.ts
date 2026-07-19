@@ -31,7 +31,8 @@ import {
   saveSettings,
   dataDir,
   isEncryptionAvailable,
-  maskSettingsForApi
+  maskSettingsForApi,
+  isSecretPlaceholder
 } from './settingsStore.js';
 import { registerBot } from './bot/registerBot.js';
 import {
@@ -1349,7 +1350,11 @@ app.post('/api/test/grok2api-remote', asyncHandler(async (req, res) => {
       .trim()
       .replace(/\/+$/, '');
     const username = String(body.username ?? settings.grok2apiUsername ?? '').trim();
-    const password = String(body.password ?? settings.grok2apiPassword ?? '').trim();
+    const password = String(
+      (isSecretPlaceholder(body.password) ? undefined : body.password) ??
+        settings.grok2apiPassword ??
+        ''
+    ).trim();
     if (!base) {
       return res.json({ ok: false, message: '请先填写 grok2api 地址' });
     }
