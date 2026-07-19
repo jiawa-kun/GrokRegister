@@ -837,9 +837,9 @@ def wait_for_verification_code(jwt: str, timeout: int = 120, email: str = "") ->
             msg_id = msg.get("id")
             if msg_id is None or msg_id in seen_ids:
                 continue
-            seen_ids.add(msg_id)
 
             # 列表接口通常已带正文；不够时再请求详情。
+            # 仅在成功提取验证码后才标记 seen，避免详情失败导致永不重试
             content = (
                 msg.get("raw")
                 or msg.get("text")
@@ -853,17 +853,18 @@ def wait_for_verification_code(jwt: str, timeout: int = 120, email: str = "") ->
                 content = "\n".join(str(x) for x in content)
             if not content:
                 detail = fetch_email_detail(jwt, msg_id, email=email or "")
-                if detail:
-                    content = (
-                        detail.get("raw")
-                        or detail.get("text")
-                        or detail.get("html")
-                        or detail.get("body")
-                        or detail.get("bodyPreview")
-                        or ""
-                    )
-                    if isinstance(content, list):
-                        content = "\n".join(str(x) for x in content)
+                if not detail:
+                    continue
+                content = (
+                    detail.get("raw")
+                    or detail.get("text")
+                    or detail.get("html")
+                    or detail.get("body")
+                    or detail.get("bodyPreview")
+                    or ""
+                )
+                if isinstance(content, list):
+                    content = "\n".join(str(x) for x in content)
 
             # 把 subject 也并进来，方便 6 位数字模式匹配
             subject = msg.get("subject") or ""
@@ -872,8 +873,12 @@ def wait_for_verification_code(jwt: str, timeout: int = 120, email: str = "") ->
 
             code = extract_verification_code(content)
             if code:
+                seen_ids.add(msg_id)
                 print(f"[*] 提取到验证码: {code}")
                 return code
+            # 有正文但提不出码：才标记，避免同信空转
+            if content and str(content).strip():
+                seen_ids.add(msg_id)
         time.sleep(poll_interval)
     return None
 

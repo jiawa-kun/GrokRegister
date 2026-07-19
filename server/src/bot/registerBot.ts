@@ -24,6 +24,7 @@ import {
 import { syncSingBoxFromSettings } from '../singboxManager.js';
 import { checkSso } from '../ssoCheck.js';
 import { resolveHttpProxy } from '../resolveHttpProxy.js';
+import { LineSplitter } from '../lineSplitter.js';
 
 interface StartOptions {
   runCountOverride?: number;
@@ -655,30 +656,33 @@ export class RegisterBot extends EventEmitter {
         job.status.pid = child.pid;
       }
 
-      child.stdout?.on('data', (data: Buffer) => {
-        const text = data.toString('utf-8').trim();
-        if (!text) return;
-        for (const line of text.split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          if (this.tryParseStructuredLine(job, trimmed, count)) {
-            continue;
-          }
-          this.parsePythonOutput(job, trimmed, count);
+      const stdoutSplit = new LineSplitter();
+      const stderrSplit = new LineSplitter();
+      const handleStdoutLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        if (this.tryParseStructuredLine(job, trimmed, count)) {
+          return;
         }
+        this.parsePythonOutput(job, trimmed, count);
+      };
+      const handleStderrLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        this.error(runId, trimmed);
+      };
+
+      child.stdout?.on('data', (data: Buffer) => {
+        stdoutSplit.push(data.toString('utf-8'), handleStdoutLine);
       });
 
       child.stderr?.on('data', (data: Buffer) => {
-        const text = data.toString('utf-8').trim();
-        if (!text) return;
-        for (const line of text.split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          this.error(runId, trimmed);
-        }
+        stderrSplit.push(data.toString('utf-8'), handleStderrLine);
       });
 
       child.on('close', (code) => {
+        stdoutSplit.flush(handleStdoutLine);
+        stderrSplit.flush(handleStderrLine);
         job.childProcess = null;
         this.clearKillTimers(job);
         this.extractSsoFromFile(runId, ssoFile);

@@ -382,35 +382,7 @@ def _write_and_probe_one(
     except Exception:
         pass
 
-    remote_result: dict[str, Any] | None = None
-    if fake_alive:
-        log(
-            f"[auth] channel={channel} ✘ 无 grok-4.5/chat，跳过 CPA 推送（假活 token）"
-            f" err={models_probe.get('error') or (chat_probe or {}).get('error') or 'not listed'}"
-        )
-        remote_result = {
-            "ok": False,
-            "skipped": True,
-            "error": "require_grok_45/chat: fake-alive gate",
-            "models": models_probe,
-            "chat": chat_probe,
-        }
-    elif not skip_remote:
-        r_url = (remote_url or "").strip()
-        r_key = (management_key or "").strip()
-        if not r_url or not r_key:
-            cfg_url, cfg_key = _read_cpa_remote_config()
-            r_url = r_url or cfg_url
-            r_key = r_key or cfg_key
-        if r_url and r_key:
-            try:
-                name = upload_cpa_auth_remote(r_url, r_key, payload)
-                log(f"[auth] channel={channel} CPA 远程推送 OK → {name}")
-                remote_result = {"ok": True, "url": r_url, "name": name}
-            except Exception as e:
-                log(f"[auth] channel={channel} CPA 远程推送失败: {e}")
-                remote_result = {"ok": False, "error": str(e), "url": r_url}
-
+    # 先最终 probe，再决定是否远程推送（避免 dead 凭据已推远端）
     probe = probe_and_cleanup(
         path,
         proxy=proxy or "",
@@ -430,18 +402,77 @@ def _write_and_probe_one(
         f"http={probe.get('http_status')} deleted={probe.get('deleted')} "
         f"{probe.get('summary') or probe.get('error') or ''}"
     )
-    alive = probe.get("action") == "ok" or (
-        probe.get("action") in ("error", "keep") or probe.get("mint_soft_warn")
-    )
     dead = probe.get("action") == "dead"
+    probe_error = probe.get("action") in ("error", "keep") or bool(
+        probe.get("mint_soft_warn")
+    )
+    probe_ok = probe.get("action") == "ok"
     still = path.is_file()
-    # 明确无 grok-4.5 → ok=False（不进 CPA）；models 网络失败不按假活判死
-    ok = bool(still) and not (dead and not still) and not fake_alive
+    # 待复验：网络/软错误，本地文件可保留，但不算成功、不推远端
+    pending_reprobe = bool(still) and not dead and not fake_alive and not probe_ok and probe_error
+    alive = probe_ok or pending_reprobe
+
+    remote_result: dict[str, Any] | None = None
+    if fake_alive:
+        log(
+            f"[auth] channel={channel} ✘ 无 grok-4.5/chat，跳过 CPA 推送（假活 token）"
+            f" err={models_probe.get('error') or (chat_probe or {}).get('error') or 'not listed'}"
+        )
+        remote_result = {
+            "ok": False,
+            "skipped": True,
+            "error": "require_grok_45/chat: fake-alive gate",
+            "models": models_probe,
+            "chat": chat_probe,
+        }
+    elif dead:
+        log(
+            f"[auth] channel={channel} ✘ probe=dead，跳过 CPA 推送 "
+            f"http={probe.get('http_status')}"
+        )
+        remote_result = {
+            "ok": False,
+            "skipped": True,
+            "error": f"probe dead HTTP {probe.get('http_status')}",
+            "probe": probe,
+        }
+    elif pending_reprobe:
+        log(
+            f"[auth] channel={channel} ⚠ probe 待复验，跳过 CPA 推送 "
+            f"action={probe.get('action')}"
+        )
+        remote_result = {
+            "ok": False,
+            "skipped": True,
+            "pending_reprobe": True,
+            "error": f"probe pending_reprobe action={probe.get('action')}",
+            "probe": probe,
+        }
+    elif not skip_remote:
+        r_url = (remote_url or "").strip()
+        r_key = (management_key or "").strip()
+        if not r_url or not r_key:
+            cfg_url, cfg_key = _read_cpa_remote_config()
+            r_url = r_url or cfg_url
+            r_key = r_key or cfg_key
+        if r_url and r_key:
+            try:
+                name = upload_cpa_auth_remote(r_url, r_key, payload)
+                log(f"[auth] channel={channel} CPA 远程推送 OK → {name}")
+                remote_result = {"ok": True, "url": r_url, "name": name}
+            except Exception as e:
+                log(f"[auth] channel={channel} CPA 远程推送失败: {e}")
+                remote_result = {"ok": False, "error": str(e), "url": r_url}
+
+    # 仅最终 probe 通过且非假活才算成功；dead 必失败；网络异常为待复验(ok=False)
+    ok = bool(still) and probe_ok and not dead and not fake_alive
     err = None
     if fake_alive:
         err = "require_grok_45: token ok but grok-4.5 not listed"
     elif dead:
         err = f"cpa probe dead HTTP {probe.get('http_status')}"
+    elif pending_reprobe:
+        err = f"cpa probe pending_reprobe action={probe.get('action')}"
     return {
         "ok": ok,
         "channel": channel,
@@ -451,7 +482,8 @@ def _write_and_probe_one(
         "sub": payload.get("sub") or "",
         "agent_id": (headers or {}).get("x-grok-agent-id", ""),
         "probe": probe,
-        "probe_alive": bool(alive) and not dead and not fake_alive,
+        "probe_alive": bool(probe_ok) and not dead and not fake_alive,
+        "pending_reprobe": pending_reprobe,
         "has_grok_45": has_g45,
         "models_probe": models_probe,
         "chat_probe": chat_probe,

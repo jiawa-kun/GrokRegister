@@ -1203,9 +1203,14 @@ def enqueue_sso_to_auth(
         "run_at": run_at,
         "enqueued_at": time.time(),
     }
+    # 先占 pending 再 put，避免 worker 已 task_done 后计数抖动
+    with _lock:
+        _pending += 1
     try:
         _q.put(job, timeout=_enqueue_block_sec)
     except queue.Full:
+        with _lock:
+            _pending = max(0, _pending - 1)
         _log(
             f"[auth-queue] ✘ 入队失败：队列已满 queue_max={_queue_max} "
             f"pending≈{_pending} email={email or '-'}（背压，未丢已入队任务）",
@@ -1218,8 +1223,10 @@ def enqueue_sso_to_auth(
             "pending": _pending,
             "flags": flags,
         }
-    with _lock:
-        _pending += 1
+    except Exception:
+        with _lock:
+            _pending = max(0, _pending - 1)
+        raise
     st = queue_stats()
     _log(
         f"[auth-queue] 已入队授权流水线 email={email or '-'} "

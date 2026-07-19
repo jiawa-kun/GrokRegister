@@ -1,13 +1,8 @@
 # -*- coding: utf-8 -*-
-"""账号侧车标签（NSFW 等），供 SSO 号池 / Auth 列表展示。
+"""账号侧车标签（NSFW / 推送等），跨进程 SQLite 持久化。
 
-落盘优先级（写用第一可写路径；读合并候选）:
-  1) $DATA_DIR/account_tags.json   ← Docker 持久卷 ./data:/data，重建镜像不丢
-  2) register/data/account_tags.json  ← 兼容旧数据（entrypoint 须 exclude data/）
-  {
-    "by_email": { "a@b.com": { "nsfw_enabled": true, "nsfw_at": "..." } },
-    "by_sso_hash": { "sha256...": { ... } }
-  }
+落盘: $DATA_DIR/gra_store.sqlite（account_tags 表）
+兼容读旧 JSON: account_tags.json（启动时惰性迁移一次）
 """
 from __future__ import annotations
 
@@ -19,9 +14,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-_LOCK = threading.Lock()
+from gra_sqlite import dumps_json, loads_json, now_ts, transaction
 
-# 与 Node settingsStore / docker-compose DATA_DIR 默认一致
+_MIGRATE_LOCK = threading.Lock()
+_MIGRATED = False
+
 _DEFAULT_DATA_DIR = "/data"
 
 
@@ -29,19 +26,15 @@ def _data_dir() -> Path:
     raw = (os.environ.get("DATA_DIR") or "").strip()
     if raw:
         return Path(raw).expanduser()
-    # Docker/生产默认；本地开发也可设 DATA_DIR
     return Path(_DEFAULT_DATA_DIR)
 
 
-def _path_candidates() -> list[Path]:
-    """读/写候选路径。DATA_DIR 优先，避免 hot-sync 覆盖 register/data。"""
+def _json_path_candidates() -> list[Path]:
     out: list[Path] = []
     out.append(_data_dir() / "account_tags.json")
-    # 兼容旧路径（可能已被 rsync 清过）
     reg = Path(__file__).resolve().parent
     out.append(reg / "data" / "account_tags.json")
     out.append(reg / "account_tags.json")
-    # 去重保序
     seen: set[str] = set()
     uniq: list[Path] = []
     for p in out:
@@ -56,12 +49,10 @@ def _path_candidates() -> list[Path]:
 
 
 def _primary_path() -> Path:
-    """写路径：始终 DATA_DIR（持久卷），不写会随镜像重建被清掉的路径。"""
     return _data_dir() / "account_tags.json"
 
 
 def primary_tags_path() -> str:
-    """供日志/诊断。"""
     return str(_primary_path())
 
 
@@ -84,7 +75,6 @@ def sso_hash(sso: str) -> str:
 
 
 def _merge_tag_maps(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
-    """合并 by_email / by_sso_hash；extra 覆盖同 key。"""
     out = {
         "by_email": dict(base.get("by_email") or {}),
         "by_sso_hash": dict(base.get("by_sso_hash") or {}),
@@ -102,40 +92,117 @@ def _merge_tag_maps(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, An
     return out
 
 
-def _load() -> dict[str, Any]:
-    """从所有候选路径合并读取（DATA_DIR 最后写入优先）。"""
-    merged: dict[str, Any] = {"by_email": {}, "by_sso_hash": {}}
-    for path in reversed(_path_candidates()):  # 低优先级先，高优先级后覆盖
+def _ensure_migrated() -> None:
+    global _MIGRATED
+    if _MIGRATED:
+        return
+    with _MIGRATE_LOCK:
+        if _MIGRATED:
+            return
         try:
-            if not path.is_file():
-                continue
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                data.setdefault("by_email", {})
-                data.setdefault("by_sso_hash", {})
-                merged = _merge_tag_maps(merged, data)
+            with transaction() as conn:
+                row = conn.execute("SELECT COUNT(*) AS c FROM account_tags").fetchone()
+                count = int(row["c"] if row else 0)
+                if count > 0:
+                    _MIGRATED = True
+                    return
+                merged: dict[str, Any] = {"by_email": {}, "by_sso_hash": {}}
+                for path in reversed(_json_path_candidates()):
+                    try:
+                        if not path.is_file():
+                            continue
+                        data = json.loads(path.read_text(encoding="utf-8"))
+                        if isinstance(data, dict):
+                            data.setdefault("by_email", {})
+                            data.setdefault("by_sso_hash", {})
+                            merged = _merge_tag_maps(merged, data)
+                    except Exception:
+                        continue
+                ts = now_ts()
+                for email, tag in (merged.get("by_email") or {}).items():
+                    if not isinstance(tag, dict):
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO account_tags(key_type, key_value, data_json, updated_at)
+                        VALUES('email', ?, ?, ?)
+                        ON CONFLICT(key_type, key_value) DO UPDATE SET
+                          data_json=excluded.data_json,
+                          updated_at=excluded.updated_at
+                        """,
+                        (str(email).strip().lower(), dumps_json(tag), ts),
+                    )
+                for h, tag in (merged.get("by_sso_hash") or {}).items():
+                    if not isinstance(tag, dict):
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO account_tags(key_type, key_value, data_json, updated_at)
+                        VALUES('sso_hash', ?, ?, ?)
+                        ON CONFLICT(key_type, key_value) DO UPDATE SET
+                          data_json=excluded.data_json,
+                          updated_at=excluded.updated_at
+                        """,
+                        (str(h).strip().lower(), dumps_json(tag), ts),
+                    )
         except Exception:
-            continue
-    return merged
+            pass
+        _MIGRATED = True
 
 
-def _save(data: dict[str, Any]) -> Path:
-    """只写 DATA_DIR 持久路径；返回写入路径。"""
-    path = _primary_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(path)
-    # 可选：再镜像到 register/data（仅备份；失败忽略）。主源始终是 DATA_DIR。
-    try:
-        legacy = Path(__file__).resolve().parent / "data" / "account_tags.json"
-        if path.resolve() != legacy.resolve():
-            legacy.parent.mkdir(parents=True, exist_ok=True)
-            legacy.write_text(payload, encoding="utf-8")
-    except Exception:
-        pass
-    return path
+def _patch_keys(
+    *,
+    email: str = "",
+    sso: str = "",
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    _ensure_migrated()
+    email_k = str(email or "").strip().lower()
+    h = sso_hash(sso)
+    if not email_k and not h:
+        raise ValueError("tag write requires email or sso")
+    written: dict[str, Any] = dict(patch)
+    with transaction() as conn:
+        ts = now_ts()
+        if email_k:
+            row = conn.execute(
+                "SELECT data_json FROM account_tags WHERE key_type='email' AND key_value=?",
+                (email_k,),
+            ).fetchone()
+            prev = loads_json(row["data_json"] if row else {})
+            prev.update(patch)
+            conn.execute(
+                """
+                INSERT INTO account_tags(key_type, key_value, data_json, updated_at)
+                VALUES('email', ?, ?, ?)
+                ON CONFLICT(key_type, key_value) DO UPDATE SET
+                  data_json=excluded.data_json,
+                  updated_at=excluded.updated_at
+                """,
+                (email_k, dumps_json(prev), ts),
+            )
+            written = prev
+        if h:
+            row = conn.execute(
+                "SELECT data_json FROM account_tags WHERE key_type='sso_hash' AND key_value=?",
+                (h,),
+            ).fetchone()
+            prev = loads_json(row["data_json"] if row else {})
+            prev.update(patch)
+            conn.execute(
+                """
+                INSERT INTO account_tags(key_type, key_value, data_json, updated_at)
+                VALUES('sso_hash', ?, ?, ?)
+                ON CONFLICT(key_type, key_value) DO UPDATE SET
+                  data_json=excluded.data_json,
+                  updated_at=excluded.updated_at
+                """,
+                (h, dumps_json(prev), ts),
+            )
+            if not email_k:
+                written = prev
+    written["_written_to"] = primary_tags_path()
+    return written
 
 
 def set_nsfw_tag(
@@ -146,7 +213,6 @@ def set_nsfw_tag(
     error: str = "",
     steps: Any = None,
 ) -> dict[str, Any]:
-    """写入 NSFW 开启结果（成功/失败都记）。始终落盘到 DATA_DIR。"""
     tag = {
         "nsfw_enabled": bool(enabled),
         "nsfw_attempted": True,
@@ -158,44 +224,46 @@ def set_nsfw_tag(
             tag["nsfw_steps"] = steps
         except Exception:
             pass
-    with _LOCK:
-        data = _load()
-        email_k = str(email or "").strip().lower()
-        if email_k:
-            prev = dict(data["by_email"].get(email_k) or {})
-            prev.update(tag)
-            data["by_email"][email_k] = prev
-        h = sso_hash(sso)
-        if h:
-            prev = dict(data["by_sso_hash"].get(h) or {})
-            prev.update(tag)
-            data["by_sso_hash"][h] = prev
-        if not email_k and not h:
-            # 无键无法索引：仍写入空操作避免静默丢
-            raise ValueError("set_nsfw_tag requires email or sso")
-        written = _save(data)
-        tag["_written_to"] = str(written)
-    return tag
+    return _patch_keys(email=email, sso=sso, patch=tag)
 
 
 def get_tag(*, email: str = "", sso: str = "") -> dict[str, Any]:
-    with _LOCK:
-        data = _load()
+    _ensure_migrated()
     email_k = str(email or "").strip().lower()
-    if email_k and email_k in data.get("by_email", {}):
-        return dict(data["by_email"][email_k] or {})
-    h = sso_hash(sso)
-    if h and h in data.get("by_sso_hash", {}):
-        return dict(data["by_sso_hash"][h] or {})
+    with transaction(immediate=False) as conn:
+        if email_k:
+            row = conn.execute(
+                "SELECT data_json FROM account_tags WHERE key_type='email' AND key_value=?",
+                (email_k,),
+            ).fetchone()
+            if row:
+                return loads_json(row["data_json"])
+        h = sso_hash(sso)
+        if h:
+            row = conn.execute(
+                "SELECT data_json FROM account_tags WHERE key_type='sso_hash' AND key_value=?",
+                (h,),
+            ).fetchone()
+            if row:
+                return loads_json(row["data_json"])
     return {}
 
 
 def dump_all() -> dict[str, Any]:
-    with _LOCK:
-        return _load()
+    _ensure_migrated()
+    out: dict[str, Any] = {"by_email": {}, "by_sso_hash": {}}
+    with transaction(immediate=False) as conn:
+        for row in conn.execute(
+            "SELECT key_type, key_value, data_json FROM account_tags"
+        ):
+            tag = loads_json(row["data_json"])
+            if row["key_type"] == "email":
+                out["by_email"][row["key_value"]] = tag
+            elif row["key_type"] == "sso_hash":
+                out["by_sso_hash"][row["key_value"]] = tag
+    return out
 
 
-# auth 文件上应保留的 NSFW 字段（重 mint / 探针回写时不得抹掉）
 NSFW_AUTH_KEYS = (
     "nsfw_enabled",
     "nsfw_attempted",
@@ -209,7 +277,6 @@ def preserve_nsfw_fields(
     new_doc: dict[str, Any],
     old_doc: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """把旧 auth JSON 的 nsfw_* 合并进新文档（仅当新文档尚未标记 attempted）。"""
     if not isinstance(new_doc, dict):
         return new_doc
     if new_doc.get("nsfw_attempted") is True:
@@ -225,7 +292,6 @@ def preserve_nsfw_fields(
 
 
 def patch_auth_file_nsfw(path: str | Path, *, enabled: bool, error: str = "") -> bool:
-    """把 nsfw 字段写回 CPA auth JSON（不挡主流程）。"""
     p = Path(path)
     if not p.is_file():
         return False
@@ -256,7 +322,6 @@ def set_zdr_tag(
     error: str = "",
     steps: Any = None,
 ) -> dict[str, Any]:
-    """写入 ZDR 关闭结果：closed=True → 关；False → 开。"""
     tag = {
         "zdr_closed": bool(closed),
         "zdr_attempted": True,
@@ -268,24 +333,13 @@ def set_zdr_tag(
             tag["zdr_steps"] = steps
         except Exception:
             pass
-    with _LOCK:
-        data = _load()
-        email_k = str(email or "").strip().lower()
-        if email_k:
-            prev = dict(data["by_email"].get(email_k) or {})
-            prev.update(tag)
-            data["by_email"][email_k] = prev
-        h = sso_hash(sso)
-        if h:
-            prev = dict(data["by_sso_hash"].get(h) or {})
-            prev.update(tag)
-            data["by_sso_hash"][h] = prev
-        _save(data)
-    return tag
+    try:
+        return _patch_keys(email=email, sso=sso, patch=tag)
+    except ValueError:
+        return tag
 
 
 def patch_auth_file_zdr(path: str | Path, *, closed: bool, error: str = "") -> bool:
-    """把 zdr 字段写回 CPA auth JSON（不挡主流程）。"""
     p = Path(path)
     if not p.is_file():
         return False
@@ -308,13 +362,6 @@ def patch_auth_file_zdr(path: str | Path, *, closed: bool, error: str = "") -> b
         return False
 
 
-# ---------------------------------------------------------------------------
-# 推送渠道标签：成功后打标，后续同渠道不再重复推送
-# 渠道:
-#   sso_g2        — SSO → grok2api
-#   auth_cpa      — Auth → CPA Management API
-#   auth_sub2api  — Auth → sub2api
-# ---------------------------------------------------------------------------
 PUSH_CHANNELS = ("sso_g2", "auth_cpa", "auth_sub2api")
 
 
@@ -353,7 +400,6 @@ def _normalize_push_channel(channel: str) -> str:
 
 
 def is_push_ok(*, channel: str, email: str = "", sso: str = "") -> bool:
-    """True = 该渠道已成功推送过，应跳过。"""
     ch = _normalize_push_channel(channel)
     if not ch:
         return False
@@ -370,7 +416,6 @@ def set_push_tag(
     error: str = "",
     detail: Any = None,
 ) -> dict[str, Any]:
-    """写入推送结果。ok=True 后 is_push_ok 为真，后续跳过同渠道推送。"""
     ch = _normalize_push_channel(channel)
     if not ch:
         raise ValueError("set_push_tag requires channel")
@@ -385,24 +430,9 @@ def set_push_tag(
             tag[f"push_{ch}_detail"] = detail
         except Exception:
             pass
-    with _LOCK:
-        data = _load()
-        email_k = str(email or "").strip().lower()
-        if email_k:
-            prev = dict(data["by_email"].get(email_k) or {})
-            prev.update(tag)
-            data["by_email"][email_k] = prev
-        h = sso_hash(sso)
-        if h:
-            prev = dict(data["by_sso_hash"].get(h) or {})
-            prev.update(tag)
-            data["by_sso_hash"][h] = prev
-        if not email_k and not h:
-            raise ValueError("set_push_tag requires email or sso")
-        written = _save(data)
-        tag["_written_to"] = str(written)
-        tag["channel"] = ch
-    return tag
+    written = _patch_keys(email=email, sso=sso, patch=tag)
+    written["channel"] = ch
+    return written
 
 
 def patch_auth_file_push(
@@ -412,7 +442,6 @@ def patch_auth_file_push(
     ok: bool,
     error: str = "",
 ) -> bool:
-    """把推送标签写回 CPA auth JSON（不挡主流程）。"""
     ch = _normalize_push_channel(channel)
     p = Path(path)
     if not p.is_file() or not ch:
@@ -437,7 +466,6 @@ def patch_auth_file_push(
 
 
 def clear_push_tag(*, channel: str, email: str = "", sso: str = "") -> bool:
-    """清除某渠道成功标记（需要强制重推时用）。"""
     ch = _normalize_push_channel(channel)
     keys = [
         _push_ok_key(ch),
@@ -446,25 +474,31 @@ def clear_push_tag(*, channel: str, email: str = "", sso: str = "") -> bool:
         _push_error_key(ch),
         f"push_{ch}_detail",
     ]
-    with _LOCK:
-        data = _load()
-        changed = False
-        email_k = str(email or "").strip().lower()
-        if email_k and email_k in data.get("by_email", {}):
-            prev = dict(data["by_email"][email_k] or {})
+    _ensure_migrated()
+    email_k = str(email or "").strip().lower()
+    h = sso_hash(sso)
+    changed = False
+    with transaction() as conn:
+        ts = now_ts()
+        for key_type, key_value in (("email", email_k), ("sso_hash", h)):
+            if not key_value:
+                continue
+            row = conn.execute(
+                "SELECT data_json FROM account_tags WHERE key_type=? AND key_value=?",
+                (key_type, key_value),
+            ).fetchone()
+            if not row:
+                continue
+            prev = loads_json(row["data_json"])
             for k in keys:
                 if k in prev:
                     prev.pop(k, None)
                     changed = True
-            data["by_email"][email_k] = prev
-        h = sso_hash(sso)
-        if h and h in data.get("by_sso_hash", {}):
-            prev = dict(data["by_sso_hash"][h] or {})
-            for k in keys:
-                if k in prev:
-                    prev.pop(k, None)
-                    changed = True
-            data["by_sso_hash"][h] = prev
-        if changed:
-            _save(data)
-        return changed
+            conn.execute(
+                """
+                UPDATE account_tags SET data_json=?, updated_at=?
+                WHERE key_type=? AND key_value=?
+                """,
+                (dumps_json(prev), ts, key_type, key_value),
+            )
+    return changed

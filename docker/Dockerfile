@@ -65,11 +65,12 @@ RUN python -m pip install --upgrade pip \
  && python -m pip install -r /app/register/requirements.txt \
  && apt-get update \
  && apt-get install -y --no-install-recommends rsync \
- && chmod +x /app/register/bin/cfwp/linux-amd64 /app/register/bin/cfwp/linux-arm64 2>/dev/null || true \
+ && rm -rf /var/lib/apt/lists/*
+# chmod 单独处理：二进制可能按架构缺失，不得吞掉上面 pip/apt 失败
+RUN chmod +x /app/register/bin/cfwp/linux-amd64 /app/register/bin/cfwp/linux-arm64 2>/dev/null || true \
  && chmod +x /app/register/bin/sing-box/linux-amd64 /app/register/bin/sing-box/linux-arm64 2>/dev/null || true \
  && chmod +x /opt/register-seed/bin/cfwp/linux-amd64 /opt/register-seed/bin/cfwp/linux-arm64 2>/dev/null || true \
- && chmod +x /opt/register-seed/bin/sing-box/linux-amd64 /opt/register-seed/bin/sing-box/linux-arm64 2>/dev/null || true \
- && rm -rf /var/lib/apt/lists/*
+ && chmod +x /opt/register-seed/bin/sing-box/linux-amd64 /opt/register-seed/bin/sing-box/linux-arm64 2>/dev/null || true
 
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules

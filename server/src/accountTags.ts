@@ -1,11 +1,12 @@
 /**
- * 读取 account_tags.json（NSFW 等侧车标签）
- * 与 Python account_tags.py 格式一致。
- * 主路径：DATA_DIR/account_tags.json（Docker ./data 卷，重建镜像不丢）
+ * 账号侧车标签（NSFW / 推送）
+ * 写路径优先走 Python gra_store_cli（SQLite，跨进程安全）；
+ * 读失败时回退旧 JSON。
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { resolveRegisterRuntime } from './bot/registerRuntime.js';
 
 export interface AccountTagEntry {
@@ -82,10 +83,56 @@ function mergeTagFiles(a: AccountTagsFile, b: AccountTagsFile): AccountTagsFile 
   return { by_email, by_sso_hash };
 }
 
+function runGraStoreCli(
+  cmd: string,
+  body?: Record<string, unknown>
+): { ok: boolean; data?: unknown; error?: string } | null {
+  try {
+    const rt = resolveRegisterRuntime({});
+    if (!rt?.registerDir || !rt.pythonPath) return null;
+    const script = join(rt.registerDir, 'gra_store_cli.py');
+    if (!existsSync(script)) return null;
+    const input = body ? JSON.stringify(body) : '';
+    const r = spawnSync(rt.pythonPath, [script, cmd], {
+      cwd: rt.registerDir,
+      input,
+      encoding: 'utf-8',
+      timeout: 15000,
+      env: {
+        ...process.env,
+        DATA_DIR: String(process.env.DATA_DIR || '/data'),
+        PYTHONIOENCODING: 'utf-8'
+      }
+    });
+    const text = String(r.stdout || '').trim();
+    if (!text) return null;
+    const parsed = JSON.parse(text) as { ok?: boolean; data?: unknown; error?: string };
+    return {
+      ok: Boolean(parsed.ok),
+      data: parsed.data,
+      error: parsed.error
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function loadAccountTags(): AccountTagsFile {
-  // 低优先级路径先读，高优先级后覆盖（与 tagsPathCandidates 顺序一致）
+  const viaCli = runGraStoreCli('dump_tags');
+  if (viaCli?.ok && viaCli.data && typeof viaCli.data === 'object') {
+    const raw = viaCli.data as Partial<AccountTagsFile>;
+    return {
+      by_email: (
+        raw.by_email && typeof raw.by_email === 'object' ? raw.by_email : {}
+      ) as Record<string, AccountTagEntry>,
+      by_sso_hash: (
+        raw.by_sso_hash && typeof raw.by_sso_hash === 'object' ? raw.by_sso_hash : {}
+      ) as Record<string, AccountTagEntry>
+    };
+  }
+
+  // 回退：低优先级路径先读，高优先级后覆盖
   let merged: AccountTagsFile = { by_email: {}, by_sso_hash: {} };
-  // 倒序：候选列表前面是高优先级（DATA_DIR），最后写入覆盖
   const paths = tagsPathCandidates().slice().reverse();
   for (const p of paths) {
     try {
@@ -293,7 +340,7 @@ export function allPushStatusesFromTag(tag: AccountTagEntry | null | undefined):
   };
 }
 
-/** 写入推送标签到 DATA_DIR/account_tags.json（与 Python set_push_tag 对齐） */
+/** 写入推送标签（优先 SQLite via Python CLI，失败回退 JSON） */
 export function setPushTag(opts: {
   channel: string;
   ok: boolean;
@@ -307,6 +354,16 @@ export function setPushTag(opts: {
   const h = opts.sso ? ssoHashHex(opts.sso) : '';
   if (!email && !h) return false;
 
+  const viaCli = runGraStoreCli('set_push_tag', {
+    channel: ch,
+    ok: Boolean(opts.ok),
+    email,
+    sso: String(opts.sso || ''),
+    error: String(opts.error || '')
+  });
+  if (viaCli?.ok) return true;
+
+  // 回退 JSON（仅当 Python CLI 不可用）
   const path = primaryAccountTagsPath();
   let data: AccountTagsFile = { by_email: {}, by_sso_hash: {} };
   try {

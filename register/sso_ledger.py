@@ -1,18 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-W3 · SSO 指纹账本：成功落盘/入队前原子去重。
+W3 · SSO 指纹账本：跨进程 SQLite 原子去重。
 
-文件: register/data/sso_identities.json
-  {
-    "by_hash": {
-      "sha256hex": {
-        "email": "...",
-        "first_seen": "ISO",
-        "last_seen": "ISO",
-        "count": 1
-      }
-    }
-  }
+表: sso_ledger（$DATA_DIR/gra_store.sqlite）
+兼容迁移: register/data/sso_identities.json
 """
 from __future__ import annotations
 
@@ -20,14 +11,16 @@ import hashlib
 import json
 import os
 import threading
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from gra_sqlite import dumps_json, loads_json, transaction
+
 _ROOT = Path(__file__).resolve().parent
 _DEFAULT_PATH = _ROOT / "data" / "sso_identities.json"
-_lock = threading.RLock()
+_MIGRATE_LOCK = threading.Lock()
+_MIGRATED = False
 
 
 def _now_iso() -> str:
@@ -47,39 +40,71 @@ def ledger_path() -> Path:
     env = os.environ.get("SSO_LEDGER_PATH", "").strip()
     if env:
         return Path(env)
+    data = (os.environ.get("DATA_DIR") or "").strip()
+    if data:
+        return Path(data) / "sso_identities.json"
     return _DEFAULT_PATH
 
 
-def _load(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {"by_hash": {}}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            return {"by_hash": {}}
-        bh = raw.get("by_hash")
-        if not isinstance(bh, dict):
-            raw["by_hash"] = {}
-        return raw
-    except Exception:
-        return {"by_hash": {}}
-
-
-def _save(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+def _ensure_migrated(path: Optional[Path] = None) -> None:
+    global _MIGRATED
+    if _MIGRATED:
+        return
+    with _MIGRATE_LOCK:
+        if _MIGRATED:
+            return
+        try:
+            with transaction() as conn:
+                row = conn.execute("SELECT COUNT(*) AS c FROM sso_ledger").fetchone()
+                if int(row["c"] if row else 0) > 0:
+                    _MIGRATED = True
+                    return
+                p = path or ledger_path()
+                if not p.is_file():
+                    _MIGRATED = True
+                    return
+                try:
+                    raw = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    _MIGRATED = True
+                    return
+                bh = raw.get("by_hash") if isinstance(raw, dict) else {}
+                if not isinstance(bh, dict):
+                    _MIGRATED = True
+                    return
+                for fp, entry in bh.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO sso_ledger(
+                          fingerprint, email, first_seen, last_seen, count, data_json
+                        ) VALUES(?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(fp),
+                            str(entry.get("email") or ""),
+                            str(entry.get("first_seen") or ""),
+                            str(entry.get("last_seen") or ""),
+                            int(entry.get("count") or 1),
+                            dumps_json(entry),
+                        ),
+                    )
+        except Exception:
+            pass
+        _MIGRATED = True
 
 
 def is_duplicate(sso: str, path: Optional[Path] = None) -> bool:
     fp = sso_fingerprint(sso)
     if not fp:
         return False
-    p = path or ledger_path()
-    with _lock:
-        data = _load(p)
-        return fp in (data.get("by_hash") or {})
+    _ensure_migrated(path)
+    with transaction(immediate=False) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM sso_ledger WHERE fingerprint=?", (fp,)
+        ).fetchone()
+        return row is not None
 
 
 def register_sso(
@@ -94,61 +119,99 @@ def register_sso(
 
     返回:
       { ok, duplicate, fingerprint, email, count }
-    若 duplicate 且 not allow_duplicate：不更新 count 的「首次」语义，ok=False。
+    若 duplicate 且 not allow_duplicate：ok=False。
     """
     fp = sso_fingerprint(sso)
     if not fp:
         return {"ok": False, "duplicate": False, "error": "empty sso", "fingerprint": ""}
 
-    p = path or ledger_path()
+    _ensure_migrated(path)
     email_n = str(email or "").strip().lower()
-    with _lock:
-        data = _load(p)
-        bh: dict[str, Any] = data.setdefault("by_hash", {})
-        prev = bh.get(fp)
-        if prev and not allow_duplicate:
-            # 更新 last_seen / count 便于审计，但标记 duplicate
-            try:
-                prev["last_seen"] = _now_iso()
-                prev["count"] = int(prev.get("count") or 1) + 1
-                if email_n and not prev.get("email"):
-                    prev["email"] = email_n
-                bh[fp] = prev
-                _save(p, data)
-            except Exception:
-                pass
+    now = _now_iso()
+
+    with transaction() as conn:
+        row = conn.execute(
+            "SELECT email, first_seen, last_seen, count, data_json FROM sso_ledger WHERE fingerprint=?",
+            (fp,),
+        ).fetchone()
+        if row and not allow_duplicate:
+            count = int(row["count"] or 1) + 1
+            email_keep = str(row["email"] or email_n)
+            if email_n and not row["email"]:
+                email_keep = email_n
+            prev = loads_json(row["data_json"])
+            prev.update(
+                {
+                    "email": email_keep,
+                    "first_seen": row["first_seen"] or now,
+                    "last_seen": now,
+                    "count": count,
+                }
+            )
+            conn.execute(
+                """
+                UPDATE sso_ledger
+                SET email=?, last_seen=?, count=?, data_json=?
+                WHERE fingerprint=?
+                """,
+                (email_keep, now, count, dumps_json(prev), fp),
+            )
             return {
                 "ok": False,
                 "duplicate": True,
                 "fingerprint": fp,
-                "email": str(prev.get("email") or email_n),
-                "count": int(prev.get("count") or 1),
-                "first_seen": prev.get("first_seen"),
+                "email": email_keep,
+                "count": count,
+                "first_seen": row["first_seen"] or now,
             }
 
-        now = _now_iso()
-        if prev:
-            entry = dict(prev)
-            entry["last_seen"] = now
-            entry["count"] = int(entry.get("count") or 1) + 1
-            if email_n:
-                entry["email"] = email_n
-        else:
+        if row:
+            count = int(row["count"] or 1) + 1
+            email_keep = email_n or str(row["email"] or "")
+            first = str(row["first_seen"] or now)
             entry = {
-                "email": email_n,
-                "first_seen": now,
+                "email": email_keep,
+                "first_seen": first,
                 "last_seen": now,
-                "count": 1,
+                "count": count,
             }
-        bh[fp] = entry
-        _save(p, data)
+            conn.execute(
+                """
+                UPDATE sso_ledger
+                SET email=?, last_seen=?, count=?, data_json=?
+                WHERE fingerprint=?
+                """,
+                (email_keep, now, count, dumps_json(entry), fp),
+            )
+            return {
+                "ok": True,
+                "duplicate": True,
+                "fingerprint": fp,
+                "email": email_keep,
+                "count": count,
+                "first_seen": first,
+            }
+
+        entry = {
+            "email": email_n,
+            "first_seen": now,
+            "last_seen": now,
+            "count": 1,
+        }
+        conn.execute(
+            """
+            INSERT INTO sso_ledger(fingerprint, email, first_seen, last_seen, count, data_json)
+            VALUES(?, ?, ?, ?, 1, ?)
+            """,
+            (fp, email_n, now, now, dumps_json(entry)),
+        )
         return {
             "ok": True,
-            "duplicate": bool(prev),
+            "duplicate": False,
             "fingerprint": fp,
             "email": email_n,
-            "count": int(entry.get("count") or 1),
-            "first_seen": entry.get("first_seen"),
+            "count": 1,
+            "first_seen": now,
         }
 
 

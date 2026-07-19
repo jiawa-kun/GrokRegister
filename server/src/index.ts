@@ -1,9 +1,21 @@
-import express, { type Request, type Response } from 'express';
+import express, {
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response
+} from 'express';
 import { createServer } from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { existsSync, promises as fsp, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import {
+  existsSync,
+  promises as fsp,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  chmodSync
+} from 'node:fs';
 import { WebSocket, WebSocketServer } from 'ws';
 
 import type { RegisterStartArgs, SystemHealth, SystemHealthCheck } from '@shared/ipc';
@@ -90,6 +102,11 @@ function ensureInternalApiKey(): string {
     if (existsSync(keyPath)) {
       const disk = readFileSync(keyPath, 'utf-8').trim();
       if (disk.length >= 16) {
+        try {
+          chmodSync(keyPath, 0o600);
+        } catch {
+          /* Windows / non-posix */
+        }
         process.env.GRA_INTERNAL_KEY = disk;
         return disk;
       }
@@ -100,7 +117,12 @@ function ensureInternalApiKey(): string {
   const generated = randomBytes(24).toString('hex');
   try {
     mkdirSync(dataDir(), { recursive: true });
-    writeFileSync(keyPath, generated, 'utf-8');
+    writeFileSync(keyPath, generated, { encoding: 'utf-8', mode: 0o600 });
+    try {
+      chmodSync(keyPath, 0o600);
+    } catch {
+      /* Windows / non-posix */
+    }
   } catch {
     /* 写盘失败仍用内存密钥，本进程 spawn 的 Python 可读 process.env */
   }
@@ -131,7 +153,7 @@ function isLoopbackReq(req: Request): boolean {
   );
 }
 
-/** 仅供本机 Python 回调的代理内部写接口（无 session 时需 internal key 或 loopback） */
+/** 仅白名单内部回调接口可使用 internal key / loopback 旁路 */
 function isInternalProxyCallbackPath(req: Request): boolean {
   const p = String(req.path || req.url || '').split('?')[0];
   return (
@@ -145,6 +167,14 @@ function isInternalProxyCallbackPath(req: Request): boolean {
     p.endsWith('/proxy/demote') ||
     p.endsWith('/singbox/rotate')
   );
+}
+
+type AsyncRoute = (req: Request, res: Response, next: NextFunction) => unknown | Promise<unknown>;
+
+function asyncHandler(fn: AsyncRoute): RequestHandler {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
 }
 const STATIC_ROOT = resolve(
   process.env.STATIC_ROOT || join(__dirname, '..', '..', '..', '..', 'out', 'renderer')
@@ -161,153 +191,183 @@ app.use((_req, res, next) => {
   next();
 });
 
-async function requireApiAuth(req: Request, res: Response, next: () => void) {
-  const state = await getAuthState(req);
-  if (state.authenticated) {
-    next();
-    return;
+async function requireApiAuth(req: Request, res: Response, next: NextFunction) {
+  try {
+    const state = await getAuthState(req);
+    if (state.authenticated) {
+      next();
+      return;
+    }
+    // 仅白名单内部回调：X-GRA-Internal 共享密钥（不可通吃全部 /api）
+    const hdr = String(
+      req.headers['x-gra-internal'] ||
+        req.headers['x-internal-key'] ||
+        req.headers['x-gra-internal-key'] ||
+        ''
+    ).trim();
+    if (
+      isInternalProxyCallbackPath(req) &&
+      INTERNAL_API_KEY &&
+      hdr &&
+      safeEqualStr(hdr, INTERNAL_API_KEY)
+    ) {
+      next();
+      return;
+    }
+    // 兼容：本机 loopback 访问代理成功/降级回调（无密钥的旧进程；逐步淘汰）
+    if (isInternalProxyCallbackPath(req) && isLoopbackReq(req)) {
+      next();
+      return;
+    }
+    res.status(401).json({ error: 'unauthorized' });
+  } catch (err) {
+    next(err);
   }
-  // Python 内部回调：X-GRA-Internal 共享密钥
-  const hdr = String(
-    req.headers['x-gra-internal'] ||
-      req.headers['x-internal-key'] ||
-      req.headers['x-gra-internal-key'] ||
-      ''
-  ).trim();
-  if (INTERNAL_API_KEY && hdr && safeEqualStr(hdr, INTERNAL_API_KEY)) {
-    next();
-    return;
-  }
-  // 兼容：本机 loopback 访问代理成功/降级回调（无密钥的旧进程）
-  if (isInternalProxyCallbackPath(req) && isLoopbackReq(req)) {
-    next();
-    return;
-  }
-  res.status(401).json({ error: 'unauthorized' });
 }
 
-app.get('/api/auth/me', async (req, res) => {
-  res.json(await getAuthState(req));
-});
+app.get(
+  '/api/auth/me',
+  asyncHandler(async (req, res) => {
+    res.json(await getAuthState(req));
+  })
+);
 
-app.get('/api/auth/bootstrap', async (_req, res) => {
-  res.json(await authBootstrapInfo());
-});
+app.get(
+  '/api/auth/bootstrap',
+  asyncHandler(async (_req, res) => {
+    res.json(await authBootstrapInfo());
+  })
+);
 
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const state = await login(req, res);
-    if (!state) {
-      res.status(401).json({ error: '用户名或密码不正确' });
-      return;
+app.post(
+  '/api/auth/login',
+  asyncHandler(async (req, res) => {
+    try {
+      const state = await login(req, res);
+      if (!state) {
+        res.status(401).json({ error: '用户名或密码不正确' });
+        return;
+      }
+      res.json(state);
+    } catch (err) {
+      if (err instanceof LoginRateLimitError) {
+        res.setHeader('Retry-After', String(err.retryAfterSec));
+        res.status(429).json({ error: err.message, retryAfter: err.retryAfterSec });
+        return;
+      }
+      throw err;
     }
-    res.json(state);
-  } catch (err) {
-    if (err instanceof LoginRateLimitError) {
-      res.setHeader('Retry-After', String(err.retryAfterSec));
-      res.status(429).json({ error: err.message, retryAfter: err.retryAfterSec });
-      return;
+  })
+);
+
+app.post(
+  '/api/auth/logout',
+  asyncHandler(async (req, res) => {
+    await logout(req, res);
+    res.json({ ok: true });
+  })
+);
+
+app.post(
+  '/api/auth/change',
+  asyncHandler(async (req, res) => {
+    try {
+      res.json(await changeCredentials(req, res, req.body));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(message === 'unauthorized' ? 401 : 400).json({ error: message });
     }
-    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-  }
-});
-
-app.post('/api/auth/logout', async (req, res) => {
-  await logout(req, res);
-  res.json({ ok: true });
-});
-
-app.post('/api/auth/change', async (req, res) => {
-  try {
-    res.json(await changeCredentials(req, res, req.body));
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    res.status(message === 'unauthorized' ? 401 : 400).json({ error: message });
-  }
-});
+  })
+);
 
 app.use('/api', requireApiAuth);
 
-app.get('/api/settings', async (_req, res) => {
-  res.json(await loadSettings());
-});
+app.get(
+  '/api/settings',
+  asyncHandler(async (_req, res) => {
+    res.json(await loadSettings());
+  })
+);
 
-app.put('/api/settings', async (req: Request, res: Response) => {
-  const body = req.body as AppSettings;
-  await saveSettings(body);
-  // 保存后同步 sing-box（普通/CF 代理已移除）
-  try {
-    const s = await loadSettings();
-    const singbox = await syncSingBoxFromSettings(s);
-    // 确保旧 CF 进程被停掉
+app.put(
+  '/api/settings',
+  asyncHandler(async (req: Request, res: Response) => {
+    const body = req.body as AppSettings;
+    await saveSettings(body);
+    // 保存后同步 sing-box（普通/CF 代理已移除）
     try {
-      await stopCfwp();
-    } catch {
-      /* ignore */
+      const s = await loadSettings();
+      const singbox = await syncSingBoxFromSettings(s);
+      // 确保旧 CF 进程被停掉
+      try {
+        await stopCfwp();
+      } catch {
+        /* ignore */
+      }
+      res.json({ ok: true, singbox });
+    } catch (err) {
+      console.error('[settings] proxy sync failed', err);
+      res.json({ ok: true, syncError: String(err) });
     }
-    res.json({ ok: true, singbox });
-  } catch (err) {
-    console.error('[settings] proxy sync failed', err);
-    res.json({ ok: true, syncError: String(err) });
-  }
-});
+  })
+);
 
 /** CF 独立代理（cfwp）状态 */
-app.get('/api/cf-proxy/status', async (_req, res) => {
+app.get('/api/cf-proxy/status', asyncHandler(async (_req, res) => {
   const s = await loadSettings();
   res.json(getCfwpStatus(s));
-});
+}));
 
 /** 按当前配置启动/重载 cfwp */
-app.post('/api/cf-proxy/start', async (_req, res) => {
+app.post('/api/cf-proxy/start', asyncHandler(async (_req, res) => {
   res.status(410).json({
     ok: false,
     error: 'CF 独立代理已移除，请使用 Sing-Box 或直连'
   });
-});
+}));
 
 /** 停止 cfwp（不改 settings；下次保存若仍开启会再启） */
-app.post('/api/cf-proxy/stop', async (_req, res) => {
+app.post('/api/cf-proxy/stop', asyncHandler(async (_req, res) => {
   const status = await stopCfwp();
   res.json({ ok: true, ...status });
-});
+}));
 
 /** 按当前 settings 同步（与保存时相同） */
-app.post('/api/cf-proxy/sync', async (_req, res) => {
+app.post('/api/cf-proxy/sync', asyncHandler(async (_req, res) => {
   const status = await stopCfwp();
   res.json({ ok: true, ...status, message: 'CF 独立代理已移除' });
-});
+}));
 
 /** 读取 cfwp 最近日志（只读） */
-app.get('/api/cf-proxy/log', async (req, res) => {
+app.get('/api/cf-proxy/log', asyncHandler(async (req, res) => {
   const s = await loadSettings();
   const tailRaw = Number(req.query.tail);
   const tail = Number.isFinite(tailRaw) ? tailRaw : 200;
   res.json(readCfwpLog(s, tail));
-});
+}));
 
 /** sing-box 独立代理状态 */
-app.get('/api/singbox/status', async (_req, res) => {
+app.get('/api/singbox/status', asyncHandler(async (_req, res) => {
   const s = await loadSettings();
   res.json(getSingBoxStatus(s));
-});
+}));
 
 /** 解析 settings 中的节点摘要 + 当前选中 */
-app.get('/api/singbox/nodes', async (_req, res) => {
+app.get('/api/singbox/nodes', asyncHandler(async (_req, res) => {
   const s = await loadSettings();
   const nodes = listSingBoxNodeSummaries(s.singBoxNodes || '');
   res.json({ nodes, selected: s.singBoxSelected || '' });
-});
+}));
 
 /** 解析任意节点文本（设置页 draft 预览，不写盘） */
-app.post('/api/singbox/parse', async (req, res) => {
+app.post('/api/singbox/parse', asyncHandler(async (req, res) => {
   const text = String((req.body as { nodes?: string })?.nodes ?? '');
   const nodes = listSingBoxNodeSummaries(text);
   res.json({ nodes, parseable: parseSingBoxNodes(text).length });
-});
+}));
 
 /** 按当前配置启动/重载 sing-box */
-app.post('/api/singbox/start', async (_req, res) => {
+app.post('/api/singbox/start', asyncHandler(async (_req, res) => {
   const s = await loadSettings();
   if (!s.singBoxEnabled) {
     res.status(400).json({
@@ -318,26 +378,26 @@ app.post('/api/singbox/start', async (_req, res) => {
   }
   const status = await syncSingBoxFromSettings(s);
   res.json({ ok: !status.lastError || status.running, ...status });
-});
+}));
 
 /** 停止 sing-box（不改 settings；下次保存若仍开启会再启） */
-app.post('/api/singbox/stop', async (_req, res) => {
+app.post('/api/singbox/stop', asyncHandler(async (_req, res) => {
   const status = await stopSingBox();
   res.json({ ok: true, ...status });
-});
+}));
 
 /** 按当前 settings 同步（与保存时相同） */
-app.post('/api/singbox/sync', async (_req, res) => {
+app.post('/api/singbox/sync', asyncHandler(async (_req, res) => {
   const s = await loadSettings();
   const status = await syncSingBoxFromSettings(s);
   res.json({ ok: true, ...status });
-});
+}));
 
 /**
  * 注册失败降级：切换到其他节点并重启 sing-box（内部密钥 / 已登录）。
  * Python pools.demote 在 singbox 模式下调用。
  */
-app.post('/api/singbox/rotate', async (req, res) => {
+app.post('/api/singbox/rotate', asyncHandler(async (req, res) => {
   const s = await loadSettings();
   if (!s.singBoxEnabled) {
     res.status(400).json({ ok: false, error: '未开启 sing-box', rotated: false });
@@ -355,31 +415,31 @@ app.post('/api/singbox/rotate', async (req, res) => {
       : status.lastError || '无其他可用节点或已用当前节点',
     ...status
   });
-});
+}));
 
 /** 读取 sing-box 最近日志（只读） */
-app.get('/api/singbox/log', async (req, res) => {
+app.get('/api/singbox/log', asyncHandler(async (req, res) => {
   const s = await loadSettings();
   const tailRaw = Number(req.query.tail);
   const tail = Number.isFinite(tailRaw) ? tailRaw : 200;
   res.json(readSingBoxLog(s, tail));
-});
+}));
 
-app.get('/api/system/health', async (_req, res) => {
+app.get('/api/system/health', asyncHandler(async (_req, res) => {
   res.json(await buildSystemHealth());
-});
+}));
 
 app.get('/api/system/version', (_req, res) => {
   const buildId = currentBuildId();
   res.json({ current: buildId, buildId, version: currentVersion() });
 });
 
-app.get('/api/system/update-check', async (_req, res) => {
+app.get('/api/system/update-check', asyncHandler(async (_req, res) => {
   res.json(await checkForUpdate());
-});
+}));
 
 /** 授权队列 metrics（register/data/auth_queue_metrics.json） */
-app.get('/api/auth-queue/metrics', async (_req, res) => {
+app.get('/api/auth-queue/metrics', asyncHandler(async (_req, res) => {
   try {
     const { loadSettings } = await import('./settingsStore.js');
     const { resolveRegisterRuntime } = await import('./bot/registerRuntime.js');
@@ -416,36 +476,36 @@ app.get('/api/auth-queue/metrics', async (_req, res) => {
   } catch (err) {
     res.status(500).json({ ok: false, error: (err as Error).message });
   }
-});
+}));
 
-app.get('/api/run/status', async (_req, res) => {
+app.get('/api/run/status', asyncHandler(async (_req, res) => {
   res.json(registerBot.getStatus());
-});
+}));
 
 /** 并行任务列表 */
-app.get('/api/run/jobs', async (_req, res) => {
+app.get('/api/run/jobs', asyncHandler(async (_req, res) => {
   res.json({
     jobs: registerBot.listJobs(),
     active: registerBot.activeCount(),
     focus: registerBot.getStatus().runId
   });
-});
+}));
 
-app.get('/api/run/jobs/:runId', async (req: Request, res: Response) => {
+app.get('/api/run/jobs/:runId', asyncHandler(async (req: Request, res: Response) => {
   const st = registerBot.getJobStatus(String(req.params.runId || ''));
   if (!st) {
     res.status(404).json({ error: '任务不存在' });
     return;
   }
   res.json(st);
-});
+}));
 
-app.post('/api/run/focus', async (req: Request, res: Response) => {
+app.post('/api/run/focus', asyncHandler(async (req: Request, res: Response) => {
   const runId = req.body?.runId != null ? String(req.body.runId) : null;
   res.json(registerBot.setFocus(runId || null));
-});
+}));
 
-app.post('/api/run/start', async (req: Request, res: Response) => {
+app.post('/api/run/start', asyncHandler(async (req: Request, res: Response) => {
   try {
     const args = (req.body ?? {}) as RegisterStartArgs & { maxParallel?: number };
     res.json(
@@ -457,9 +517,9 @@ app.post('/api/run/start', async (req: Request, res: Response) => {
   } catch (err) {
     res.status(400).json({ error: (err as Error).message });
   }
-});
+}));
 
-app.post('/api/run/stop', async (req: Request, res: Response) => {
+app.post('/api/run/stop', asyncHandler(async (req: Request, res: Response) => {
   try {
     const runId = req.body?.runId != null ? String(req.body.runId) : undefined;
     const stopAll = req.body?.stopAll === true;
@@ -467,33 +527,33 @@ app.post('/api/run/stop', async (req: Request, res: Response) => {
   } catch (err) {
     res.status(400).json({ error: (err as Error).message });
   }
-});
+}));
 
 /** 清理已停止/完成/失败的任务队列（不杀仍在运行的进程） */
-app.post('/api/run/jobs/clear-finished', async (_req: Request, res: Response) => {
+app.post('/api/run/jobs/clear-finished', asyncHandler(async (_req: Request, res: Response) => {
   try {
     res.json(registerBot.clearFinishedJobs());
   } catch (err) {
     res.status(400).json({ error: (err as Error).message });
   }
-});
+}));
 
-app.get('/api/accounts', async (_req, res) => {
+app.get('/api/accounts', asyncHandler(async (_req, res) => {
   res.json(await listAccounts());
-});
+}));
 
 /** 从 DATA_DIR/sso 与旧路径重新扫描导入历史账号 */
-app.post('/api/accounts/resync', async (_req, res) => {
+app.post('/api/accounts/resync', asyncHandler(async (_req, res) => {
   try {
     res.json(await resyncAccountsFromDisk());
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: message });
   }
-});
+}));
 
 /** 批量删除号池账号（按 id） */
-app.post('/api/accounts/delete', async (req: Request, res: Response) => {
+app.post('/api/accounts/delete', asyncHandler(async (req: Request, res: Response) => {
   try {
     const ids = Array.isArray(req.body?.ids) ? (req.body.ids as string[]) : [];
     res.json(await deleteAccounts(ids));
@@ -501,10 +561,10 @@ app.post('/api/accounts/delete', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
-});
+}));
 
 /** 文本/文件导入 SSO 到号池 */
-app.post('/api/accounts/import', async (req: Request, res: Response) => {
+app.post('/api/accounts/import', asyncHandler(async (req: Request, res: Response) => {
   try {
     const text = String(req.body?.text || '');
     const source = String(req.body?.source || 'paste');
@@ -521,10 +581,10 @@ app.post('/api/accounts/import', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
-});
+}));
 
 /** 号池 SSO → grok2api 手动推送（需推送设置开启 SSO→grok2api） */
-app.post('/api/accounts/push-grok2api', async (req: Request, res: Response) => {
+app.post('/api/accounts/push-grok2api', asyncHandler(async (req: Request, res: Response) => {
   try {
     const body = (req.body ?? {}) as {
       items?: { sso: string; email?: string; id?: string }[];
@@ -540,20 +600,20 @@ app.post('/api/accounts/push-grok2api', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
-});
+}));
 
 /** CPA auth 文件列表（data/auth 或 settings.authDir） */
-app.get('/api/cpa-auth', async (_req, res) => {
+app.get('/api/cpa-auth', asyncHandler(async (_req, res) => {
   try {
     res.json(await listCpaAuth());
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: message });
   }
-});
+}));
 
 /** 重签单个 CPA auth（refresh 优先，失败可带 sso；可选 pushRemote） */
-app.post('/api/cpa-auth/resign', async (req: Request, res: Response) => {
+app.post('/api/cpa-auth/resign', asyncHandler(async (req: Request, res: Response) => {
   try {
     const body = (req.body ?? {}) as {
       filename?: string;
@@ -567,10 +627,10 @@ app.post('/api/cpa-auth/resign', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
-});
+}));
 
 /** 批量重签 CPA auth */
-app.post('/api/cpa-auth/resign-batch', async (req: Request, res: Response) => {
+app.post('/api/cpa-auth/resign-batch', asyncHandler(async (req: Request, res: Response) => {
   try {
     const body = (req.body ?? {}) as {
       filenames?: string[];
@@ -584,10 +644,10 @@ app.post('/api/cpa-auth/resign-batch', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
-});
+}));
 
 /** 批量推送已有 auth 到远程 CPA（不重新 mint） */
-app.post('/api/cpa-auth/push-remote', async (req: Request, res: Response) => {
+app.post('/api/cpa-auth/push-remote', asyncHandler(async (req: Request, res: Response) => {
   try {
     const body = (req.body ?? {}) as {
       filenames?: string[];
@@ -599,10 +659,10 @@ app.post('/api/cpa-auth/push-remote', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
-});
+}));
 
 /** 批量推送已有 auth 到 sub2api（先转 grok oauth 格式再 POST） */
-app.post('/api/cpa-auth/push-sub2api', async (req: Request, res: Response) => {
+app.post('/api/cpa-auth/push-sub2api', asyncHandler(async (req: Request, res: Response) => {
   try {
     const body = (req.body ?? {}) as {
       filenames?: string[];
@@ -614,10 +674,10 @@ app.post('/api/cpa-auth/push-sub2api', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
-});
+}));
 
 /** 号池 SSO → CPA auth 补 mint */
-app.post('/api/cpa-auth/mint', async (req: Request, res: Response) => {
+app.post('/api/cpa-auth/mint', asyncHandler(async (req: Request, res: Response) => {
   try {
     const body = (req.body ?? {}) as {
       items?: { sso: string; email?: string }[];
@@ -637,10 +697,10 @@ app.post('/api/cpa-auth/mint', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
-});
+}));
 
 /** 批量 CPA 测活（cehuo /responses；401/402/403 默认删文件，可关） */
-app.post('/api/cpa-auth/probe-batch', async (req: Request, res: Response) => {
+app.post('/api/cpa-auth/probe-batch', asyncHandler(async (req: Request, res: Response) => {
   try {
     const body = (req.body ?? {}) as {
       filenames?: string[];
@@ -653,13 +713,13 @@ app.post('/api/cpa-auth/probe-batch', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
-});
+}));
 
 /**
  * 手动重登激活：密码登录 → mint 覆盖 → 随机英文消息 → 二次测活。
  * 浏览器登录通常 30～120s，前端勿当「秒失败」。
  */
-app.post('/api/cpa-auth/relogin', async (req: Request, res: Response) => {
+app.post('/api/cpa-auth/relogin', asyncHandler(async (req: Request, res: Response) => {
   try {
     const body = (req.body ?? {}) as {
       filename?: string;
@@ -670,10 +730,10 @@ app.post('/api/cpa-auth/relogin', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
-});
+}));
 
 /** 批量删除 CPA auth 文件 */
-app.post('/api/cpa-auth/delete', async (req: Request, res: Response) => {
+app.post('/api/cpa-auth/delete', asyncHandler(async (req: Request, res: Response) => {
   try {
     const body = (req.body ?? {}) as { filenames?: string[]; paths?: string[] };
     res.json(await deleteCpaAuthBatch(body));
@@ -681,10 +741,10 @@ app.post('/api/cpa-auth/delete', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
-});
+}));
 
 /** 读取 auth 文件内容（前端导出） */
-app.post('/api/cpa-auth/export', async (req: Request, res: Response) => {
+app.post('/api/cpa-auth/export', asyncHandler(async (req: Request, res: Response) => {
   try {
     const body = (req.body ?? {}) as { filenames?: string[] };
     res.json(await readCpaAuthFiles(body));
@@ -692,10 +752,10 @@ app.post('/api/cpa-auth/export', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
-});
+}));
 
 /** 从号池按 email 给 auth 回填顶层 sso（旧文件无 sso 时用于 hash 匹配） */
-app.post('/api/cpa-auth/backfill-sso', async (req: Request, res: Response) => {
+app.post('/api/cpa-auth/backfill-sso', asyncHandler(async (req: Request, res: Response) => {
   try {
     const body = (req.body ?? {}) as {
       filenames?: string[];
@@ -707,9 +767,9 @@ app.post('/api/cpa-auth/backfill-sso', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
-});
+}));
 
-app.get('/api/mail/code', async (req: Request, res: Response) => {
+app.get('/api/mail/code', asyncHandler(async (req: Request, res: Response) => {
   const address = String(req.query.address || '').trim();
   if (!address) {
     res.status(400).json({ error: '缺少邮箱地址' });
@@ -722,9 +782,9 @@ app.get('/api/mail/code', async (req: Request, res: Response) => {
     resolveHttpProxy(settings)
   );
   res.json(result);
-});
+}));
 
-app.post('/api/sso/check', async (req: Request, res: Response) => {
+app.post('/api/sso/check', asyncHandler(async (req: Request, res: Response) => {
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
   if (items.length === 0) {
     res.status(400).json({ error: '缺少待验活的 sso 列表' });
@@ -770,9 +830,9 @@ app.post('/api/sso/check', async (req: Request, res: Response) => {
     console.warn('[sso/check] persist ssoCheck failed:', err);
   }
   res.json({ results, emailsFilled });
-});
+}));
 
-app.post('/api/verify-code', async (req, res) => {
+app.post('/api/verify-code', asyncHandler(async (req, res) => {
   try {
     const jwt = req.body.jwt;
     if (!jwt) throw new Error("缺少 jwt");
@@ -790,10 +850,10 @@ app.post('/api/verify-code', async (req, res) => {
   } catch (err) {
     res.status(400).json({ error: (err as Error).message });
   }
-});
+}));
 
 
-app.post('/api/test/turnstile-solver', async (req, res) => {
+app.post('/api/test/turnstile-solver', asyncHandler(async (req, res) => {
   try {
     const settings = await loadSettings();
     const body = (req.body ?? {}) as {
@@ -870,9 +930,9 @@ app.post('/api/test/turnstile-solver', async (req, res) => {
   } catch (e: any) {
     return res.json({ ok: false, message: `检测异常: ${e?.message || e}` });
   }
-});
+}));
 
-app.post('/api/test/mail', async (req, res) => {
+app.post('/api/test/mail', asyncHandler(async (req, res) => {
   try {
     const body = (req.body ?? {}) as {
       apiBase?: string;
@@ -1246,10 +1306,10 @@ app.post('/api/test/mail', async (req, res) => {
   } catch (e: any) {
     return res.json({ ok: false, message: `连接失败: ${errorMessage(e)}` });
   }
-});
+}));
 
 /** 远程 CPA Management API 连通性检测（不上传文件） */
-app.post('/api/test/cpa-remote', async (req, res) => {
+app.post('/api/test/cpa-remote', asyncHandler(async (req, res) => {
   try {
     const body = (req.body ?? {}) as { url?: string; key?: string };
     const result = await testCpaRemoteConnectivity(body);
@@ -1257,10 +1317,10 @@ app.post('/api/test/cpa-remote', async (req, res) => {
   } catch (e: any) {
     return res.json({ ok: false, message: `检测异常: ${e?.message || e}` });
   }
-});
+}));
 
 /** 远程 sub2api Admin API 连通性检测（不上传账号） */
-app.post('/api/test/sub2api-remote', async (req, res) => {
+app.post('/api/test/sub2api-remote', asyncHandler(async (req, res) => {
   try {
     const body = (req.body ?? {}) as { url?: string; token?: string };
     const result = await testSub2apiRemoteConnectivity(body);
@@ -1268,10 +1328,10 @@ app.post('/api/test/sub2api-remote', async (req, res) => {
   } catch (e: any) {
     return res.json({ ok: false, message: `检测异常: ${e?.message || e}` });
   }
-});
+}));
 
 /** 远程 grok2api 管理登录连通性（不上传账号） */
-app.post('/api/test/grok2api-remote', async (req, res) => {
+app.post('/api/test/grok2api-remote', asyncHandler(async (req, res) => {
   try {
     const settings = await loadSettings();
     const body = (req.body ?? {}) as {
@@ -1400,10 +1460,10 @@ app.post('/api/test/grok2api-remote', async (req, res) => {
   } catch (e: any) {
     return res.json({ ok: false, message: `检测异常: ${errorMessage(e)}` });
   }
-});
+}));
 
 /** 代理池单条测活 */
-app.post('/api/test/proxy', async (req, res) => {
+app.post('/api/test/proxy', asyncHandler(async (req, res) => {
   try {
     const proxy = String(req.body?.proxy || req.body?.url || '').trim();
     if (!proxy) {
@@ -1414,21 +1474,21 @@ app.post('/api/test/proxy', async (req, res) => {
   } catch (e: any) {
     return res.json({ ok: false, message: `测活异常: ${e?.message || e}` });
   }
-});
+}));
 
 /**
  * 已废弃：无代理池后不再写成功计数。保留路由避免旧客户端 404。
  */
-app.post('/api/proxy/register-success', async (_req: Request, res: Response) => {
+app.post('/api/proxy/register-success', asyncHandler(async (_req: Request, res: Response) => {
   res.json({ ok: true, bumped: 0, message: 'disabled (no proxy pool)' });
-});
+}));
 
 /**
  * 注册失败降级：从「可用池」移到「待定池」。
  * body: { proxies: string[] | string, reason?: string }
  * 供 Python 注册机在页面不可达等场景回调（已取消出口 IP 检测）。
  */
-app.post('/api/proxy/demote', async (req: Request, res: Response) => {
+app.post('/api/proxy/demote', asyncHandler(async (req: Request, res: Response) => {
   try {
     const settings = await loadSettings();
     const raw = req.body?.proxies ?? req.body?.proxy ?? [];
@@ -1472,14 +1532,14 @@ app.post('/api/proxy/demote', async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(500).json({ ok: false, moved: 0, message });
   }
-});
+}));
 
 /**
  * 从网页拉取代理列表（hide.mn 表格 / 纯文本 ip:port 等）。
  * viaProxy=true 时用当前配置的 HTTP 代理出站（被墙时）。
  * pages：hide.mn 翻页数（1–20，默认 1）。
  */
-app.post('/api/proxy/fetch', async (req: Request, res: Response) => {
+app.post('/api/proxy/fetch', asyncHandler(async (req: Request, res: Response) => {
   try {
     const settings = await loadSettings();
     const url = String(
@@ -1508,10 +1568,10 @@ app.post('/api/proxy/fetch', async (req: Request, res: Response) => {
       sample: []
     });
   }
-});
+}));
 
 /** 代理池批量并发测活（单次建议 ≤48 条；大批量由前端分块，避免 CF 524） */
-app.post('/api/test/proxy-batch', async (req, res) => {
+app.post('/api/test/proxy-batch', asyncHandler(async (req, res) => {
   // 防止反代/客户端过早断开时 Node 仍傻等
   req.setTimeout(90_000);
   res.setTimeout(90_000);
@@ -1550,7 +1610,7 @@ app.post('/api/test/proxy-batch', async (req, res) => {
       message: `批量测活异常: ${e?.message || e}`
     });
   }
-});
+}));
 
 if (existsSync(STATIC_ROOT)) {
   app.use(express.static(STATIC_ROOT, { index: 'index.html' }));
@@ -1567,6 +1627,17 @@ if (existsSync(STATIC_ROOT)) {
       );
   });
 }
+
+
+app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  console.error('[api] unhandled route error', err);
+  res.status(500).json({ error: message || 'internal error' });
+});
 
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ noServer: true });
@@ -1600,30 +1671,46 @@ wss.on('connection', (ws) => {
   });
 });
 
-httpServer.on('upgrade', async (request, socket, head) => {
-  const pathname = (() => {
+httpServer.on('upgrade', (request, socket, head) => {
+  void (async () => {
     try {
-      return new URL(request.url || '/', 'http://localhost').pathname;
-    } catch {
-      return '/';
+      const pathname = (() => {
+        try {
+          return new URL(request.url || '/', 'http://localhost').pathname;
+        } catch {
+          return '/';
+        }
+      })();
+
+      if (pathname !== '/ws') {
+        socket.destroy();
+        return;
+      }
+
+      const state = await getAuthStateFromCookie(request.headers.cookie);
+      if (!state.authenticated) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
+    } catch (err) {
+      console.error('[ws] upgrade failed', err);
+      try {
+        socket.write('HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n');
+      } catch {
+        /* ignore */
+      }
+      try {
+        socket.destroy();
+      } catch {
+        /* ignore */
+      }
     }
   })();
-
-  if (pathname !== '/ws') {
-    socket.destroy();
-    return;
-  }
-
-  const state = await getAuthStateFromCookie(request.headers.cookie);
-  if (!state.authenticated) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-    socket.destroy();
-    return;
-  }
-
-  wss.handleUpgrade(request, socket, head, (ws) => {
-    wss.emit('connection', ws, request);
-  });
 });
 
 httpServer.listen(PORT, HOST, () => {
@@ -1754,5 +1841,11 @@ async function shutdown(sig: string) {
   setTimeout(() => process.exit(0), 8000).unref();
 }
 
+process.on('unhandledRejection', (reason) => {
+  console.error('[Grok Register Agent] unhandledRejection', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[Grok Register Agent] uncaughtException', err);
+});
 process.on('SIGINT', () => void shutdown('SIGINT'));
 process.on('SIGTERM', () => void shutdown('SIGTERM'));

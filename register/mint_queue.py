@@ -221,14 +221,19 @@ def enqueue_mint(
         "cloudflare_cookies": (cloudflare_cookies or "").strip(),
         "enqueued_at": time.time(),
     }
+    with _lock:
+        _pending += 1
     try:
         _q.put(job, timeout=max(1.0, float(block_sec)))
     except queue.Full:
+        with _lock:
+            _pending = max(0, _pending - 1)
         _log(f"[mint-queue] 背压：队列已满 email={email or '-'}", log)
         return {"queued": False, "error": "mint queue full", "backpressure": True}
-
-    with _lock:
-        _pending += 1
+    except Exception:
+        with _lock:
+            _pending = max(0, _pending - 1)
+        raise
     _log(
         f"[mint-queue] 已入队 email={email or '-'} pending≈{_pending} "
         f"qsize={_q.qsize()}",

@@ -520,9 +520,19 @@ def sso_to_token_via_browser_consent(
                 parsed = urllib.parse.urlparse(self.path)
                 q = urllib.parse.parse_qs(parsed.query or "")
                 code = (q.get("code") or [""])[0]
+                st = (q.get("state") or [""])[0]
                 if code:
+                    # 必须校验 OAuth state，防止并发 callback 串线
+                    if st and st != state:
+                        body = b"<html><body>state mismatch</body></html>"
+                        self.send_response(400)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
                     captured["code"] = code
-                    captured["state"] = (q.get("state") or [""])[0]
+                    captured["state"] = st
                 body = b"<html><body>OK close</body></html>"
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1085,6 +1095,12 @@ return (t.innerText || t.value || 'Allow').trim().slice(0, 32);
         while time.time() < deadline:
             # 1) local callback server
             if captured.get("code"):
+                cb_state = str(captured.get("state") or "")
+                if cb_state and cb_state != state:
+                    log("  ⚠ browser consent: callback state mismatch, ignore")
+                    captured.pop("code", None)
+                    captured.pop("state", None)
+                    continue
                 code = captured["code"]
                 log("  🔑 browser consent: got code from local callback")
                 break
