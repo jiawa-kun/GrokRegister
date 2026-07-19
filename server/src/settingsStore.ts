@@ -91,6 +91,27 @@ function encryptSettingsForDisk(settings: AppSettings): Record<string, unknown> 
   return doc;
 }
 
+function hasPlainSettingsSecrets(raw: unknown): boolean {
+  if (!isSecretEncryptionAvailable()) return false;
+  for (const path of SECRET_SETTING_PATHS) {
+    const value = readPath(raw, path);
+    if (typeof value === 'string' && value && !isEncryptedSecret(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function encryptRawSettingsSecrets(raw: unknown): Record<string, unknown> {
+  const doc = cloneJson(raw) as Record<string, unknown>;
+  for (const path of SECRET_SETTING_PATHS) {
+    const value = readPath(doc, path);
+    if (typeof value !== 'string' || !value || isEncryptedSecret(value)) continue;
+    writePath(doc, path, maybeEncryptSecret(value));
+  }
+  return doc;
+}
+
 function asPoolMode(v: unknown, fallback: PoolMode): PoolMode {
   return v === 'random' || v === 'round_robin' ? v : fallback;
 }
@@ -514,7 +535,14 @@ export async function loadSettings(): Promise<AppSettings> {
   if (existsSync(CONFIG_PATH)) {
     try {
       const raw = await fsp.readFile(CONFIG_PATH, 'utf-8');
-      cache = merge(decryptSettingsForRuntime(JSON.parse(raw)));
+      const parsed = JSON.parse(raw);
+      cache = merge(decryptSettingsForRuntime(parsed));
+      if (hasPlainSettingsSecrets(parsed)) {
+        const tmp = `${CONFIG_PATH}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+        await fsp.writeFile(tmp, JSON.stringify(encryptRawSettingsSecrets(parsed), null, 2), 'utf-8');
+        await fsp.rename(tmp, CONFIG_PATH);
+        console.log('[settingsStore] encrypted plaintext settings secrets in config.json');
+      }
       return cache;
     } catch (err) {
       console.error('[settingsStore] read failed, using defaults', err);

@@ -21,6 +21,7 @@ import {
   deleteAccounts,
   importAccountsFromText,
   listAccounts,
+  migrateAccountSecretStorage,
   resyncAccountsFromDisk
 } from './accountStore.js';
 import { checkForUpdate, currentVersion, currentBuildId } from './updateCheck.js';
@@ -1650,6 +1651,7 @@ httpServer.listen(PORT, HOST, () => {
   // 启动时同步 sing-box，并停止遗留 cfwp
   void loadSettings()
     .then(async (s) => {
+      await migrateAccountSecretStorage();
       try {
         await stopCfwp();
       } catch {

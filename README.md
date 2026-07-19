@@ -196,11 +196,18 @@ Plan C  harvest Castle/CF → CreateEmail（可无 castle 继续）→ 邮件码
 
 ## 本地从源码构建
 
-根目录 `docker-compose.yml` 需要本地 build 时：
+推荐使用本地部署脚本，它会检查 Docker、创建 `docker/.env`、自动生成 `GRA_MASTER_KEY`，并等待容器健康检查通过：
+
+```powershell
+.\scripts\deploy-local-docker.ps1
+```
+
+手动执行 compose 时：
 
 ```bash
 cd docker
 cp .env.example .env
+# 编辑 .env，至少填写 GRA_MASTER_KEY
 docker compose up -d --build
 ```
 

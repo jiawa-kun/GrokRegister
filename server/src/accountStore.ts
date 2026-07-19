@@ -14,6 +14,8 @@ import { dataDir } from './settingsStore.js';
 import {
   decryptSecretString,
   encryptSecretString,
+  isEncryptedSecret,
+  isSecretEncryptionAvailable,
   warnIfSecretEncryptionUnavailable
 } from './secretCrypto.js';
 
@@ -123,6 +125,31 @@ async function readJsonAccounts(path: string): Promise<AccountRecord[]> {
     return parsed.filter(isAccountRecord).map(decryptRecordForRuntime);
   } catch {
     return [];
+  }
+}
+
+async function encryptPlaintextAccountsIfNeeded(): Promise<void> {
+  const path = accountsPath();
+  if (!isSecretEncryptionAvailable() || !existsSync(path)) return;
+  try {
+    const raw = await fsp.readFile(path, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return;
+    const hasPlainSecret = parsed.some((item) => {
+      if (!item || typeof item !== 'object') return false;
+      const record = item as Record<string, unknown>;
+      return (
+        (typeof record.password === 'string' &&
+          record.password &&
+          !isEncryptedSecret(record.password)) ||
+        (typeof record.sso === 'string' && record.sso && !isEncryptedSecret(record.sso))
+      );
+    });
+    if (!hasPlainSecret) return;
+    await writeAll(parsed.filter(isAccountRecord).map(decryptRecordForRuntime));
+    console.log('[accountStore] encrypted plaintext account secrets in accounts.json');
+  } catch (err) {
+    console.error('[accountStore] account secret encryption migration failed', err);
   }
 }
 
@@ -406,6 +433,10 @@ export async function listAccounts(): Promise<AccountRecord[]> {
     }
     return withTags.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   });
+}
+
+export async function migrateAccountSecretStorage(): Promise<void> {
+  await withAccountsLock(encryptPlaintextAccountsIfNeeded);
 }
 
 /** 按 id 批量删除号池账号（仅写 accounts.json，不删 SSO 历史 txt） */
