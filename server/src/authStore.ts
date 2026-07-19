@@ -5,10 +5,13 @@ import type { Request, Response } from 'express';
 import { dataDir } from './settingsStore.js';
 
 const AUTH_PATH = join(dataDir(), 'auth.json');
+const AUTH_BOOTSTRAP_PATH = join(dataDir(), 'auth-bootstrap.json');
 const SESSION_COOKIE = 'grok_register_session';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 const DEFAULT_USERNAME = 'admin';
-const DEFAULT_PASSWORD = 'admin';
+const LOGIN_WINDOW_MS = 1000 * 60 * 10;
+const LOGIN_LOCK_MS = 1000 * 60 * 5;
+const LOGIN_MAX_FAILURES = 5;
 
 interface AuthRecord {
   username: string;
@@ -22,13 +25,46 @@ interface SessionRecord {
   expiresAt: number;
 }
 
+interface AuthBootstrapRecord {
+  username: string;
+  password: string;
+  source: 'env' | 'generated';
+  createdAt: string;
+}
+
 export interface AuthState {
   authenticated: boolean;
   username: string | null;
   mustChangePassword: boolean;
 }
 
+export interface AuthBootstrapInfo {
+  username: string;
+  defaultUsername: string;
+  mustChangePassword: boolean;
+  bootstrapFile: string | null;
+  initialPasswordAvailable: boolean;
+  initialPasswordSource: 'env' | 'file' | 'none';
+}
+
+export class LoginRateLimitError extends Error {
+  retryAfterSec: number;
+
+  constructor(retryAfterSec: number) {
+    super('登录失败次数过多，请稍后再试');
+    this.name = 'LoginRateLimitError';
+    this.retryAfterSec = retryAfterSec;
+  }
+}
+
+interface LoginAttemptRecord {
+  failures: number;
+  firstAt: number;
+  lockedUntil: number;
+}
+
 const sessions = new Map<string, SessionRecord>();
+const loginAttempts = new Map<string, LoginAttemptRecord>();
 let cache: AuthRecord | null = null;
 
 function hashPassword(password: string, salt: string) {
@@ -45,21 +81,100 @@ function makeRecord(username: string, password: string, mustChangePassword: bool
   };
 }
 
-function defaultRecord(): AuthRecord {
-  return makeRecord(DEFAULT_USERNAME, DEFAULT_PASSWORD, true);
+function randomInitialPassword(): string {
+  return randomBytes(24).toString('base64url');
+}
+
+async function atomicWriteJson(path: string, doc: unknown, mode?: number) {
+  await fsp.mkdir(dataDir(), { recursive: true });
+  const tmp = `${path}.${process.pid}.${Date.now()}.${randomBytes(8).toString('hex')}.tmp`;
+  await fsp.writeFile(tmp, JSON.stringify(doc, null, 2), { encoding: 'utf-8', mode });
+  await fsp.rename(tmp, path);
+  if (mode != null) {
+    try {
+      await fsp.chmod(path, mode);
+    } catch {
+      /* chmod is best-effort on Windows */
+    }
+  }
+}
+
+async function readBootstrapRecord(): Promise<AuthBootstrapRecord | null> {
+  if (!existsSync(AUTH_BOOTSTRAP_PATH)) return null;
+  try {
+    const parsed = JSON.parse(await fsp.readFile(AUTH_BOOTSTRAP_PATH, 'utf-8')) as Partial<AuthBootstrapRecord>;
+    const username = String(parsed.username || '').trim();
+    const password = String(parsed.password || '');
+    if (!username || !password) return null;
+    return {
+      username,
+      password,
+      source: parsed.source === 'env' ? 'env' : 'generated',
+      createdAt: typeof parsed.createdAt === 'string' ? parsed.createdAt : new Date().toISOString()
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function writeBootstrapRecord(record: AuthBootstrapRecord) {
+  await atomicWriteJson(AUTH_BOOTSTRAP_PATH, record, 0o600);
+}
+
+async function removeBootstrapRecord() {
+  try {
+    await fsp.unlink(AUTH_BOOTSTRAP_PATH);
+  } catch {
+    /* missing is fine */
+  }
+}
+
+async function initialCredentials(): Promise<{ username: string; password: string }> {
+  const username = DEFAULT_USERNAME;
+  const fromEnv = String(process.env.GRA_INITIAL_PASSWORD || '').trim();
+  if (fromEnv) {
+    await writeBootstrapRecord({
+      username,
+      password: fromEnv,
+      source: 'env',
+      createdAt: new Date().toISOString()
+    });
+    return { username, password: fromEnv };
+  }
+
+  const existing = await readBootstrapRecord();
+  if (existing?.password) {
+    return { username: existing.username || username, password: existing.password };
+  }
+
+  const password = randomInitialPassword();
+  await writeBootstrapRecord({
+    username,
+    password,
+    source: 'generated',
+    createdAt: new Date().toISOString()
+  });
+  return { username, password };
+}
+
+async function defaultRecord(): Promise<AuthRecord> {
+  const initial = await initialCredentials();
+  return makeRecord(initial.username, initial.password, true);
 }
 
 async function loadAuthRecord(): Promise<AuthRecord> {
   if (cache) return cache;
   if (!existsSync(AUTH_PATH)) {
-    cache = defaultRecord();
+    cache = await defaultRecord();
+    await saveAuthRecord(cache);
     return cache;
   }
   try {
     const raw = await fsp.readFile(AUTH_PATH, 'utf-8');
     const parsed = JSON.parse(raw) as Partial<AuthRecord>;
     if (!parsed.username || !parsed.passwordHash || !parsed.salt) {
-      cache = defaultRecord();
+      cache = await defaultRecord();
+      await saveAuthRecord(cache);
       return cache;
     }
     cache = {
@@ -70,17 +185,15 @@ async function loadAuthRecord(): Promise<AuthRecord> {
     };
     return cache;
   } catch {
-    cache = defaultRecord();
+    cache = await defaultRecord();
+    await saveAuthRecord(cache);
     return cache;
   }
 }
 
 async function saveAuthRecord(next: AuthRecord) {
   cache = next;
-  await fsp.mkdir(dataDir(), { recursive: true });
-  const tmp = `${AUTH_PATH}.tmp`;
-  await fsp.writeFile(tmp, JSON.stringify(next, null, 2), 'utf-8');
-  await fsp.rename(tmp, AUTH_PATH);
+  await atomicWriteJson(AUTH_PATH, next, 0o600);
 }
 
 function parseCookies(header: string | undefined): Record<string, string> {
@@ -116,6 +229,16 @@ function pruneSessions() {
 }
 
 setInterval(pruneSessions, 1000 * 60 * 10).unref();
+
+function pruneLoginAttempts() {
+  const now = Date.now();
+  for (const [key, item] of loginAttempts) {
+    if (item.lockedUntil > now) continue;
+    if (now - item.firstAt > LOGIN_WINDOW_MS) loginAttempts.delete(key);
+  }
+}
+
+setInterval(pruneLoginAttempts, 1000 * 60 * 10).unref();
 
 function readSessionFromCookie(cookie: string | undefined): SessionRecord | null {
   pruneSessions();
@@ -155,6 +278,51 @@ function clearCookie() {
   return pieces.join('; ');
 }
 
+function clientIp(req: Request): string {
+  return String(req.ip || req.socket?.remoteAddress || 'unknown');
+}
+
+function loginAttemptKey(req: Request, username: string): string {
+  return `${clientIp(req)}|${String(username || '').trim().toLowerCase() || '<empty>'}`;
+}
+
+function assertLoginAllowed(key: string): void {
+  pruneLoginAttempts();
+  const rec = loginAttempts.get(key);
+  if (!rec || rec.lockedUntil <= Date.now()) return;
+  throw new LoginRateLimitError(Math.ceil((rec.lockedUntil - Date.now()) / 1000));
+}
+
+function recordLoginFailure(key: string): void {
+  const now = Date.now();
+  const prev = loginAttempts.get(key);
+  const rec =
+    !prev || now - prev.firstAt > LOGIN_WINDOW_MS
+      ? { failures: 0, firstAt: now, lockedUntil: 0 }
+      : { ...prev };
+  rec.failures += 1;
+  if (rec.failures >= LOGIN_MAX_FAILURES) {
+    rec.lockedUntil = now + LOGIN_LOCK_MS;
+  }
+  loginAttempts.set(key, rec);
+}
+
+function clearLoginFailures(key: string): void {
+  loginAttempts.delete(key);
+}
+
+function issueSession(record: AuthRecord, res: Response): AuthState {
+  const token = randomBytes(24).toString('base64url');
+  const expiresAt = Date.now() + SESSION_TTL_MS;
+  sessions.set(token, { username: record.username, expiresAt });
+  res.append('Set-Cookie', buildCookie(token, expiresAt));
+  return {
+    authenticated: true,
+    username: record.username,
+    mustChangePassword: record.mustChangePassword
+  };
+}
+
 export async function getAuthStateFromCookie(cookie: string | undefined): Promise<AuthState> {
   const session = readSessionFromCookie(cookie);
   if (!session) {
@@ -178,19 +346,15 @@ export async function getAuthState(req: Request): Promise<AuthState> {
 export async function login(req: Request, res: Response): Promise<AuthState | null> {
   const username = String(req.body?.username || '').trim();
   const password = String(req.body?.password || '');
+  const key = loginAttemptKey(req, username);
+  assertLoginAllowed(key);
   const record = await loadAuthRecord();
   if (username !== record.username || !verifyPassword(record, password)) {
+    recordLoginFailure(key);
     return null;
   }
-  const token = randomBytes(24).toString('base64url');
-  const expiresAt = Date.now() + SESSION_TTL_MS;
-  sessions.set(token, { username: record.username, expiresAt });
-  res.append('Set-Cookie', buildCookie(token, expiresAt));
-  return {
-    authenticated: true,
-    username: record.username,
-    mustChangePassword: record.mustChangePassword
-  };
+  clearLoginFailures(key);
+  return issueSession(record, res);
 }
 
 export async function logout(req: Request, res: Response) {
@@ -199,7 +363,11 @@ export async function logout(req: Request, res: Response) {
   res.append('Set-Cookie', clearCookie());
 }
 
-export async function changeCredentials(req: Request, input: unknown): Promise<AuthState> {
+export async function changeCredentials(
+  req: Request,
+  res: Response,
+  input: unknown
+): Promise<AuthState> {
   const state = await getAuthState(req);
   if (!state.authenticated) {
     throw new Error('unauthorized');
@@ -226,22 +394,27 @@ export async function changeCredentials(req: Request, input: unknown): Promise<A
 
   const next = makeRecord(username, password, false);
   await saveAuthRecord(next);
-  for (const [token, session] of sessions) {
-    sessions.set(token, { ...session, username });
-  }
-  return {
-    authenticated: true,
-    username,
-    mustChangePassword: false
-  };
+  await removeBootstrapRecord();
+  sessions.clear();
+  loginAttempts.clear();
+  return issueSession(next, res);
 }
 
-export async function authBootstrapInfo() {
+export async function authBootstrapInfo(): Promise<AuthBootstrapInfo> {
   const record = await loadAuthRecord();
+  const bootstrap = await readBootstrapRecord();
   return {
     username: record.username,
     defaultUsername: DEFAULT_USERNAME,
-    defaultPassword: DEFAULT_PASSWORD,
-    mustChangePassword: record.mustChangePassword
+    mustChangePassword: record.mustChangePassword,
+    bootstrapFile: record.mustChangePassword ? AUTH_BOOTSTRAP_PATH : null,
+    initialPasswordAvailable: Boolean(record.mustChangePassword && bootstrap?.password),
+    initialPasswordSource: record.mustChangePassword
+      ? bootstrap?.source === 'env'
+        ? 'env'
+        : bootstrap?.password
+          ? 'file'
+          : 'none'
+      : 'none'
   };
 }

@@ -21,9 +21,15 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+try:
+    from runtime_config import runtime_config_path
+except Exception:
+    def runtime_config_path() -> Path:
+        return Path(__file__).resolve().parent / "config.json"
+
 LogFn = Callable[[str], None]
 
-_CONFIG = Path(__file__).resolve().parent / "config.json"
+_CONFIG = runtime_config_path()
 
 _q: queue.Queue[dict[str, Any] | None] | None = None
 _workers: list[threading.Thread] = []

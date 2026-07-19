@@ -3,12 +3,24 @@ import { randomUUID } from 'crypto';
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { loadSettings } from '../settingsStore.js';
 import { appendAccount, applyAccountSsoChecks } from '../accountStore.js';
-import type { AccountRecord, LogLevel, RunEvent, RunPhase, RunStatus } from '@shared/runEvents';
+import type {
+  AccountRecord,
+  LogLevel,
+  RunEvent,
+  RunPhase,
+  RunStatus,
+  StructuredRunEvent
+} from '@shared/runEvents';
 import { EMPTY_STATUS } from '@shared/runEvents';
 import type { AppSettings } from '@shared/settings';
 import fs from 'fs';
 import path from 'path';
-import { resolveRegisterRuntime, writeConfigForPython } from './registerRuntime.js';
+import {
+  buildRuntimeConfigPath,
+  cleanupRuntimeConfig,
+  resolveRegisterRuntime,
+  writeConfigForPython
+} from './registerRuntime.js';
 import { syncSingBoxFromSettings } from '../singboxManager.js';
 import { checkSso } from '../ssoCheck.js';
 import { resolveHttpProxy } from '../resolveHttpProxy.js';
@@ -43,6 +55,9 @@ interface Job {
   killEscalationTimer: ReturnType<typeof setTimeout> | null;
   killHardTimer: ReturnType<typeof setTimeout> | null;
   currentSsoFile: string | null;
+  runtimeConfigPath: string | null;
+  structuredEventsSeen: boolean;
+  countedResultRounds: Set<number>;
   pendingAccount: { email?: string; password?: string };
 }
 
@@ -402,6 +417,9 @@ export class RegisterBot extends EventEmitter {
       killEscalationTimer: null,
       killHardTimer: null,
       currentSsoFile: null,
+      runtimeConfigPath: null,
+      structuredEventsSeen: false,
+      countedResultRounds: new Set<number>(),
       pendingAccount: {}
     };
     this.jobs.set(runId, job);
@@ -547,6 +565,7 @@ export class RegisterBot extends EventEmitter {
     const job = this.jobs.get(runId);
     if (!job) return;
     this.clearKillTimers(job);
+    this.cleanupRuntimeConfig(job);
     job.status.phase = job.shouldStop ? 'killed' : success ? 'done' : 'error';
     job.status.finishedAt = Date.now();
     this.push({
@@ -575,8 +594,10 @@ export class RegisterBot extends EventEmitter {
 
     const { registerDir, scriptPath, pythonPath, entrypoint } = runtime;
 
-    // 并行时 config 共用；count 走 CLI，避免互相覆盖轮数
-    writeConfigForPython(registerDir, settings, count);
+    const runtimeConfigPath = buildRuntimeConfigPath(registerDir);
+    job.runtimeConfigPath = runtimeConfigPath;
+    // 并行时每任务写独立 runtime config；count 走 CLI，避免互相覆盖轮数
+    writeConfigForPython(registerDir, settings, count, { configPath: runtimeConfigPath });
     // 启动时在任务日志打一行代理摘要（与 Python [proxy] 双保险）
     try {
       const sb = (settings as { singBoxEnabled?: boolean }).singBoxEnabled === true;
@@ -616,6 +637,7 @@ export class RegisterBot extends EventEmitter {
           PYTHONIOENCODING: 'utf-8',
           PYTHONUNBUFFERED: '1',
           GROK_RUN_ID: runId,
+          GRA_CONFIG_PATH: runtimeConfigPath,
           // 代理成功计数 / 降级回调鉴权（与 Node requireApiAuth 共享）
           GRA_INTERNAL_KEY: process.env.GRA_INTERNAL_KEY || '',
           GRA_API_BASE:
@@ -639,6 +661,9 @@ export class RegisterBot extends EventEmitter {
         for (const line of text.split('\n')) {
           const trimmed = line.trim();
           if (!trimmed) continue;
+          if (this.tryParseStructuredLine(job, trimmed, count)) {
+            continue;
+          }
           this.parsePythonOutput(job, trimmed, count);
         }
       });
@@ -657,6 +682,7 @@ export class RegisterBot extends EventEmitter {
         job.childProcess = null;
         this.clearKillTimers(job);
         this.extractSsoFromFile(runId, ssoFile);
+        this.cleanupRuntimeConfig(job);
         if (code === 0 || job.shouldStop) {
           this.finalizeRun(runId, true);
           resolve();
@@ -669,11 +695,103 @@ export class RegisterBot extends EventEmitter {
       child.on('error', (err) => {
         job.childProcess = null;
         this.clearKillTimers(job);
+        this.cleanupRuntimeConfig(job);
         this.error(runId, `Python 进程启动失败: ${err.message}`);
         this.finalizeRun(runId, false);
         resolve();
       });
     });
+  }
+
+  private cleanupRuntimeConfig(job: Job) {
+    const configPath = job.runtimeConfigPath;
+    if (!configPath) return;
+    try {
+      cleanupRuntimeConfig(path.dirname(configPath), configPath);
+    } catch {
+      /* ignore */
+    }
+    job.runtimeConfigPath = null;
+  }
+
+  private tryParseStructuredLine(job: Job, line: string, total: number): boolean {
+    const raw = line.startsWith('GRA_EVENT:') ? line.slice('GRA_EVENT:'.length).trim() : '';
+    if (!raw) return false;
+    let payload: StructuredRunEvent | null = null;
+    try {
+      payload = JSON.parse(raw) as StructuredRunEvent;
+    } catch {
+      return false;
+    }
+    if (!payload || typeof payload !== 'object' || !payload.type) return false;
+    this.handleStructuredPayload(job, payload, total);
+    return true;
+  }
+
+  private handleStructuredPayload(job: Job, payload: StructuredRunEvent, total: number) {
+    const runId = job.runId;
+    const round = Number(payload.round ?? payload.current ?? job.status.current ?? 0);
+    switch (payload.type) {
+      case 'bootstrap': {
+        job.structuredEventsSeen = true;
+        return;
+      }
+      case 'progress': {
+        job.structuredEventsSeen = true;
+        const current = Number(payload.current ?? job.status.current ?? 0);
+        const nextTotal = Number(payload.total ?? total ?? job.status.total ?? 0);
+        job.status.current = current;
+        job.status.total = nextTotal;
+        job.pendingAccount = {};
+        this.push({ type: 'progress', runId, current, total: nextTotal });
+        return;
+      }
+      case 'success': {
+        job.structuredEventsSeen = true;
+        const success = Number(payload.success ?? job.status.success);
+        const failed = Number(payload.failed ?? job.status.failed);
+        const nextTotal = Number(payload.total ?? total ?? job.status.total ?? 0);
+        const email = String(payload.email || '').trim();
+        const password = String(payload.password || '').trim();
+        if (email) job.pendingAccount.email = email;
+        if (password) job.pendingAccount.password = password;
+        if (Number.isFinite(round) && round > 0) job.countedResultRounds.add(round);
+        job.status.success = success;
+        job.status.failed = failed;
+        job.status.total = nextTotal;
+        this.push({ type: 'success', runId, success, failed, total: nextTotal });
+        this.recordAccount(job, {
+          email,
+          password,
+          sso: String(payload.sso || '').trim()
+        });
+        return;
+      }
+      case 'failed': {
+        job.structuredEventsSeen = true;
+        const success = Number(payload.success ?? job.status.success);
+        const failed = Number(payload.failed ?? job.status.failed);
+        const nextTotal = Number(payload.total ?? total ?? job.status.total ?? 0);
+        if (Number.isFinite(round) && round > 0) job.countedResultRounds.add(round);
+        job.status.success = success;
+        job.status.failed = failed;
+        job.status.total = nextTotal;
+        job.pendingAccount = {};
+        this.push({ type: 'failed', runId, success, failed, total: nextTotal });
+        return;
+      }
+      case 'log': {
+        job.structuredEventsSeen = true;
+        const text = String(payload.text || '');
+        if (!text) return;
+        const level = payload.level || 'info';
+        if (level === 'error') this.error(runId, text);
+        else this.log(runId, text, level);
+        return;
+      }
+      default:
+        return;
+    }
   }
 
   private parsePythonOutput(job: Job, line: string, total: number) {
@@ -685,7 +803,13 @@ export class RegisterBot extends EventEmitter {
     if (/^[═─]+$/.test(msg.trim())) return;
 
     const roundMatch = msg.match(/第\s*(\d+)/);
-    if (roundMatch && msg.includes('轮') && !msg.includes('成功') && !msg.includes('失败')) {
+    if (
+      !job.structuredEventsSeen &&
+      roundMatch &&
+      msg.includes('轮') &&
+      !msg.includes('成功') &&
+      !msg.includes('失败')
+    ) {
       const current = parseInt(roundMatch[1], 10);
       job.status.current = current;
       job.pendingAccount = {};
@@ -716,16 +840,20 @@ export class RegisterBot extends EventEmitter {
       /第\s*\d+/.test(msg) &&
       !msg.includes('失败') &&
       !msg.includes('跳过');
-    if (isRoundSuccess) {
-      job.status.success++;
-      this.push({
-        type: 'success',
-        runId,
-        success: job.status.success,
-        failed: job.status.failed,
-        total
-      });
-      this.recordAccount(job);
+    if (!job.structuredEventsSeen && isRoundSuccess) {
+      const round = Number(msg.match(/第\s*(\d+)/)?.[1] || 0);
+      if (!round || !job.countedResultRounds.has(round)) {
+        if (round) job.countedResultRounds.add(round);
+        job.status.success++;
+        this.push({
+          type: 'success',
+          runId,
+          success: job.status.success,
+          failed: job.status.failed,
+          total
+        });
+        this.recordAccount(job);
+      }
     }
 
     // 失败/跳过均计入「失败」：Python 常用「✘ 第 N 轮跳过」不含「失败」字样
@@ -738,16 +866,20 @@ export class RegisterBot extends EventEmitter {
         (msg.includes('失败') || msg.includes('跳过'))) &&
       !msg.includes('轮成功') &&
       !isRoundSuccess;
-    if (isRoundFail) {
-      job.status.failed++;
-      job.pendingAccount = {};
-      this.push({
-        type: 'failed',
-        runId,
-        success: job.status.success,
-        failed: job.status.failed,
-        total
-      });
+    if (!job.structuredEventsSeen && isRoundFail) {
+      const round = Number(msg.match(/第\s*(\d+)/)?.[1] || 0);
+      if (!round || !job.countedResultRounds.has(round)) {
+        if (round) job.countedResultRounds.add(round);
+        job.status.failed++;
+        job.pendingAccount = {};
+        this.push({
+          type: 'failed',
+          runId,
+          success: job.status.success,
+          failed: job.status.failed,
+          total
+        });
+      }
     }
 
     // 噪声行：不写 UI 日志（进度/成功/失败事件已在上面处理）
@@ -760,7 +892,10 @@ export class RegisterBot extends EventEmitter {
     }
   }
 
-  private recordAccount(job: Job) {
+  private recordAccount(
+    job: Job,
+    override?: { email?: string; password?: string; sso?: string }
+  ) {
     const runId = job.runId;
     const { email, password } = job.pendingAccount;
     job.pendingAccount = {};
@@ -808,9 +943,9 @@ export class RegisterBot extends EventEmitter {
       /* ignore */
     }
 
-    const finalEmail = (email || fileEmail || '').trim();
-    const finalPassword = (password || filePassword || '').trim();
-    const finalSso = (sso || '').trim();
+    const finalEmail = (override?.email || email || fileEmail || '').trim();
+    const finalPassword = (override?.password || password || filePassword || '').trim();
+    const finalSso = (override?.sso || sso || '').trim();
     // 原先要求 email||password：Plan C 只有 [hybrid] email= 未匹配时直接 return → 无号池/无验活
     if (!finalEmail && !finalPassword && !finalSso) return;
     if (!finalSso) {

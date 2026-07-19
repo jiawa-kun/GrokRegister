@@ -75,6 +75,32 @@ export interface AccountRecord {
   zdrStatus?: 'closed' | 'open' | 'none';
 }
 
+export interface StructuredRunEvent {
+  type: 'log' | 'progress' | 'account' | 'success' | 'failed' | 'sso' | 'exit' | 'bootstrap';
+  runId?: string;
+  level?: LogLevel;
+  current?: number;
+  total?: number;
+  success?: number;
+  failed?: number;
+  pid?: number;
+  text?: string;
+  token?: string;
+  record?: AccountRecord;
+  code?: number | null;
+  signal?: string | null;
+  killed?: boolean;
+  phase?: string;
+  username?: string;
+  email?: string;
+  password?: string;
+  sso?: string;
+  plan?: string;
+  round?: number;
+  message?: string;
+  ts?: number;
+}
+
 /** Auth 重登阶段（WebSocket 推送，UI 显示登录中/mint/激活） */
 export type ReloginStage =
   | 'queued'
@@ -110,7 +136,8 @@ export type RunEvent =
       stage: ReloginStage;
       message?: string;
       ts: number;
-    };
+    }
+  | { type: 'structured'; payload: StructuredRunEvent; raw?: string };
 
 /** 测试连接的统一返回 */
 export interface TestResult {

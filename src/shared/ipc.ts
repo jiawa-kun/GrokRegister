@@ -251,6 +251,15 @@ export interface AuthState {
   mustChangePassword: boolean;
 }
 
+export interface AuthBootstrapInfo {
+  username: string;
+  defaultUsername: string;
+  mustChangePassword: boolean;
+  bootstrapFile: string | null;
+  initialPasswordAvailable: boolean;
+  initialPasswordSource: 'env' | 'file' | 'none';
+}
+
 export interface ChangeCredentialsInput {
   currentPassword: string;
   username: string;
@@ -283,6 +292,7 @@ export interface SystemHealth {
 export interface RendererApi {
   // auth
   getAuthState(): Promise<AuthState>;
+  getAuthBootstrap(): Promise<AuthBootstrapInfo>;
   login(username: string, password: string): Promise<AuthState>;
   logout(): Promise<{ ok: true }>;
   changeCredentials(input: ChangeCredentialsInput): Promise<AuthState>;

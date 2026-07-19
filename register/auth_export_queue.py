@@ -28,9 +28,15 @@ import time
 from pathlib import Path  # used by NSFW/sub2api helpers
 from typing import Any, Callable, Optional
 
+try:
+    from runtime_config import runtime_config_path
+except Exception:
+    def runtime_config_path() -> Path:
+        return Path(__file__).resolve().parent / "config.json"
+
 LogFn = Callable[[str], None]
 
-_CONFIG = Path(__file__).resolve().parent / "config.json"
+_CONFIG = runtime_config_path()
 
 _q: queue.Queue[dict[str, Any] | None] | None = None
 _workers: list[threading.Thread] = []
@@ -1101,7 +1107,7 @@ def resolve_mint_proxy(explicit: str = "") -> str:
             import json as _j
             from pathlib import Path as _P
 
-            cp = _P(__file__).resolve().parent / "config.json"
+            cp = runtime_config_path()
             if cp.is_file():
                 conf = _j.loads(cp.read_text(encoding="utf-8")) or {}
         except Exception:

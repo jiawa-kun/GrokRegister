@@ -13,7 +13,14 @@ from __future__ import annotations
 
 import secrets
 import time
+from pathlib import Path
 from typing import Any, Callable
+
+try:
+    from runtime_config import runtime_config_path
+except Exception:
+    def runtime_config_path() -> Path:
+        return Path(__file__).resolve().parent / "config.json"
 
 LogFn = Callable[[str], None]
 
@@ -241,10 +248,8 @@ def simulate_submit_click(page) -> dict[str, Any]:
 
 def _load_register_config() -> dict:
     import json
-    import os
-    from pathlib import Path
 
-    p = Path(os.path.join(os.path.dirname(__file__), "config.json"))
+    p = runtime_config_path()
     if not p.is_file():
         return {}
     try:

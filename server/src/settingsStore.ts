@@ -3,6 +3,7 @@
  * 没有 Electron safeStorage，落盘到 DATA_DIR/config.json。
  * Linux 用户应该把 DATA_DIR 挂成 docker volume 以保留配置。
  */
+import { randomUUID } from 'node:crypto';
 import { promises as fsp, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import {
@@ -14,11 +15,81 @@ import {
   DEFAULT_SETTINGS,
   enforceProxyModeMutex
 } from '@shared/settings';
+import {
+  isEncryptedSecret,
+  isSecretEncryptionAvailable,
+  maybeDecryptSecret,
+  maybeEncryptSecret,
+  warnIfSecretEncryptionUnavailable
+} from './secretCrypto.js';
 
 const DATA_DIR = resolve(process.env.DATA_DIR || '/data');
 const CONFIG_PATH = join(DATA_DIR, 'config.json');
 
 let cache: AppSettings | null = null;
+
+const SECRET_SETTING_PATHS = [
+  ['mail', 'adminAuth'],
+  ['cfProxyToken'],
+  ['yescaptchaKey'],
+  ['sub2apiAdminToken'],
+  ['cpaManagementKey'],
+  ['grok2apiPassword']
+] as const;
+
+type SecretPath = (typeof SECRET_SETTING_PATHS)[number];
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value ?? {})) as T;
+}
+
+function readPath(root: unknown, path: SecretPath): unknown {
+  let cur = root as Record<string, unknown> | undefined;
+  for (const key of path) {
+    if (!cur || typeof cur !== 'object') return undefined;
+    cur = cur[key] as Record<string, unknown> | undefined;
+  }
+  return cur;
+}
+
+function writePath(root: Record<string, unknown>, path: SecretPath, value: unknown): void {
+  let cur = root;
+  for (let i = 0; i < path.length - 1; i++) {
+    const key = path[i];
+    const next = cur[key];
+    if (!next || typeof next !== 'object' || Array.isArray(next)) {
+      cur[key] = {};
+    }
+    cur = cur[key] as Record<string, unknown>;
+  }
+  cur[path[path.length - 1]] = value;
+}
+
+function decryptSettingsForRuntime(raw: unknown): unknown {
+  const doc = cloneJson(raw) as Record<string, unknown>;
+  for (const path of SECRET_SETTING_PATHS) {
+    const value = readPath(doc, path);
+    if (typeof value === 'string' && isEncryptedSecret(value)) {
+      writePath(doc, path, maybeDecryptSecret(value, `settings.${path.join('.')}`));
+    }
+  }
+  return doc;
+}
+
+function encryptSettingsForDisk(settings: AppSettings): Record<string, unknown> {
+  const doc = cloneJson(settings) as Record<string, unknown>;
+  let hasPlainSecret = false;
+  for (const path of SECRET_SETTING_PATHS) {
+    const value = readPath(doc, path);
+    if (typeof value !== 'string' || !value) continue;
+    if (!isEncryptedSecret(value)) hasPlainSecret = true;
+    writePath(doc, path, maybeEncryptSecret(value));
+  }
+  if (hasPlainSecret && !isSecretEncryptionAvailable()) {
+    warnIfSecretEncryptionUnavailable('settings secrets');
+  }
+  return doc;
+}
 
 function asPoolMode(v: unknown, fallback: PoolMode): PoolMode {
   return v === 'random' || v === 'round_robin' ? v : fallback;
@@ -443,7 +514,7 @@ export async function loadSettings(): Promise<AppSettings> {
   if (existsSync(CONFIG_PATH)) {
     try {
       const raw = await fsp.readFile(CONFIG_PATH, 'utf-8');
-      cache = merge(JSON.parse(raw));
+      cache = merge(decryptSettingsForRuntime(JSON.parse(raw)));
       return cache;
     } catch (err) {
       console.error('[settingsStore] read failed, using defaults', err);
@@ -456,8 +527,8 @@ export async function loadSettings(): Promise<AppSettings> {
 export async function saveSettings(next: AppSettings): Promise<void> {
   cache = merge(next);
   await fsp.mkdir(DATA_DIR, { recursive: true });
-  const tmp = `${CONFIG_PATH}.tmp`;
-  await fsp.writeFile(tmp, JSON.stringify(cache, null, 2), 'utf-8');
+  const tmp = `${CONFIG_PATH}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+  await fsp.writeFile(tmp, JSON.stringify(encryptSettingsForDisk(cache), null, 2), 'utf-8');
   await fsp.rename(tmp, CONFIG_PATH);
 }
 
@@ -466,6 +537,5 @@ export function dataDir(): string {
 }
 
 export function isEncryptionAvailable(): boolean {
-  // 服务端永远是明文（落到挂载卷里），UI 上据此提示 Linux 用户
-  return false;
+  return isSecretEncryptionAvailable();
 }

@@ -32,6 +32,12 @@ from typing import Any
 
 from curl_cffi import requests
 
+try:
+    from runtime_config import runtime_config_path
+except Exception:
+    def runtime_config_path() -> Path:
+        return Path(__file__).resolve().parent / "config.json"
+
 from cpa_schema import (
     CLIENT_ID,
     DEFAULT_BASE_URL as CPA_GROK_BASE_URL,
@@ -701,7 +707,7 @@ def sso_to_token_via_browser_consent(
             pref_local = True
             try:
                 import json as _jpx
-                _cp = Path(__file__).resolve().parent / "config.json"
+                _cp = runtime_config_path()
                 if _cp.is_file():
                     pref_local = bool(
                         (_jpx.loads(_cp.read_text(encoding="utf-8")) or {}).get(
@@ -1834,7 +1840,7 @@ def upload_cpa_auth_remote(
         base = base[:-3].rstrip("/")
 
     # 配置覆盖
-    conf_path = _Path(__file__).resolve().parent / "config.json"
+    conf_path = runtime_config_path()
     try:
         conf = json.loads(conf_path.read_text(encoding="utf-8"))
         if conf.get("cpa_remote_timeout") is not None:

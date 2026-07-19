@@ -26,6 +26,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+try:
+    from runtime_config import runtime_config_path
+except Exception:
+    def runtime_config_path() -> Path:
+        return Path(__file__).resolve().parent / "config.json"
+
 _lock = threading.Lock()
 _proxy_list: List[str] = []
 _domain_list: List[str] = []
@@ -41,7 +47,7 @@ _proxy_last_used: Dict[str, float] = {}
 
 
 def _config_path() -> Path:
-    return Path(__file__).resolve().parent / "config.json"
+    return runtime_config_path()
 
 
 _HOST_PORT_RE = re.compile(

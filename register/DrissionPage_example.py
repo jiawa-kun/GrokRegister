@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import json
 import sys
 import os
 import io
@@ -30,6 +31,7 @@ import platform
 from pathlib import Path
 
 from email_register import get_email_and_token, get_oai_code
+from runtime_config import runtime_config_path
 
 
 def setup_run_logger() -> logging.Logger:
@@ -188,7 +190,7 @@ _auto_auth_export = True
 _proxy_prefer_local_forward = False
 try:
     import json as _json_mod
-    _cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
+    _cfg_path = str(runtime_config_path())
     if os.path.isfile(_cfg_path):
         with open(_cfg_path, "r") as _f:
             _cfg = _json_mod.load(_f)
@@ -618,6 +620,31 @@ def _emit(msg: str) -> None:
             pass
 
 
+def _emit_structured(event_type: str, **payload) -> None:
+    run_id = (os.environ.get("GROK_RUN_ID") or "").strip()
+    event = {
+        "type": event_type,
+        "ts": int(time.time() * 1000),
+    }
+    if run_id:
+        event["runId"] = run_id
+    for key, value in payload.items():
+        if value is None:
+            continue
+        event[key] = value
+    try:
+        print(
+            "GRA_EVENT:" + json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+            flush=True,
+        )
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def log_runtime_fingerprint(tab=None, force: bool = False):
     """
     打印架构 / 浏览器版本 / WebGL 探测，方便确认 ARM 无 GUI 环境是否可用。
@@ -720,7 +747,7 @@ def _start_browser_once():
             # 池空：打印 config 关键键，便于排查「UI 有代理却直连」
             try:
                 import json as _jdbg
-                _cp = os.path.join(os.path.dirname(__file__), "config.json")
+                _cp = str(runtime_config_path())
                 if os.path.isfile(_cp):
                     with open(_cp, "r", encoding="utf-8") as _fdbg:
                         _cd = _jdbg.load(_fdbg)
@@ -805,7 +832,7 @@ def _start_browser_once():
                 prefer_local = _proxy_prefer_local_forward
                 try:
                     import json as _jm
-                    _cp = os.path.join(os.path.dirname(__file__), "config.json")
+                    _cp = str(runtime_config_path())
                     if os.path.isfile(_cp):
                         with open(_cp, "r", encoding="utf-8") as _cf:
                             prefer_local = bool(
@@ -895,7 +922,7 @@ def _start_browser_once():
                 _cfg_pe = {}
                 try:
                     with open(
-                        os.path.join(os.path.dirname(__file__), "config.json"),
+                        str(runtime_config_path()),
                         "r",
                         encoding="utf-8",
                     ) as _fp:
@@ -931,7 +958,7 @@ def _start_browser_once():
             _cfg_pe2 = {}
             try:
                 with open(
-                    os.path.join(os.path.dirname(__file__), "config.json"),
+                        str(runtime_config_path()),
                     "r",
                     encoding="utf-8",
                 ) as _fp2:
@@ -2661,7 +2688,7 @@ def _load_turnstile_auto_wait_max() -> int:
     实际等待在 [30, max] 内随机；缺省 max=60。
     """
     default_max = 60
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    config_path = str(runtime_config_path())
     try:
         import json
         with open(config_path, "r", encoding="utf-8") as f:
@@ -4222,7 +4249,7 @@ def push_sso_to_api(new_tokens: list):
     import requests
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    config_path = str(runtime_config_path())
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             conf = json.load(f)
@@ -4284,7 +4311,7 @@ def run_single_registration(
         conf_mail = {}
         try:
             with open(
-                os.path.join(os.path.dirname(__file__), "config.json"),
+                str(runtime_config_path()),
                 "r",
                 encoding="utf-8",
             ) as _cf:
@@ -4543,7 +4570,7 @@ def run_single_registration(
             mint_mode = ""
             try:
                 with open(
-                    os.path.join(os.path.dirname(__file__), "config.json"),
+                    str(runtime_config_path()),
                     "r",
                     encoding="utf-8",
                 ) as _mf:
@@ -4626,7 +4653,7 @@ def run_single_registration(
 
 def load_run_count() -> int:
     # 从 config.json 读取默认执行轮数，配置不存在时返回 10。
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    config_path = str(runtime_config_path())
     try:
         import json
         with open(config_path, "r", encoding="utf-8") as f:
@@ -4652,6 +4679,7 @@ def main():
     args = parser.parse_args()
 
     total = args.count if args.count > 0 else '∞'
+    total_count = args.count if args.count > 0 else 0
     # logger 就绪后再打一次环境摘要，确保 WebUI/日志文件都能看到（不依赖模块 import 时的 print）
     _emit(
         f"[*] 运行环境: system={platform.system()} machine={platform.machine()} "
@@ -4686,7 +4714,7 @@ def main():
                 pass
             return u.split("@")[-1] if "@" in u else u[:48]
 
-        _cfgp = os.path.join(os.path.dirname(__file__), "config.json")
+        _cfgp = str(runtime_config_path())
         _c0 = {}
         if os.path.isfile(_cfgp):
             import json as _j0
@@ -4788,7 +4816,7 @@ def main():
         conf_rt = {}
         try:
             with open(
-                os.path.join(os.path.dirname(__file__), "config.json"),
+                str(runtime_config_path()),
                 "r",
                 encoding="utf-8",
             ) as _rf:
@@ -4835,7 +4863,7 @@ def main():
                 return True
             return bool(default)
 
-        _cfg_path = os.path.join(os.path.dirname(__file__), "config.json")
+        _cfg_path = str(runtime_config_path())
         _cg = {}
         if os.path.isfile(_cfg_path):
             with open(_cfg_path, "r", encoding="utf-8") as _fg:
@@ -4894,6 +4922,13 @@ def main():
                 break
 
             current_round += 1
+            _emit_structured(
+                "progress",
+                current=current_round,
+                total=total_count,
+                round=current_round,
+                phase="running",
+            )
             print(f"")
             # 首轮 / 失败后 / 每 N 成功：完整 quit+restart；否则 clear_session 复用进程
             do_full_restart = force_browser_recycle or browser is None
@@ -5099,6 +5134,16 @@ def main():
                 fail_count += 1
                 detail = " | ".join(err_parts) if err_parts else str(last_err or "全部方案失败")
                 print(f"✘ 第 {current_round} 轮失败/跳过（{detail}）")
+                _emit_structured(
+                    "failed",
+                    current=current_round,
+                    total=total_count,
+                    success=success_count,
+                    failed=fail_count,
+                    round=current_round,
+                    plan=used_plan or None,
+                    message=detail,
+                )
                 try:
                     from pools import demote_proxy_to_pending
 
@@ -5119,6 +5164,18 @@ def main():
                 )
                 # 邮箱已在「注册成功 | email=…」行输出，此处不再重复
                 print(f"✔ 第 {current_round} 轮成功（{tag}）")
+                _emit_structured(
+                    "success",
+                    current=current_round,
+                    total=total_count,
+                    success=success_count,
+                    failed=fail_count,
+                    round=current_round,
+                    plan=used_plan or None,
+                    email=str(result.get("email") or "").strip() or None,
+                    password=str(result.get("password") or "").strip() or None,
+                    sso=str(result.get("sso") or "").strip() or None,
+                )
                 # P2/3：成功后 GC；每 N 成功强制下轮重启浏览器
                 try:
                     from runtime_gc import on_register_success

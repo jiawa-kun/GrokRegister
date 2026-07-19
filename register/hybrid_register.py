@@ -25,6 +25,12 @@ from typing import Any, Callable, Optional
 LogFn = Callable[[str], None]
 ROOT = Path(__file__).resolve().parent
 
+try:
+    from runtime_config import runtime_config_path
+except Exception:
+    def runtime_config_path() -> Path:
+        return ROOT / "config.json"
+
 
 def _noop(_: str) -> None:
     return None
@@ -99,7 +105,10 @@ def _get_mail_code(mail_token: str, email: str, log: LogFn) -> str:
 
 def _load_proxy() -> str:
     try:
-        conf = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+        p = runtime_config_path()
+        if not p.is_file():
+            return ""
+        conf = json.loads(p.read_text(encoding="utf-8"))
         p = str(
             conf.get("proxy")
             or conf.get("browser_proxy")

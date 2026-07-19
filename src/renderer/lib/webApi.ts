@@ -108,6 +108,7 @@ function maybeCloseWs() {
 
 const webApi: RendererApi = {
   getAuthState: () => http('GET', '/api/auth/me'),
+  getAuthBootstrap: () => http('GET', '/api/auth/bootstrap'),
   login: (username, password) => http('POST', '/api/auth/login', { username, password }),
   logout: async () => {
     await http('POST', '/api/auth/logout');

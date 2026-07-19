@@ -18,11 +18,17 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+try:
+    from runtime_config import runtime_config_path
+except Exception:
+    def runtime_config_path() -> Path:
+        return Path(__file__).parent / "config.json"
+
 # ============================================================
 # 自建邮件服务配置（兼容 dreamhunter2333/cloudflare_temp_email / vmail）
 # ============================================================
 
-_config_path = Path(__file__).parent / "config.json"
+_config_path = runtime_config_path()
 _conf: Dict[str, Any] = {}
 if _config_path.exists():
     with _config_path.open("r", encoding="utf-8") as _f:

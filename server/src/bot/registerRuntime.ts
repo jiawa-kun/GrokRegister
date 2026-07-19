@@ -20,6 +20,11 @@ export interface RegisterRuntime {
   pythonPath: string;
 }
 
+const RUNTIME_CONFIG_MARKER = {
+  generated_by: 'GrokRegisterAgent',
+  runtime: true
+};
+
 function addCandidate(candidates: string[], value?: string) {
   const normalized = normalizeRegisterPath(value);
   if (!normalized) return;
@@ -96,17 +101,31 @@ export function resolveRegisterRuntime(settings: RuntimeSettings = {}): Register
   return null;
 }
 
-export function writeConfigForPython(registerDir: string, settings: RuntimeSettings, count?: number) {
-  const configPath = path.join(registerDir, 'config.json');
-  let config: Record<string, any> = {};
+export function buildRuntimeConfigPath(registerDir: string): string {
+  return path.join(
+    registerDir,
+    `config.runtime.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 10)}.json`
+  );
+}
 
+export function writeConfigForPython(
+  registerDir: string,
+  settings: RuntimeSettings,
+  count?: number,
+  opts?: { configPath?: string }
+) {
+  const configPath = opts?.configPath || path.join(registerDir, 'config.json');
+  const baseConfigPath = path.join(registerDir, 'config.json');
+  let config: Record<string, any> = {};
   try {
-    if (fs.existsSync(configPath)) {
-      config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    if (fs.existsSync(baseConfigPath)) {
+      const parsed = JSON.parse(fs.readFileSync(baseConfigPath, 'utf-8'));
+      config = parsed && typeof parsed === 'object' ? parsed : {};
     }
   } catch {
     config = {};
   }
+  config._gra_runtime_config = RUNTIME_CONFIG_MARKER;
 
   // 规范化：去掉尾斜杠与误填的 /admin|/api 后缀（否则 POST 会 405）
   let mailBase = String(settings.mail?.apiBase || '').trim().replace(/\/+$/, '');
@@ -481,5 +500,25 @@ export function writeConfigForPython(registerDir: string, settings: RuntimeSetti
   if (ycKey) config.yescaptcha_key = ycKey;
   else delete config.yescaptcha_key;
 
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
+  const tmp = `${configPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2), 'utf-8');
+  fs.renameSync(tmp, configPath);
+  return configPath;
+}
+
+export function cleanupRuntimeConfig(registerDir: string, configPath?: string) {
+  const target = configPath || path.join(registerDir, 'config.json');
+  try {
+    if (!fs.existsSync(target)) return;
+    const doc = JSON.parse(fs.readFileSync(target, 'utf-8')) as Record<string, unknown>;
+    const marker = doc._gra_runtime_config as Record<string, unknown> | boolean | undefined;
+    const runtime =
+      marker === true ||
+      (marker && typeof marker === 'object' && marker.generated_by === RUNTIME_CONFIG_MARKER.generated_by);
+    if (runtime) {
+      fs.unlinkSync(target);
+    }
+  } catch {
+    /* ignore cleanup failure */
+  }
 }

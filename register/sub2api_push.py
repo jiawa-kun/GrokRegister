@@ -24,9 +24,15 @@ LogFn = Callable[[str], None]
 
 _ROOT = Path(__file__).resolve().parent
 
+try:
+    from runtime_config import runtime_config_path
+except Exception:
+    def runtime_config_path() -> Path:
+        return _ROOT / "config.json"
+
 
 def _load_conf() -> dict[str, Any]:
-    p = _ROOT / "config.json"
+    p = runtime_config_path()
     if not p.is_file():
         return {}
     try:

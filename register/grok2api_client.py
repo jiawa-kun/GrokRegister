@@ -17,7 +17,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable
+
+try:
+    from runtime_config import runtime_config_path
+except Exception:
+    def runtime_config_path() -> Path:
+        return Path(__file__).resolve().parent / "config.json"
 
 LogFn = Callable[[str], None]
 
@@ -428,11 +435,8 @@ def upload_registered_sso(
 
 def load_grok2api_settings_from_config(config_path: str | None = None) -> dict[str, Any]:
     """从 register/config.json 读取 grok2api 段。"""
-    import os
-    from pathlib import Path
-
     if not config_path:
-        config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        config_path = str(runtime_config_path())
     p = Path(config_path)
     if not p.is_file():
         return {}

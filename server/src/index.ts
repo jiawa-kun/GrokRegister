@@ -14,7 +14,7 @@ import {
 } from '@shared/settings';
 import type { RunEvent } from '@shared/runEvents';
 import { setAppEventBroadcast } from './appEvents.js';
-import { loadSettings, saveSettings, dataDir } from './settingsStore.js';
+import { loadSettings, saveSettings, dataDir, isEncryptionAvailable } from './settingsStore.js';
 import { registerBot } from './bot/registerBot.js';
 import {
   applyAccountSsoChecks,
@@ -49,6 +49,7 @@ import {
   changeCredentials,
   getAuthState,
   getAuthStateFromCookie,
+  LoginRateLimitError,
   login,
   logout
 } from './authStore.js';
@@ -188,13 +189,26 @@ app.get('/api/auth/me', async (req, res) => {
   res.json(await getAuthState(req));
 });
 
+app.get('/api/auth/bootstrap', async (_req, res) => {
+  res.json(await authBootstrapInfo());
+});
+
 app.post('/api/auth/login', async (req, res) => {
-  const state = await login(req, res);
-  if (!state) {
-    res.status(401).json({ error: '用户名或密码不正确' });
-    return;
+  try {
+    const state = await login(req, res);
+    if (!state) {
+      res.status(401).json({ error: '用户名或密码不正确' });
+      return;
+    }
+    res.json(state);
+  } catch (err) {
+    if (err instanceof LoginRateLimitError) {
+      res.setHeader('Retry-After', String(err.retryAfterSec));
+      res.status(429).json({ error: err.message, retryAfter: err.retryAfterSec });
+      return;
+    }
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
-  res.json(state);
 });
 
 app.post('/api/auth/logout', async (req, res) => {
@@ -204,7 +218,7 @@ app.post('/api/auth/logout', async (req, res) => {
 
 app.post('/api/auth/change', async (req, res) => {
   try {
-    res.json(await changeCredentials(req, req.body));
+    res.json(await changeCredentials(req, res, req.body));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(message === 'unauthorized' ? 401 : 400).json({ error: message });
@@ -1617,11 +1631,18 @@ httpServer.listen(PORT, HOST, () => {
   console.log(
     `[Grok Register Agent] static UI: ${existsSync(STATIC_ROOT) ? STATIC_ROOT : '(not built)'}`
   );
+  if (!isEncryptionAvailable()) {
+    console.warn(
+      '[Grok Register Agent] GRA_MASTER_KEY is not set; saved settings/accounts secrets remain plaintext.'
+    );
+  }
   void authBootstrapInfo().then((info) => {
-    console.log(`[Grok Register Agent] default account: ${info.defaultUsername}`);
-    console.log(`[Grok Register Agent] default password: ${info.defaultPassword}`);
+    console.log(`[Grok Register Agent] web account: ${info.username || info.defaultUsername}`);
     if (info.mustChangePassword) {
       console.log('[Grok Register Agent] first login must change username/password');
+      if (info.bootstrapFile) {
+        console.log(`[Grok Register Agent] initial password file: ${info.bootstrapFile}`);
+      }
     } else {
       console.log(`[Grok Register Agent] web account configured: ${info.username}`);
     }

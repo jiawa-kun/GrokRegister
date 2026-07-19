@@ -27,6 +27,12 @@ _DEFAULT_SITE_URL = "https://accounts.x.ai"
 _DEFAULT_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
 _YESCAPTCHA_API = "https://api.yescaptcha.com"
 
+try:
+    from runtime_config import runtime_config_path
+except Exception:
+    def runtime_config_path() -> Path:
+        return Path(__file__).resolve().parent / "config.json"
+
 
 def _lg(log: Optional[LogFn], msg: str) -> None:
     if log:
@@ -39,7 +45,7 @@ def _lg(log: Optional[LogFn], msg: str) -> None:
 
 
 def _load_cfg() -> dict[str, Any]:
-    p = Path(__file__).resolve().parent / "config.json"
+    p = runtime_config_path()
     try:
         if p.is_file():
             data = json.loads(p.read_text(encoding="utf-8"))

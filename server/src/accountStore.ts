@@ -11,6 +11,11 @@ import { join, resolve, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { AccountRecord, AccountSsoCheck } from '@shared/runEvents';
 import { dataDir } from './settingsStore.js';
+import {
+  decryptSecretString,
+  encryptSecretString,
+  warnIfSecretEncryptionUnavailable
+} from './secretCrypto.js';
 
 function accountsDir(): string {
   return dataDir();
@@ -63,12 +68,49 @@ async function ensureDir(dir: string) {
   await fsp.mkdir(dir, { recursive: true });
 }
 
+let lock = Promise.resolve();
+
+async function withAccountsLock<T>(fn: () => Promise<T>): Promise<T> {
+  const prev = lock;
+  let release!: () => void;
+  lock = new Promise<void>((resolveLock) => {
+    release = resolveLock;
+  });
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+function encryptRecordForDisk(record: AccountRecord): AccountRecord {
+  return {
+    ...record,
+    password: record.password ? encryptSecretString(record.password) : record.password,
+    sso: record.sso ? encryptSecretString(record.sso) : record.sso
+  };
+}
+
+function decryptRecordForRuntime(record: AccountRecord): AccountRecord {
+  return {
+    ...record,
+    password: record.password ? decryptSecretString(record.password, 'accounts.password') : record.password,
+    sso: record.sso ? decryptSecretString(record.sso, 'accounts.sso') : record.sso
+  };
+}
+
 async function writeAll(all: AccountRecord[]): Promise<void> {
   const dir = accountsDir();
   await ensureDir(dir);
   const path = accountsPath();
-  const tmp = `${path}.tmp`;
-  await fsp.writeFile(tmp, JSON.stringify(all, null, 2), 'utf-8');
+  const tmp = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+  warnIfSecretEncryptionUnavailable('accounts store');
+  await fsp.writeFile(
+    tmp,
+    JSON.stringify(all.map(encryptRecordForDisk), null, 2),
+    'utf-8'
+  );
   await fsp.rename(tmp, path);
 }
 
@@ -78,7 +120,7 @@ async function readJsonAccounts(path: string): Promise<AccountRecord[]> {
     const raw = await fsp.readFile(path, 'utf-8');
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(isAccountRecord);
+    return parsed.filter(isAccountRecord).map(decryptRecordForRuntime);
   } catch {
     return [];
   }
@@ -265,117 +307,126 @@ async function readAll(): Promise<AccountRecord[]> {
 export async function appendAccount(
   record: AccountRecord
 ): Promise<{ id: string; created: boolean }> {
-  const all = await readAll();
-  const sso = String(record.sso || '').trim();
-  if (sso) {
-    const existing = all.find((a) => a.sso && a.sso === sso);
-    if (existing) {
-      // 可选补全空邮箱/密码（不覆盖已有）
-      let touched = false;
-      const email = String(record.email || '').trim();
-      const password = String(record.password || '').trim();
-      const patch: AccountRecord = { ...existing };
-      if (email && !String(existing.email || '').trim()) {
-        patch.email = email;
-        touched = true;
+  return withAccountsLock(async () => {
+    const all = await readAll();
+    const sso = String(record.sso || '').trim();
+    if (sso) {
+      const existing = all.find((a) => a.sso && a.sso === sso);
+      if (existing) {
+        // 可选补全空邮箱/密码（不覆盖已有）
+        let touched = false;
+        const email = String(record.email || '').trim();
+        const password = String(record.password || '').trim();
+        const patch: AccountRecord = { ...existing };
+        if (email && !String(existing.email || '').trim()) {
+          patch.email = email;
+          touched = true;
+        }
+        if (password && !String(existing.password || '').trim()) {
+          patch.password = password;
+          touched = true;
+        }
+        if (touched) {
+          const next = all.map((a) => (a.id === existing.id ? patch : a));
+          await writeAll(next);
+        }
+        return { id: existing.id, created: false };
       }
-      if (password && !String(existing.password || '').trim()) {
-        patch.password = password;
-        touched = true;
-      }
-      if (touched) {
-        const next = all.map((a) => (a.id === existing.id ? patch : a));
-        await writeAll(next);
-      }
-      return { id: existing.id, created: false };
     }
-  }
-  all.push(record);
-  await writeAll(all);
-  return { id: record.id, created: true };
+    all.push(record);
+    await writeAll(all);
+    return { id: record.id, created: true };
+  });
 }
 
 export async function listAccounts(): Promise<AccountRecord[]> {
-  const raw = await readAll();
-  let dirty = false;
-  const all = raw.map((a) => {
-    const fixed = repairAccountFields(a);
-    if (fixed !== a && (fixed.email !== a.email || fixed.password !== a.password || fixed.sso !== a.sso)) {
-      dirty = true;
-    }
-    return fixed;
-  });
-  if (dirty) {
-    try {
-      await writeAll(all);
-      console.log('[accountStore] repaired hybrid email|password|sso rows in accounts.json');
-    } catch {
-      /* ignore */
-    }
-  }
-  // 合并 NSFW 侧车 tag（email / sso_hash）
-  let withTags = all;
-  try {
-    const {
-      loadAccountTags,
-      lookupNsfwTag,
-      nsfwStatusFromTag,
-      zdrStatusFromTag,
-      ssoHashHex
-    } = await import('./accountTags.js');
-    const tags = loadAccountTags();
-    withTags = all.map((a) => {
-      const side = nsfwStatusFromTag(
-        lookupNsfwTag(tags, {
-          email: a.email,
-          sso: a.sso,
-          ssoHash: a.sso ? ssoHashHex(a.sso) : undefined
-        })
-      );
-      const zdr = zdrStatusFromTag(
-        lookupNsfwTag(tags, {
-          email: a.email,
-          sso: a.sso,
-          ssoHash: a.sso ? ssoHashHex(a.sso) : undefined
-        })
-      );
-      return {
-        ...a,
-        nsfwEnabled: side.nsfwEnabled,
-        nsfwAttempted: side.nsfwAttempted,
-        nsfwAt: side.nsfwAt,
-        nsfwError: side.nsfwError,
-        nsfwStatus: side.nsfwStatus,
-        zdrClosed: zdr.zdrClosed,
-        zdrAttempted: zdr.zdrAttempted,
-        zdrAt: zdr.zdrAt,
-        zdrError: zdr.zdrError,
-        zdrStatus: zdr.zdrStatus
-      } as AccountRecord;
+  return withAccountsLock(async () => {
+    const raw = await readAll();
+    let dirty = false;
+    const all = raw.map((a) => {
+      const fixed = repairAccountFields(a);
+      if (
+        fixed !== a &&
+        (fixed.email !== a.email || fixed.password !== a.password || fixed.sso !== a.sso)
+      ) {
+        dirty = true;
+      }
+      return fixed;
     });
-  } catch {
-    /* tags optional */
-  }
-  return withTags.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    if (dirty) {
+      try {
+        await writeAll(all);
+        console.log('[accountStore] repaired hybrid email|password|sso rows in accounts.json');
+      } catch {
+        /* ignore */
+      }
+    }
+    // 合并 NSFW 侧车 tag（email / sso_hash）
+    let withTags = all;
+    try {
+      const {
+        loadAccountTags,
+        lookupNsfwTag,
+        nsfwStatusFromTag,
+        zdrStatusFromTag,
+        ssoHashHex
+      } = await import('./accountTags.js');
+      const tags = loadAccountTags();
+      withTags = all.map((a) => {
+        const side = nsfwStatusFromTag(
+          lookupNsfwTag(tags, {
+            email: a.email,
+            sso: a.sso,
+            ssoHash: a.sso ? ssoHashHex(a.sso) : undefined
+          })
+        );
+        const zdr = zdrStatusFromTag(
+          lookupNsfwTag(tags, {
+            email: a.email,
+            sso: a.sso,
+            ssoHash: a.sso ? ssoHashHex(a.sso) : undefined
+          })
+        );
+        return {
+          ...a,
+          nsfwEnabled: side.nsfwEnabled,
+          nsfwAttempted: side.nsfwAttempted,
+          nsfwAt: side.nsfwAt,
+          nsfwError: side.nsfwError,
+          nsfwStatus: side.nsfwStatus,
+          zdrClosed: zdr.zdrClosed,
+          zdrAttempted: zdr.zdrAttempted,
+          zdrAt: zdr.zdrAt,
+          zdrError: zdr.zdrError,
+          zdrStatus: zdr.zdrStatus
+        } as AccountRecord;
+      });
+    } catch {
+      /* tags optional */
+    }
+    return withTags.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  });
 }
 
 /** 按 id 批量删除号池账号（仅写 accounts.json，不删 SSO 历史 txt） */
 export async function deleteAccounts(
   ids: string[]
 ): Promise<{ deleted: number; requested: number; remaining: number }> {
-  const idSet = new Set(
-    (Array.isArray(ids) ? ids : []).map((x) => String(x || '').trim()).filter(Boolean)
-  );
-  if (idSet.size === 0) {
-    return { deleted: 0, requested: 0, remaining: (await listAccounts()).length };
-  }
-  const all = await readAll();
-  const next = all.filter((a) => !idSet.has(a.id));
-  const deleted = all.length - next.length;
-  if (deleted > 0) {
-    await writeAll(next);
-  }
-  return { deleted, requested: idSet.size, remaining: next.length };
+  return withAccountsLock(async () => {
+    const idSet = new Set(
+      (Array.isArray(ids) ? ids : []).map((x) => String(x || '').trim()).filter(Boolean)
+    );
+    if (idSet.size === 0) {
+      return { deleted: 0, requested: 0, remaining: (await readAll()).length };
+    }
+    const all = await readAll();
+    const next = all.filter((a) => !idSet.has(a.id));
+    const deleted = all.length - next.length;
+    if (deleted > 0) {
+      await writeAll(next);
+    }
+    return { deleted, requested: idSet.size, remaining: next.length };
+  });
 }
 
 /**
@@ -397,90 +448,94 @@ export async function importAccountsFromText(input: {
   invalid: number;
   remaining: number;
 }> {
-  const text = String(input?.text || '');
-  const source = String(input?.source || 'paste').replace(/[^\w.\-@]/g, '_').slice(0, 80);
-  const lines = text.split(/\r?\n/);
-  let parsed = 0;
-  let invalid = 0;
-  const candidates: AccountRecord[] = [];
-  const now = new Date().toISOString();
+  return withAccountsLock(async () => {
+    const text = String(input?.text || '');
+    const source = String(input?.source || 'paste').replace(/[^\w.\-@]/g, '_').slice(0, 80);
+    const lines = text.split(/\r?\n/);
+    let parsed = 0;
+    let invalid = 0;
+    const candidates: AccountRecord[] = [];
+    const now = new Date().toISOString();
 
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i].trim();
-    if (!raw || raw.startsWith('#')) continue;
-    const rec = parseHistoryLine(raw, source || 'import.txt', i + 1);
-    if (!rec || !String(rec.sso || '').trim()) {
-      // 无 sso 的行算无效（号池导入以 sso 为核心）
-      if (raw.length > 0) invalid++;
-      continue;
+    for (let i = 0; i < lines.length; i++) {
+      const raw = lines[i].trim();
+      if (!raw || raw.startsWith('#')) continue;
+      const rec = parseHistoryLine(raw, source || 'import.txt', i + 1);
+      if (!rec || !String(rec.sso || '').trim()) {
+        // 无 sso 的行算无效（号池导入以 sso 为核心）
+        if (raw.length > 0) invalid++;
+        continue;
+      }
+      parsed++;
+      candidates.push({
+        ...rec,
+        id: randomUUID(),
+        runId: `import:${source}:${i + 1}`,
+        createdAt: now
+      });
     }
-    parsed++;
-    candidates.push({
-      ...rec,
-      id: randomUUID(),
-      runId: `import:${source}:${i + 1}`,
-      createdAt: now
-    });
-  }
 
-  if (candidates.length === 0) {
-    const remaining = (await listAccounts()).length;
+    if (candidates.length === 0) {
+      const remaining = (await readAll()).length;
+      return {
+        totalLines: lines.filter((l) => l.trim() && !l.trim().startsWith('#')).length,
+        parsed: 0,
+        imported: 0,
+        skipped: 0,
+        invalid,
+        remaining
+      };
+    }
+
+    const all = await readAll();
+    const seenSso = new Set(all.map((a) => a.sso.trim()).filter(Boolean));
+    const seenKey = new Set(
+      all.map((a) => `${a.email}----${a.password}----${a.sso}`)
+    );
+    let imported = 0;
+    let skipped = 0;
+    for (const rec of candidates) {
+      const sso = rec.sso.trim();
+      if (sso && seenSso.has(sso)) {
+        skipped++;
+        continue;
+      }
+      const key = `${rec.email}----${rec.password}----${rec.sso}`;
+      if (seenKey.has(key)) {
+        skipped++;
+        continue;
+      }
+      all.push(rec);
+      if (sso) seenSso.add(sso);
+      seenKey.add(key);
+      imported++;
+    }
+    if (imported > 0) {
+      await writeAll(all);
+    }
     return {
       totalLines: lines.filter((l) => l.trim() && !l.trim().startsWith('#')).length,
-      parsed: 0,
-      imported: 0,
-      skipped: 0,
+      parsed,
+      imported,
+      skipped,
       invalid,
-      remaining
+      remaining: all.length
     };
-  }
-
-  const all = await readAll();
-  const seenSso = new Set(all.map((a) => a.sso.trim()).filter(Boolean));
-  const seenKey = new Set(
-    all.map((a) => `${a.email}----${a.password}----${a.sso}`)
-  );
-  let imported = 0;
-  let skipped = 0;
-  for (const rec of candidates) {
-    const sso = rec.sso.trim();
-    if (sso && seenSso.has(sso)) {
-      skipped++;
-      continue;
-    }
-    const key = `${rec.email}----${rec.password}----${rec.sso}`;
-    if (seenKey.has(key)) {
-      skipped++;
-      continue;
-    }
-    all.push(rec);
-    if (sso) seenSso.add(sso);
-    seenKey.add(key);
-    imported++;
-  }
-  if (imported > 0) {
-    await writeAll(all);
-  }
-  return {
-    totalLines: lines.filter((l) => l.trim() && !l.trim().startsWith('#')).length,
-    parsed,
-    imported,
-    skipped,
-    invalid,
-    remaining: all.length
-  };
+  });
 }
 
 /** 手动触发从 SSO 目录重新扫描导入历史（号池刷新时可用） */
 export async function resyncAccountsFromDisk(): Promise<{ total: number; imported: number }> {
-  const before = await readJsonAccounts(accountsPath());
-  let all = await migrateLegacyIfNeeded(before);
-  const beforeCount = all.length;
-  all = importFromSsoFiles(all);
-  if (all.length !== beforeCount) {
-    await writeAll(all);
-  }
-  return { total: all.length, imported: Math.max(0, all.length - beforeCount) };
+  return withAccountsLock(async () => {
+    const before = await readJsonAccounts(accountsPath());
+    let all = await migrateLegacyIfNeeded(before);
+    const beforeCount = all.length;
+    all = importFromSsoFiles(all);
+    if (all.length !== beforeCount) {
+      await writeAll(all);
+    }
+    return { total: all.length, imported: Math.max(0, all.length - beforeCount) };
+  });
 }
 
 /** 将批量验活结果写回 accounts.json（按 id 合并 ssoCheck） */
@@ -501,59 +556,61 @@ export async function applyAccountSsoChecks(
     isBotFlag1?: boolean;
   }>
 ): Promise<{ updated: number; emailsFilled: number }> {
-  const list = Array.isArray(results) ? results : [];
-  if (list.length === 0) return { updated: 0, emailsFilled: 0 };
+  return withAccountsLock(async () => {
+    const list = Array.isArray(results) ? results : [];
+    if (list.length === 0) return { updated: 0, emailsFilled: 0 };
 
-  const byId = new Map<string, (typeof list)[number]>();
-  for (const r of list) {
-    const id = String(r?.id || '').trim();
-    if (!id || typeof r.alive !== 'boolean') continue;
-    byId.set(id, r);
-  }
-  if (byId.size === 0) return { updated: 0, emailsFilled: 0 };
-
-  const all = await readAll();
-  let updated = 0;
-  let emailsFilled = 0;
-  const next = all.map((a) => {
-    const r = byId.get(a.id);
-    if (!r) return a;
-    const ssoCheck: AccountSsoCheck = {
-      alive: r.alive,
-      status: typeof r.status === 'number' ? r.status : 0,
-      checkedAt:
-        typeof r.checkedAt === 'string' && r.checkedAt
-          ? r.checkedAt
-          : new Date().toISOString(),
-      email: r.email,
-      givenName: r.givenName,
-      familyName: r.familyName,
-      emailConfirmed: r.emailConfirmed,
-      sessionTierId: r.sessionTierId,
-      createTime: r.createTime,
-      error: r.error,
-      botFlagSource: r.botFlagSource,
-      isBotFlag1: r.isBotFlag1
-    };
-    updated++;
-    // 验活若返回邮箱且号池无邮箱：按 SSO 补 email（便于后续 auth 回填）
-    const prevEmail = String(a.email || '').trim();
-    const fromCheck = typeof r.email === 'string' ? r.email.trim() : '';
-    let email = a.email;
-    if (!prevEmail && fromCheck) {
-      email = fromCheck;
-      emailsFilled++;
+    const byId = new Map<string, (typeof list)[number]>();
+    for (const r of list) {
+      const id = String(r?.id || '').trim();
+      if (!id || typeof r.alive !== 'boolean') continue;
+      byId.set(id, r);
     }
-    return { ...a, email, ssoCheck };
-  });
+    if (byId.size === 0) return { updated: 0, emailsFilled: 0 };
 
-  if (updated > 0) {
-    await writeAll(next);
-  }
-  if (emailsFilled > 0) {
-    console.log(
-      `[accounts] sso 验活补全邮箱: ${emailsFilled} 条（号池无邮箱且 grok 返回 email）`
-    );
-  }
-  return { updated, emailsFilled };
+    const all = await readAll();
+    let updated = 0;
+    let emailsFilled = 0;
+    const next = all.map((a) => {
+      const r = byId.get(a.id);
+      if (!r) return a;
+      const ssoCheck: AccountSsoCheck = {
+        alive: r.alive,
+        status: typeof r.status === 'number' ? r.status : 0,
+        checkedAt:
+          typeof r.checkedAt === 'string' && r.checkedAt
+            ? r.checkedAt
+            : new Date().toISOString(),
+        email: r.email,
+        givenName: r.givenName,
+        familyName: r.familyName,
+        emailConfirmed: r.emailConfirmed,
+        sessionTierId: r.sessionTierId,
+        createTime: r.createTime,
+        error: r.error,
+        botFlagSource: r.botFlagSource,
+        isBotFlag1: r.isBotFlag1
+      };
+      updated++;
+      // 验活若返回邮箱且号池无邮箱：按 SSO 补 email（便于后续 auth 回填）
+      const prevEmail = String(a.email || '').trim();
+      const fromCheck = typeof r.email === 'string' ? r.email.trim() : '';
+      let email = a.email;
+      if (!prevEmail && fromCheck) {
+        email = fromCheck;
+        emailsFilled++;
+      }
+      return { ...a, email, ssoCheck };
+    });
+
+    if (updated > 0) {
+      await writeAll(next);
+    }
+    if (emailsFilled > 0) {
+      console.log(
+        `[accounts] sso 验活补全邮箱: ${emailsFilled} 条（号池无邮箱且 grok 返回 email）`
+      );
+    }
+    return { updated, emailsFilled };
+  });
 }

@@ -18,6 +18,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    from runtime_config import runtime_config_path
+except Exception:
+    def runtime_config_path() -> Path:
+        return Path(__file__).resolve().parent / "config.json"
+
 from cpa_schema import (
     DEFAULT_BASE_URL,
     DEFAULT_CLIENT_HEADERS,
@@ -61,7 +67,7 @@ def _read_cpa_mint_mode() -> str:
         return "device"
     if env in ("double", "auto", "c", "merged", "both", "pkce_then_device"):
         return "double"
-    conf_path = Path(__file__).resolve().parent / "config.json"
+    conf_path = runtime_config_path()
     try:
         conf = json.loads(conf_path.read_text(encoding="utf-8"))
         m = str(conf.get("cpa_mint_mode") or conf.get("mint_mode") or "").strip().lower()
@@ -340,7 +346,7 @@ def _write_and_probe_one(
             # 可选硬门槛：config require_chat_probe=true 时 chat 失败也挡 CPA
             require_chat = False
             try:
-                conf_path = Path(__file__).resolve().parent / "config.json"
+                conf_path = runtime_config_path()
                 if conf_path.is_file():
                     conf = json.loads(conf_path.read_text(encoding="utf-8"))
                     require_chat = bool(
@@ -488,7 +494,7 @@ def default_auth_dir() -> Path:
     env = (os.environ.get("AUTH_DIR") or os.environ.get("CPA_AUTH_DIR") or "").strip()
     if env:
         return Path(env).expanduser().resolve()
-    conf_path = Path(__file__).resolve().parent / "config.json"
+    conf_path = runtime_config_path()
     try:
         conf = json.loads(conf_path.read_text(encoding="utf-8"))
         d = str(conf.get("cpa_auth_dir") or conf.get("auth_dir") or "").strip()
@@ -514,7 +520,7 @@ def _read_cpa_remote_config() -> tuple[str, str]:
         or os.environ.get("cpa_management_key")
         or ""
     ).strip()
-    conf_path = Path(__file__).resolve().parent / "config.json"
+    conf_path = runtime_config_path()
     try:
         conf = json.loads(conf_path.read_text(encoding="utf-8"))
         if not url:

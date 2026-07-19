@@ -14,6 +14,13 @@ from pathlib import Path
 from typing import Callable
 
 ROOT = Path(__file__).resolve().parent
+
+try:
+    from runtime_config import runtime_config_path
+except Exception:
+    def runtime_config_path() -> Path:
+        return ROOT / "config.json"
+
 CHECKS: list[tuple[str, Callable[[], bool]]] = []
 
 
@@ -33,7 +40,7 @@ def _source(filename: str) -> str:
 
 
 def _config() -> dict:
-    p = ROOT / "config.json"
+    p = runtime_config_path()
     if not p.is_file():
         return {}
     try:
@@ -113,7 +120,7 @@ def check_sub2api() -> bool:
 @check("config-readable")
 def check_config() -> bool:
     # config 可缺省（WebUI 生成）；有则须是 dict
-    p = ROOT / "config.json"
+    p = runtime_config_path()
     if not p.is_file():
         return True
     return isinstance(_config(), dict)

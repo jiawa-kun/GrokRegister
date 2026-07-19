@@ -24,7 +24,12 @@ import { useRunStore } from '@renderer/store/runStore';
 import { useSettingsStore } from '@renderer/store/settingsStore';
 import { useAccountsStore } from '@renderer/store/accountsStore';
 import { useToastStore } from '@renderer/store/toastStore';
-import type { AuthState, ChangeCredentialsInput, UpdateInfo } from '@shared/ipc';
+import type {
+  AuthBootstrapInfo,
+  AuthState,
+  ChangeCredentialsInput,
+  UpdateInfo
+} from '@shared/ipc';
 
 type Tab = 'register' | 'pool' | 'auth' | 'settings';
 
@@ -411,6 +416,32 @@ function LoginScreen({ onAuthed }: { onAuthed(next: AuthState): void }) {
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [bootstrap, setBootstrap] = useState<AuthBootstrapInfo | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void window.api
+      .getAuthBootstrap()
+      .then((info) => {
+        if (!active) return;
+        setBootstrap(info);
+        if (info.username) {
+          setUsername((prev) => (prev === 'admin' ? info.username : prev));
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const loginHint = bootstrap?.mustChangePassword
+    ? bootstrap.initialPasswordSource === 'env'
+      ? '首次登录需修改账号密码；初始密码来自 GRA_INITIAL_PASSWORD。'
+      : bootstrap.initialPasswordAvailable
+        ? '首次登录需修改账号密码；初始密码见服务端日志或 auth-bootstrap.json。'
+        : '首次登录需修改账号密码；请查看服务端初始密码。'
+    : '使用已配置的控制台账号登录。';
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -440,7 +471,7 @@ function LoginScreen({ onAuthed }: { onAuthed(next: AuthState): void }) {
         </div>
         <h1 className="text-[28px] font-bold tracking-[-0.03em]">登录</h1>
         <p className="mt-1.5 text-[13px] leading-5 text-muted-foreground">
-          默认账号 admin / admin，首次登录后需修改。
+          {loginHint}
         </p>
         <div className="mt-6 space-y-4">
           <label className="block space-y-1.5">
