@@ -73,6 +73,12 @@ export interface AccountRecord {
   zdrError?: string;
   /** closed | open | none */
   zdrStatus?: 'closed' | 'open' | 'none';
+  /**
+   * 分页列表轻字段：是否有密码/SSO（全文仅 detail/match 返回）。
+   * 旧全量接口可能不带此字段。
+   */
+  hasPassword?: boolean;
+  hasSso?: boolean;
 }
 
 export interface StructuredRunEvent {

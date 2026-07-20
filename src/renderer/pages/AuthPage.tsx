@@ -382,6 +382,35 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       auth: null
     });
   }, [page, pageSize, searchQuery, metaFilter, statusFilter, pushFilter]);
+
+  // 浏览器前进/后退：从 URL 恢复筛选
+  useEffect(() => {
+    const onPop = () => {
+      setPage(getQueryInt('page', 1));
+      const ps = Number(getQuery('ps'));
+      if (isPageSize(ps)) setPageSize(ps);
+      setSearchQuery(getQuery('q'));
+      setMetaFilter(
+        oneOf(getQuery('meta'), ['all', 'no_sso', 'no_email', 'need_fill'] as const, 'all')
+      );
+      setStatusFilter(
+        oneOf(
+          getQuery('status'),
+          ['all', 'unprobed', '200', '401', '403', 'other_err'] as const,
+          'all'
+        )
+      );
+      setPushFilter(
+        oneOf(
+          getQuery('push'),
+          ['all', 'cpa_none', 'cpa_ok', 'cpa_fail', 's2a_none', 's2a_ok', 's2a_fail'] as const,
+          'all'
+        )
+      );
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
   const [listTotal, setListTotal] = useState(0);
   const [listTotalPages, setListTotalPages] = useState(1);
   const [facets, setFacets] = useState<{

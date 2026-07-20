@@ -26,7 +26,11 @@ import {
   type FailStageId
 } from '@shared/failStages';
 
-export function RegisterPage({ onOpenSettings }: { onOpenSettings(): void }) {
+export function RegisterPage({
+  onOpenSettings
+}: {
+  onOpenSettings(section?: string | null): void;
+}) {
   const status = useRunStore((s) => s.status);
   const jobsActive = useRunStore((s) => s.jobsActive);
   const settings = useSettingsStore((s) => s.data);
@@ -185,7 +189,12 @@ export function RegisterPage({ onOpenSettings }: { onOpenSettings(): void }) {
                   <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
                   <span>启动前请到「配置」页补齐邮箱后端与域名（或域名池）。</span>
                 </div>
-                <Button className="mt-3" variant="secondary" size="sm" onClick={onOpenSettings}>
+                <Button
+                  className="mt-3"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => onOpenSettings('mail')}
+                >
                   打开配置
                 </Button>
               </div>
@@ -195,7 +204,7 @@ export function RegisterPage({ onOpenSettings }: { onOpenSettings(): void }) {
             <RuntimeSettingsInline />
             <SystemHealthCard compact pollMs={20000} />
             <AuthQueueMetricsCard />
-            <FailStageBoardCard />
+            <FailStageBoardCard onOpenSettings={onOpenSettings} />
 
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
               <InfoBox label="轮数" value={String(settings?.runCount ?? '--')} />
@@ -495,7 +504,11 @@ function InfoBox({ label, value }: { label: string; value: string }) {
 }
 
 /** 注册失败分阶段看板（启发式 + 成功率） */
-function FailStageBoardCard() {
+function FailStageBoardCard({
+  onOpenSettings
+}: {
+  onOpenSettings(section?: string | null): void;
+}) {
   const focusRunId = useRunStore((s) => s.focusRunId);
   const jobsActive = useRunStore((s) => s.jobsActive);
   const failed = useRunStore((s) => s.status.failed);
@@ -655,10 +668,22 @@ function FailStageBoardCard() {
           <div className="text-[10px] font-semibold text-amber-700 dark:text-amber-400">
             建议
           </div>
-          <ul className="mt-1 space-y-0.5">
+          <ul className="mt-1 space-y-1">
             {tips.map((t, i) => (
-              <li key={i} className="text-[10px] leading-snug text-muted-foreground">
-                · {t}
+              <li
+                key={i}
+                className="flex items-start justify-between gap-2 text-[10px] leading-snug text-muted-foreground"
+              >
+                <span className="min-w-0 flex-1">· {t.text}</span>
+                {t.settingsSection ? (
+                  <button
+                    type="button"
+                    className="shrink-0 rounded-full border border-amber-600/40 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 hover:bg-amber-500/20 dark:text-amber-300"
+                    onClick={() => onOpenSettings(t.settingsSection)}
+                  >
+                    去配置
+                  </button>
+                ) : null}
               </li>
             ))}
           </ul>

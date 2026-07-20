@@ -4,6 +4,7 @@ import { cn } from '@renderer/lib/cn';
 
 export function Card({
   className,
+  id,
   children,
   /** 可折叠：点击标题栏展开/收起 */
   collapsible = false,
@@ -13,6 +14,7 @@ export function Card({
   onOpenChange
 }: {
   className?: string;
+  id?: string;
   children: ReactNode;
   collapsible?: boolean;
   defaultCollapsed?: boolean;
@@ -27,11 +29,19 @@ export function Card({
   };
 
   if (!collapsible) {
-    return <div className={cn('ios-group text-card-foreground', className)}>{children}</div>;
+    return (
+      <div id={id} className={cn('ios-group text-card-foreground', className)}>
+        {children}
+      </div>
+    );
   }
 
   return (
-    <div className={cn('ios-group text-card-foreground', className)} data-open={open ? '1' : '0'}>
+    <div
+      id={id}
+      className={cn('ios-group text-card-foreground', className)}
+      data-open={open ? '1' : '0'}
+    >
       {Children.map(children, (child, i) => {
         if (!isValidElement(child)) return child;
         const type = child.type as { displayName?: string; name?: string };

@@ -179,7 +179,7 @@ function PoolModeSelect({
   );
 }
 
-export function SettingsForm() {
+export function SettingsForm({ focusSection }: { focusSection?: string | null }) {
   const data = useSettingsStore((s) => s.data);
   const reload = useSettingsStore((s) => s.reload);
   const push = useToastStore((s) => s.push);
@@ -191,6 +191,27 @@ export function SettingsForm() {
   const [s2ConnOpen, setS2ConnOpen] = useState(false);
   /** 外置 Turnstile Solver：默认折叠 */
   const [solverOpen, setSolverOpen] = useState(false);
+  /** 深链展开：mail | proxy | register | auth | push */
+  const [secMail, setSecMail] = useState(false);
+  const [secProxy, setSecProxy] = useState(false);
+  const [secRegister, setSecRegister] = useState(false);
+  const [secAuth, setSecAuth] = useState(false);
+  const [secPush, setSecPush] = useState(false);
+
+  useEffect(() => {
+    const s = String(focusSection || '').trim().toLowerCase();
+    if (!s) return;
+    if (s === 'mail') setSecMail(true);
+    if (s === 'proxy') setSecProxy(true);
+    if (s === 'register') setSecRegister(true);
+    if (s === 'auth') setSecAuth(true);
+    if (s === 'push') setSecPush(true);
+    const t = window.setTimeout(() => {
+      const el = document.getElementById(`settings-${s}`);
+      el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 80);
+    return () => window.clearTimeout(t);
+  }, [focusSection]);
   /** sing-box 运行状态 / 日志 / 解析节点 */
   const [sbStatus, setSbStatus] = useState<SingBoxStatus | null>(null);
   const [sbBusy, setSbBusy] = useState(false);
@@ -418,7 +439,13 @@ export function SettingsForm() {
 
   return (
     <div className="space-y-5">
-      <Card collapsible defaultCollapsed>
+      <Card
+        id="settings-mail"
+        collapsible
+        defaultCollapsed
+        open={secMail}
+        onOpenChange={setSecMail}
+      >
         <CardHeader
           title="邮件设置"
           description={
@@ -640,7 +667,13 @@ export function SettingsForm() {
         </CardBody>
       </Card>
 
-      <Card collapsible defaultCollapsed>
+      <Card
+        id="settings-proxy"
+        collapsible
+        defaultCollapsed
+        open={secProxy}
+        onOpenChange={setSecProxy}
+      >
         <CardHeader
           title="代理设置"
           description={draft.singBoxEnabled ? 'Sing-Box' : '直连'}
@@ -928,7 +961,13 @@ export function SettingsForm() {
         </CardBody>
       </Card>
 
-            <Card collapsible defaultCollapsed>
+            <Card
+              id="settings-register"
+              collapsible
+              defaultCollapsed
+              open={secRegister}
+              onOpenChange={setSecRegister}
+            >
         <CardHeader
           title="注册方案"
           right={<CardHeaderIcon icon={Layers} title="注册方案" />}
@@ -1095,7 +1134,13 @@ export function SettingsForm() {
         </CardBody>
       </Card>
 
-<Card collapsible defaultCollapsed>
+<Card
+        id="settings-auth"
+        collapsible
+        defaultCollapsed
+        open={secAuth}
+        onOpenChange={setSecAuth}
+      >
         <CardHeader
           title="授权管理"
           description={(() => {
@@ -1392,7 +1437,13 @@ export function SettingsForm() {
         </CardBody>
       </Card>
 
-<Card collapsible defaultCollapsed>
+<Card
+        id="settings-push"
+        collapsible
+        defaultCollapsed
+        open={secPush}
+        onOpenChange={setSecPush}
+      >
         <CardHeader
           title="推送设置"
           description={(() => {

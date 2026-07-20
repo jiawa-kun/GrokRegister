@@ -71,7 +71,8 @@ export default function App() {
         tab: 'pool',
         meta: null,
         status: null,
-        push: null
+        push: null,
+        section: null
       });
       return;
     }
@@ -80,7 +81,24 @@ export default function App() {
         tab: 'auth',
         sso: null,
         alive: null,
-        auth: null
+        auth: null,
+        section: null
+      });
+      return;
+    }
+    if (tab === 'settings') {
+      // section 由 onOpenSettings 写入，这里只保证 tab
+      patchQuery({
+        tab: 'settings',
+        page: null,
+        ps: null,
+        q: null,
+        sso: null,
+        alive: null,
+        auth: null,
+        meta: null,
+        status: null,
+        push: null
       });
       return;
     }
@@ -94,9 +112,28 @@ export default function App() {
       auth: null,
       meta: null,
       status: null,
-      push: null
+      push: null,
+      section: null
     });
   }, [tab]);
+
+  // 浏览器前进/后退：同步 tab
+  useEffect(() => {
+    const onPop = () => {
+      setTab(oneOf(getQuery('tab'), TAB_IDS, 'register'));
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
+  const openSettings = (section?: string | null) => {
+    setTab('settings');
+    if (section) {
+      patchQuery({ tab: 'settings', section });
+    } else {
+      patchQuery({ tab: 'settings', section: null });
+    }
+  };
   const [auth, setAuth] = useState<AuthState>(emptyAuth);
   const [authLoading, setAuthLoading] = useState(true);
   const pushToast = useToastStore((s) => s.push);
@@ -448,7 +485,7 @@ export default function App() {
 
       <main className="app-main">
         <div className="page-content">
-          {tab === 'register' && <RegisterPage onOpenSettings={() => setTab('settings')} />}
+          {tab === 'register' && <RegisterPage onOpenSettings={openSettings} />}
           {tab === 'pool' && <PoolPage />}
           {tab === 'auth' && <AuthPage onOpenPool={() => setTab('pool')} />}
           {tab === 'settings' && (

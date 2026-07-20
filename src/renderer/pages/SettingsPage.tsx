@@ -16,6 +16,7 @@ import { Input } from '@renderer/components/ui/Input';
 import { PasswordInput } from '@renderer/components/ui/PasswordInput';
 import { useSettingsStore } from '@renderer/store/settingsStore';
 import { useToastStore } from '@renderer/store/toastStore';
+import { getQuery } from '@renderer/lib/urlQuery';
 import type { AuthState, ChangeCredentialsInput } from '@shared/ipc';
 
 /** 捕获配置表渲染异常，避免整页黑屏且无信息 */
@@ -68,17 +69,25 @@ export function SettingsPage({
 }) {
   const data = useSettingsStore((s) => s.data);
   const reload = useSettingsStore((s) => s.reload);
+  const [focusSection, setFocusSection] = useState(() => getQuery('section') || null);
 
   useEffect(() => {
     if (!data) void reload();
   }, [data, reload]);
+
+  useEffect(() => {
+    const sync = () => setFocusSection(getQuery('section') || null);
+    sync();
+    window.addEventListener('popstate', sync);
+    return () => window.removeEventListener('popstate', sync);
+  }, []);
 
   return (
     <div className="mx-auto w-full max-w-6xl space-y-5 pb-16">
       <SystemHealthCard pollMs={30000} />
       <CredentialsPanel username={username} onAuthChanged={onAuthChanged} />
       <SettingsErrorBoundary>
-        <SettingsForm />
+        <SettingsForm focusSection={focusSection} />
       </SettingsErrorBoundary>
     </div>
   );

@@ -834,6 +834,32 @@ export type AccountListPage = {
   facets: AccountListFacets;
 };
 
+/** 列表出口：去掉 password/sso 全文，保留 has* 与 tags */
+function toAccountListItem(a: AccountRecord): AccountRecord {
+  const hasPassword = Boolean(String(a.password || '').trim());
+  const hasSso = Boolean(String(a.sso || '').trim());
+  return {
+    ...a,
+    password: '',
+    sso: '',
+    hasPassword,
+    hasSso
+  };
+}
+
+/** 按 id 取完整账号（含 password/sso） */
+export async function getAccountById(id: string): Promise<AccountRecord | null> {
+  const key = String(id || '').trim();
+  if (!key) return null;
+  return withAccountsLock(async () => {
+    const all = await loadAccountsBase();
+    const hit = all.find((a) => a.id === key);
+    if (!hit) return null;
+    const [withTags] = await attachTagsToRecords([hit]);
+    return withTags || hit;
+  });
+}
+
 function matchAccountQuery(
   a: AccountRecord,
   opts: AccountListQuery,
@@ -963,8 +989,9 @@ export async function queryAccounts(opts: AccountListQuery = {}): Promise<Accoun
     const page = Math.min(totalPages, Math.max(1, Math.floor(Number(opts.page) || 1)));
     const start = (page - 1) * pageSize;
     const pageItems = filtered.slice(start, start + pageSize);
+    const tagged = await attachTagsToRecords(pageItems);
     return {
-      items: await attachTagsToRecords(pageItems),
+      items: tagged.map(toAccountListItem),
       total,
       page,
       pageSize,

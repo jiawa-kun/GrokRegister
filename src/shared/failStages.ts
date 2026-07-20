@@ -128,6 +128,27 @@ export const FAIL_STAGE_TIPS: Record<FailStageId, string> = {
   other: '看最近失败明细与完整日志定位'
 };
 
+/** 失败阶段 → 配置页 section（?section=） */
+export type SettingsSectionId = 'mail' | 'proxy' | 'register' | 'auth' | 'push';
+
+export const FAIL_STAGE_SETTINGS: Record<FailStageId, SettingsSectionId | null> = {
+  mail: 'mail',
+  turnstile: 'register',
+  profile: 'register',
+  sso: 'auth',
+  proxy: 'proxy',
+  blocked: 'proxy',
+  timeout: 'proxy',
+  plan: 'register',
+  other: null
+};
+
+export type FailStageSuggestion = {
+  text: string;
+  stageId?: FailStageId;
+  settingsSection?: SettingsSectionId | null;
+};
+
 export function tipForFailStage(id: string | null | undefined): string {
   const key = String(id || '').trim() as FailStageId;
   if (key && key in FAIL_STAGE_TIPS) return FAIL_STAGE_TIPS[key];
@@ -140,12 +161,16 @@ export function tipForFailStage(id: string | null | undefined): string {
 export function suggestForFailStages(
   stages: { id: string; count: number; pct?: number }[],
   opts?: { totalFailed?: number; failRate?: number }
-): string[] {
-  const tips: string[] = [];
+): FailStageSuggestion[] {
+  const tips: FailStageSuggestion[] = [];
   const total = opts?.totalFailed ?? stages.reduce((n, s) => n + (s.count || 0), 0);
   const rate = opts?.failRate;
   if (typeof rate === 'number' && rate >= 60 && total >= 3) {
-    tips.push(`失败率 ${rate}% 偏高：建议先降并行到 1，确认单路稳定再加`);
+    tips.push({
+      text: `失败率 ${rate}% 偏高：建议先降并行到 1，确认单路稳定再加`,
+      stageId: 'plan',
+      settingsSection: 'register'
+    });
   }
   const sorted = [...stages].sort((a, b) => (b.count || 0) - (a.count || 0));
   for (const s of sorted.slice(0, 3)) {
@@ -157,12 +182,21 @@ export function suggestForFailStages(
           ? Math.round((s.count / total) * 100)
           : 0;
     if (pct < 15 && sorted[0] && s.id !== sorted[0].id) continue;
-    const tip = tipForFailStage(s.id);
-    const label = FAIL_STAGE_LABELS[s.id as FailStageId] || s.id;
-    tips.push(`${label} ${pct}%：${tip}`);
+    const stageId = (s.id in FAIL_STAGE_TIPS ? s.id : 'other') as FailStageId;
+    const tip = tipForFailStage(stageId);
+    const label = FAIL_STAGE_LABELS[stageId] || s.id;
+    tips.push({
+      text: `${label} ${pct}%：${tip}`,
+      stageId,
+      settingsSection: FAIL_STAGE_SETTINGS[stageId]
+    });
   }
   if (tips.length === 0 && total > 0) {
-    tips.push(FAIL_STAGE_TIPS.other);
+    tips.push({
+      text: FAIL_STAGE_TIPS.other,
+      stageId: 'other',
+      settingsSection: null
+    });
   }
   return tips.slice(0, 3);
 }

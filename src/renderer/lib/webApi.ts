@@ -163,6 +163,7 @@ const webApi: RendererApi = {
   },
 
   listAccounts: () => http('GET', '/api/accounts'),
+  getAccount: (id) => http('GET', `/api/accounts/${encodeURIComponent(id)}`),
   listAccountsPage: (query) => {
     const qs = new URLSearchParams();
     qs.set('paged', '1');

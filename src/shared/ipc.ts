@@ -347,6 +347,8 @@ export interface RendererApi {
   // accounts
   /** 全量号池（兼容旧调用） */
   listAccounts(): Promise<AccountRecord[]>;
+  /** 单账号完整记录（含 password/sso） */
+  getAccount?(id: string): Promise<AccountRecord>;
   /**
    * 按筛选返回匹配账号（筛后全部验活/导出/补签）。
    * 精简字段，默认最多 500，硬顶 2000。

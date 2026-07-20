@@ -171,6 +171,8 @@ export function PoolPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [lastRefresh, setLastRefresh] = useState<string | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
+  /** 详情抽屉完整记录（列表轻字段无密钥时按 id 拉取） */
+  const [detailAccount, setDetailAccount] = useState<AccountRecord | null>(null);
   const [mintProg, setMintProg] = useState<MintProgress | null>(null);
   const [emailMasked, setEmailMasked] = useState(() => loadEmailPrivacyMask());
   /** 补签 Auth 时跳过 bot_flag_source=1（默认关，localStorage 记忆；开=蓝） */
@@ -231,6 +233,25 @@ export function PoolPage() {
       push: null
     });
   }, [page, pageSize, searchQuery, ssoFilter, aliveFilter, authFilter]);
+
+  // 浏览器前进/后退：从 URL 恢复筛选
+  useEffect(() => {
+    const onPop = () => {
+      setPage(getQueryInt('page', 1));
+      const ps = Number(getQuery('ps'));
+      if (isPageSize(ps)) setPageSize(ps);
+      setSearchQuery(getQuery('q'));
+      setSsoFilter(oneOf(getQuery('sso'), ['all', 'has_sso', 'no_sso'] as const, 'all'));
+      setAliveFilter(
+        oneOf(getQuery('alive'), ['all', 'unchecked', 'alive', 'dead'] as const, 'all')
+      );
+      setAuthFilter(
+        oneOf(getQuery('auth'), ['all', 'unconverted', 'converted'] as const, 'all')
+      );
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
 
   const reloadAuthEmails = async () => {
     try {
@@ -440,13 +461,9 @@ export function PoolPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, page, pageSize, ssoFilter, aliveFilter, authFilter, searchQuery]);
 
-  // 号池 SSO → hash（增量缓存：仅 id/sso 签名变化时重算）
+  // 号池 id 签名（列表无 sso 全文；hash 仅在详情 hydrate 后用）
   const accountsHashKey = useMemo(
-    () =>
-      accounts
-        .map((a) => `${a.id}\0${a.sso || ''}`)
-        .sort()
-        .join('\n'),
+    () => accounts.map((a) => a.id).join('|'),
     [accounts]
   );
 
@@ -708,6 +725,37 @@ export function PoolPage() {
     createdAt?: string;
   };
 
+  const accountHasSso = (a: AccountRecord) =>
+    a.hasSso === true || Boolean(String(a.sso || '').trim());
+
+  /** 列表轻字段无密钥时，按 id 拉完整记录 */
+  const hydrateTargets = async (list: ActionTarget[]): Promise<ActionTarget[]> => {
+    const need = list.filter((a) => !String(a.sso || '').trim() && !String(a.password || '').trim());
+    if (need.length === 0) return list;
+    const api = window.api as {
+      getAccount?: (id: string) => Promise<AccountRecord>;
+    };
+    if (!api.getAccount) return list;
+    const map = new Map<string, ActionTarget>();
+    await Promise.all(
+      need.map(async (a) => {
+        try {
+          const full = await api.getAccount!(a.id);
+          map.set(a.id, {
+            id: full.id,
+            email: full.email || a.email || '',
+            password: full.password || '',
+            sso: full.sso || '',
+            createdAt: full.createdAt || a.createdAt
+          });
+        } catch {
+          map.set(a.id, a);
+        }
+      })
+    );
+    return list.map((a) => map.get(a.id) || a);
+  };
+
   /** 当前筛选参数（与服务端 match/paged 一致） */
   const filterQuery = () => ({
     q: searchQuery.trim() || undefined,
@@ -718,7 +766,7 @@ export function PoolPage() {
 
   /**
    * 解析操作目标：
-   * - 有勾选：本页已选
+   * - 有勾选：本页已选（密钥可能需 hydrate）
    * - 分页且无勾选：scope=page 用本页；scope=filter 用服务端 match 全量筛选
    * - 全量模式：用 filteredAccounts
    */
@@ -737,7 +785,7 @@ export function PoolPage() {
     if (selected.size > 0) {
       const list = accounts
         .filter((a) => selected.has(a.id))
-        .filter((a) => (requireSso ? Boolean(String(a.sso || '').trim()) : true))
+        .filter((a) => (requireSso ? accountHasSso(a) : true))
         .map((a) => ({
           id: a.id,
           email: a.email || '',
@@ -745,14 +793,15 @@ export function PoolPage() {
           sso: a.sso || '',
           createdAt: a.createdAt
         }));
-      return { targets: list, scope: 'selected', total: list.length, truncated: false };
+      const targets = await hydrateTargets(list);
+      return { targets, scope: 'selected', total: targets.length, truncated: false };
     }
 
     const wantFilter = opts?.scope === 'filter' || (opts?.scope !== 'page' && serverPaged);
     // 显式 page：只本页
     if (opts?.scope === 'page' || (!wantFilter && serverPaged)) {
       const list = accounts
-        .filter((a) => (requireSso ? Boolean(String(a.sso || '').trim()) : true))
+        .filter((a) => (requireSso ? accountHasSso(a) : true))
         .map((a) => ({
           id: a.id,
           email: a.email || '',
@@ -760,10 +809,11 @@ export function PoolPage() {
           sso: a.sso || '',
           createdAt: a.createdAt
         }));
-      return { targets: list, scope: 'page', total: list.length, truncated: false };
+      const targets = await hydrateTargets(list);
+      return { targets, scope: 'page', total: targets.length, truncated: false };
     }
 
-    // 筛后全部：服务端 match
+    // 筛后全部：服务端 match（自带密钥）
     if (serverPaged) {
       const api = window.api as {
         matchAccounts?: (q?: {
@@ -783,7 +833,7 @@ export function PoolPage() {
       };
       if (!api.matchAccounts) {
         const list = accounts
-          .filter((a) => (requireSso ? Boolean(a.sso) : true))
+          .filter((a) => (requireSso ? accountHasSso(a) : true))
           .map((a) => ({
             id: a.id,
             email: a.email || '',
@@ -791,7 +841,8 @@ export function PoolPage() {
             sso: a.sso || '',
             createdAt: a.createdAt
           }));
-        return { targets: list, scope: 'page', total: list.length, truncated: false };
+        const targets = await hydrateTargets(list);
+        return { targets, scope: 'page', total: targets.length, truncated: false };
       }
       const r = await api.matchAccounts({
         ...filterQuery(),
@@ -807,7 +858,7 @@ export function PoolPage() {
     }
 
     const list = filteredAccounts
-      .filter((a) => (requireSso ? Boolean(String(a.sso || '').trim()) : true))
+      .filter((a) => (requireSso ? accountHasSso(a) : true))
       .slice(0, limit)
       .map((a) => ({
         id: a.id,
@@ -816,11 +867,12 @@ export function PoolPage() {
         sso: a.sso || '',
         createdAt: a.createdAt
       }));
+    const targets = await hydrateTargets(list);
     return {
-      targets: list,
+      targets,
       scope: 'local',
       total: filteredAccounts.length,
-      truncated: filteredAccounts.length > list.length
+      truncated: filteredAccounts.length > targets.length
     };
   };
 
@@ -1153,7 +1205,36 @@ export function PoolPage() {
   };
 
   const picked = accounts.filter((a) => selected.has(a.id));
-  const openAccount = accounts.find((a) => a.id === openId) ?? null;
+
+  // 打开详情时拉完整密钥（列表分页不再下发 password/sso）
+  useEffect(() => {
+    if (!openId) {
+      setDetailAccount(null);
+      return;
+    }
+    let cancelled = false;
+    const light = accounts.find((a) => a.id === openId) ?? null;
+    setDetailAccount(light);
+    const needsFull =
+      light &&
+      !String(light.password || '').trim() &&
+      !String(light.sso || '').trim() &&
+      (light.hasPassword === true || light.hasSso === true || light.hasPassword == null);
+    if (!needsFull) return;
+    const api = window.api as { getAccount?: (id: string) => Promise<AccountRecord> };
+    if (!api.getAccount) return;
+    void api
+      .getAccount(openId)
+      .then((full) => {
+        if (!cancelled) setDetailAccount(full);
+      })
+      .catch(() => {
+        /* 保留 light */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [openId, accounts]);
   const minting = !!mintProg?.running;
   const busy = verifying || minting || deleting || importing || pushingG2a;
   const hasActiveFilter =
@@ -1625,7 +1706,7 @@ export function PoolPage() {
       )}
 
       <AccountDetailDrawer
-        account={openAccount}
+        account={detailAccount}
         open={openId !== null}
         onClose={() => setOpenId(null)}
         ssoResult={openId ? ssoMap.get(openId) : undefined}
@@ -1745,15 +1826,15 @@ function AccountCard({
 
   const stop = (e: React.MouseEvent) => e.stopPropagation();
   const emailDisplay = maskEmail(account.email, emailMasked, { empty: '(无邮箱)' });
-  // 优先验活结果 → 本地 SSO JWT → 匹配 Auth 文件 bot_flag（与 Auth 页一致）
-  // 注意：bot_flag_source=0（None）是合法值，不能用 !flag / || 吞掉
-  const localFlag = readBotFlagFromSso(account.sso);
+  // 列表轻字段无 SSO 全文：优先验活 → Auth badge；有全文 sso 时再读 JWT
+  const localFlag = account.sso ? readBotFlagFromSso(account.sso) : { botFlagSource: null, isBotFlag1: false };
   const hasSsoFlag =
     ssoResult != null &&
     ssoResult.botFlagSource !== undefined &&
     ssoResult.botFlagSource !== null &&
     ssoResult.botFlagSource !== '';
   const hasLocalFlag =
+    Boolean(account.sso) &&
     localFlag.botFlagSource !== undefined &&
     localFlag.botFlagSource !== null &&
     localFlag.botFlagSource !== '';
@@ -1781,6 +1862,24 @@ function AccountCard({
     flagIs1 = authBotFlag!.isBotFlag1;
     flagFrom = 'auth';
   }
+
+  const hasPw =
+    account.hasPassword === true || Boolean(String(account.password || '').trim());
+  const hasSsoField =
+    account.hasSso === true || Boolean(String(account.sso || '').trim());
+
+  const ensureSecret = async (kind: 'password' | 'sso'): Promise<string> => {
+    const cur = kind === 'password' ? account.password : account.sso;
+    if (String(cur || '').trim()) return String(cur);
+    const api = window.api as { getAccount?: (id: string) => Promise<AccountRecord> };
+    if (!api.getAccount) return '';
+    try {
+      const full = await api.getAccount(account.id);
+      return kind === 'password' ? String(full.password || '') : String(full.sso || '');
+    } catch {
+      return '';
+    }
+  };
 
   return (
     <div
@@ -1845,18 +1944,44 @@ function AccountCard({
 
       <SecretRow
         label="密码"
-        value={account.password || ''}
+        value={
+          account.password
+            ? account.password
+            : hasPw
+              ? showPw
+                ? '（点复制或打开详情）'
+                : '••••••••'
+              : ''
+        }
         reveal={showPw}
         onToggleReveal={() => setShowPw((v) => !v)}
-        onCopy={() => void copy(account.password || '', '密码')}
+        onCopy={() =>
+          void ensureSecret('password').then((v) => {
+            if (!v) push({ tone: 'warn', title: '无密码' });
+            else void copy(v, '密码');
+          })
+        }
         onClick={stop}
       />
       <SecretRow
         label="SSO"
-        value={account.sso || ''}
+        value={
+          account.sso
+            ? account.sso
+            : hasSsoField
+              ? showSso
+                ? '（点复制或打开详情）'
+                : '••••••••'
+              : ''
+        }
         reveal={showSso}
         onToggleReveal={() => setShowSso((v) => !v)}
-        onCopy={() => void copy(account.sso || '', 'SSO')}
+        onCopy={() =>
+          void ensureSecret('sso').then((v) => {
+            if (!v) push({ tone: 'warn', title: '无 SSO' });
+            else void copy(v, 'SSO');
+          })
+        }
         onClick={stop}
         mono
       />
