@@ -241,7 +241,17 @@ export class RegisterBot extends EventEmitter {
   getFailStageBoard(opts?: { runId?: string; all?: boolean }): {
     runId: string | null;
     totalFailed: number;
-    stages: { id: string; label: string; count: number }[];
+    totalSuccess: number;
+    totalRounds: number;
+    failRate: number;
+    stages: { id: string; label: string; count: number; pct: number }[];
+    byJob: {
+      runId: string;
+      success: number;
+      failed: number;
+      phase: string;
+      topStage: string | null;
+    }[];
     recent: { ts: number; stage: string; message: string; round?: number; runId?: string }[];
   } {
     const wantAll = opts?.all === true;
@@ -249,35 +259,77 @@ export class RegisterBot extends EventEmitter {
     const jobs = wantAll
       ? [...this.jobs.values()]
       : rid
-        ? [this.jobs.get(rid)].filter(Boolean) as Job[]
-        : [this.resolveFocusJob()].filter(Boolean) as Job[];
+        ? ([this.jobs.get(rid)].filter(Boolean) as Job[])
+        : ([this.resolveFocusJob()].filter(Boolean) as Job[]);
 
     const counts = emptyFailStageCounts();
     const recent: { ts: number; stage: string; message: string; round?: number; runId?: string }[] =
       [];
     let totalFailed = 0;
+    let totalSuccess = 0;
+    const byJob: {
+      runId: string;
+      success: number;
+      failed: number;
+      phase: string;
+      topStage: string | null;
+    }[] = [];
+
     for (const j of jobs) {
       totalFailed += j.status.failed || 0;
+      totalSuccess += j.status.success || 0;
       for (const k of Object.keys(counts) as FailStageId[]) {
         counts[k] += j.failStages?.[k] || 0;
       }
       for (const r of j.recentFails || []) {
         recent.push({ ...r, runId: j.runId });
       }
+      let topStage: string | null = null;
+      let topN = 0;
+      for (const k of Object.keys(j.failStages || {}) as FailStageId[]) {
+        const n = j.failStages[k] || 0;
+        if (n > topN) {
+          topN = n;
+          topStage = FAIL_STAGE_LABELS[k] || k;
+        }
+      }
+      byJob.push({
+        runId: j.runId,
+        success: j.status.success || 0,
+        failed: j.status.failed || 0,
+        phase: j.status.phase,
+        topStage
+      });
     }
     recent.sort((a, b) => b.ts - a.ts);
+    const classified = (Object.keys(counts) as FailStageId[]).reduce(
+      (n, id) => n + (counts[id] || 0),
+      0
+    );
+    const denom = classified > 0 ? classified : totalFailed || 1;
     const stages = (Object.keys(counts) as FailStageId[])
-      .map((id) => ({
-        id,
-        label: FAIL_STAGE_LABELS[id],
-        count: counts[id]
-      }))
+      .map((id) => {
+        const count = counts[id];
+        return {
+          id,
+          label: FAIL_STAGE_LABELS[id],
+          count,
+          pct: count > 0 ? Math.round((count / denom) * 100) : 0
+        };
+      })
       .filter((x) => x.count > 0)
       .sort((a, b) => b.count - a.count);
+    const totalRounds = totalSuccess + totalFailed;
+    const failRate =
+      totalRounds > 0 ? Math.round((totalFailed / totalRounds) * 1000) / 10 : 0;
     return {
       runId: wantAll ? null : jobs[0]?.runId || rid || this.focusRunId,
       totalFailed,
+      totalSuccess,
+      totalRounds,
+      failRate,
       stages,
+      byJob: byJob.sort((a, b) => b.failed - a.failed).slice(0, 8),
       recent: recent.slice(0, 30)
     };
   }

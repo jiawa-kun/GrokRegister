@@ -9,6 +9,7 @@ import {
 import { KeyRound, UserRound } from 'lucide-react';
 import { SettingsForm } from '@renderer/components/domain/SettingsForm';
 import { CardHeaderIcon } from '@renderer/components/domain/CardHeaderIcon';
+import { SystemHealthCard } from '@renderer/components/domain/SystemHealthCard';
 import { Button } from '@renderer/components/ui/Button';
 import { Card, CardBody, CardHeader } from '@renderer/components/ui/Card';
 import { Input } from '@renderer/components/ui/Input';
@@ -74,6 +75,7 @@ export function SettingsPage({
 
   return (
     <div className="mx-auto w-full max-w-6xl space-y-5 pb-16">
+      <SystemHealthCard pollMs={30000} />
       <CredentialsPanel username={username} onAuthChanged={onAuthChanged} />
       <SettingsErrorBoundary>
         <SettingsForm />

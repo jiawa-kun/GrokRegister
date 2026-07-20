@@ -14,11 +14,13 @@ import { Slider } from '@renderer/components/ui/Slider';
 import { StatusCard } from '@renderer/components/domain/StatusCard';
 import { LogPanel } from '@renderer/components/domain/LogPanel';
 import { JobListPanel } from '@renderer/components/domain/JobListPanel';
+import { SystemHealthCard } from '@renderer/components/domain/SystemHealthCard';
 import { useRunStore } from '@renderer/store/runStore';
 import { useSettingsStore } from '@renderer/store/settingsStore';
 import { useToastStore } from '@renderer/store/toastStore';
 import { cn } from '@renderer/lib/cn';
 import type { AppSettings, CpaMintMode } from '@shared/settings';
+import { FAIL_STAGE_LABELS, type FailStageId } from '@shared/failStages';
 
 export function RegisterPage({ onOpenSettings }: { onOpenSettings(): void }) {
   const status = useRunStore((s) => s.status);
@@ -187,6 +189,7 @@ export function RegisterPage({ onOpenSettings }: { onOpenSettings(): void }) {
 
             {/* 原「运行设置」合并进实时状态 */}
             <RuntimeSettingsInline />
+            <SystemHealthCard compact pollMs={20000} />
             <AuthQueueMetricsCard />
             <FailStageBoardCard />
 
@@ -487,15 +490,33 @@ function InfoBox({ label, value }: { label: string; value: string }) {
   );
 }
 
-/** 注册失败分阶段看板（启发式） */
+/** 注册失败分阶段看板（启发式 + 成功率） */
 function FailStageBoardCard() {
   const focusRunId = useRunStore((s) => s.focusRunId);
   const jobsActive = useRunStore((s) => s.jobsActive);
   const failed = useRunStore((s) => s.status.failed);
+  const success = useRunStore((s) => s.status.success);
+  const [scopeAll, setScopeAll] = useState(true);
   const [board, setBoard] = useState<{
     totalFailed: number;
-    stages: { id: string; label: string; count: number }[];
-    recent: { ts: number; stage: string; message: string; round?: number }[];
+    totalSuccess?: number;
+    totalRounds?: number;
+    failRate?: number;
+    stages: { id: string; label: string; count: number; pct?: number }[];
+    byJob?: {
+      runId: string;
+      success: number;
+      failed: number;
+      phase: string;
+      topStage: string | null;
+    }[];
+    recent: {
+      ts: number;
+      stage: string;
+      message: string;
+      round?: number;
+      runId?: string;
+    }[];
   } | null>(null);
 
   useEffect(() => {
@@ -508,13 +529,30 @@ function FailStageBoardCard() {
             all?: boolean;
           }) => Promise<{
             totalFailed: number;
-            stages: { id: string; label: string; count: number }[];
-            recent: { ts: number; stage: string; message: string; round?: number }[];
+            totalSuccess?: number;
+            totalRounds?: number;
+            failRate?: number;
+            stages: { id: string; label: string; count: number; pct?: number }[];
+            byJob?: {
+              runId: string;
+              success: number;
+              failed: number;
+              phase: string;
+              topStage: string | null;
+            }[];
+            recent: {
+              ts: number;
+              stage: string;
+              message: string;
+              round?: number;
+              runId?: string;
+            }[];
           }>;
         };
         if (!api.getFailStageBoard) return;
+        const useAll = scopeAll || jobsActive > 1 || !focusRunId;
         const r = await api.getFailStageBoard(
-          jobsActive > 1 ? { all: true } : focusRunId ? { runId: focusRunId } : { all: true }
+          useAll ? { all: true } : { runId: focusRunId || undefined }
         );
         if (!cancelled && r) setBoard(r);
       } catch {
@@ -527,48 +565,108 @@ function FailStageBoardCard() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [focusRunId, jobsActive, failed]);
+  }, [focusRunId, jobsActive, failed, success, scopeAll]);
 
   const stages = board?.stages || [];
-  const total = board?.totalFailed ?? 0;
+  const totalFail = board?.totalFailed ?? 0;
+  const totalOk = board?.totalSuccess ?? success ?? 0;
+  const failRate = board?.failRate;
   const top = stages.slice(0, 6);
   const maxCount = Math.max(1, ...top.map((s) => s.count));
+  const byJob = board?.byJob || [];
+
+  const stageLabel = (id: string) =>
+    FAIL_STAGE_LABELS[id as FailStageId] || id;
 
   return (
     <div className="rounded-xl border border-border bg-card/80 p-3.5 shadow-[var(--ios-shadow)]">
-      <div className="flex items-center justify-between gap-2">
-        <div className="text-[13px] font-semibold tracking-[-0.02em]">失败归因</div>
-        <span className="text-[10px] text-muted-foreground">
-          累计失败 {total}
-          {jobsActive > 1 ? ' · 全部任务' : ''}
-        </span>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="min-w-0">
+          <div className="text-[13px] font-semibold tracking-[-0.02em]">失败归因</div>
+          <p className="text-[10px] text-muted-foreground">
+            成功 {totalOk} · 失败 {totalFail}
+            {typeof failRate === 'number' ? ` · 失败率 ${failRate}%` : ''}
+          </p>
+        </div>
+        <div className="flex items-center gap-1 rounded-full border border-border/70 bg-muted/60 p-0.5">
+          <button
+            type="button"
+            className={cn(
+              'rounded-full px-2 py-0.5 text-[10px] font-semibold',
+              scopeAll ? 'bg-primary text-primary-foreground' : 'text-muted-foreground'
+            )}
+            onClick={() => setScopeAll(true)}
+          >
+            全部
+          </button>
+          <button
+            type="button"
+            className={cn(
+              'rounded-full px-2 py-0.5 text-[10px] font-semibold',
+              !scopeAll ? 'bg-primary text-primary-foreground' : 'text-muted-foreground'
+            )}
+            onClick={() => setScopeAll(false)}
+            disabled={!focusRunId}
+            title={focusRunId ? `聚焦 #${focusRunId.slice(0, 8)}` : '无聚焦任务'}
+          >
+            聚焦
+          </button>
+        </div>
       </div>
+
       {top.length === 0 ? (
         <p className="mt-2 text-[11px] text-muted-foreground">暂无分阶段数据（成功或尚未失败）</p>
       ) : (
         <div className="mt-2 space-y-1.5">
           {top.map((s) => (
             <div key={s.id} className="flex items-center gap-2">
-              <div className="w-16 shrink-0 text-[11px] text-muted-foreground">{s.label}</div>
+              <div className="w-[4.5rem] shrink-0 truncate text-[11px] text-muted-foreground">
+                {s.label}
+              </div>
               <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
                 <div
                   className="h-full rounded-full bg-amber-500/80"
                   style={{ width: `${Math.max(8, Math.round((s.count / maxCount) * 100))}%` }}
                 />
               </div>
-              <div className="w-7 shrink-0 text-right text-[12px] font-semibold tabular-nums">
+              <div className="w-12 shrink-0 text-right text-[11px] font-semibold tabular-nums">
                 {s.count}
+                {typeof s.pct === 'number' ? (
+                  <span className="ml-0.5 text-[10px] font-normal text-muted-foreground">
+                    {s.pct}%
+                  </span>
+                ) : null}
               </div>
             </div>
           ))}
         </div>
       )}
+
+      {byJob.length > 1 ? (
+        <div className="mt-2 space-y-1">
+          <div className="text-[10px] font-medium text-muted-foreground">分任务</div>
+          {byJob.slice(0, 4).map((j) => (
+            <div
+              key={j.runId}
+              className="flex items-center justify-between gap-2 text-[10px] text-muted-foreground"
+            >
+              <span className="font-mono">#{j.runId.slice(0, 8)}</span>
+              <span>
+                ✓{j.success} · ✗{j.failed}
+                {j.topStage ? ` · ${j.topStage}` : ''}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
       {(board?.recent || []).length > 0 ? (
-        <div className="mt-2 max-h-20 overflow-y-auto rounded-lg border border-border/50 bg-muted/40 px-2 py-1.5">
-          {(board?.recent || []).slice(0, 5).map((r, i) => (
+        <div className="mt-2 max-h-24 overflow-y-auto rounded-lg border border-border/50 bg-muted/40 px-2 py-1.5">
+          {(board?.recent || []).slice(0, 8).map((r, i) => (
             <div key={`${r.ts}-${i}`} className="truncate text-[10px] text-muted-foreground">
+              {r.runId ? `#${r.runId.slice(0, 6)} ` : ''}
               {r.round ? `R${r.round} ` : ''}
-              <span className="text-foreground/80">{r.stage}</span>
+              <span className="text-foreground/80">{stageLabel(r.stage)}</span>
               {r.message ? ` · ${r.message}` : ''}
             </div>
           ))}

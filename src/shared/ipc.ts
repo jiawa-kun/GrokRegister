@@ -360,7 +360,17 @@ export interface RendererApi {
   }): Promise<{
     runId: string | null;
     totalFailed: number;
-    stages: { id: string; label: string; count: number }[];
+    totalSuccess?: number;
+    totalRounds?: number;
+    failRate?: number;
+    stages: { id: string; label: string; count: number; pct?: number }[];
+    byJob?: {
+      runId: string;
+      success: number;
+      failed: number;
+      phase: string;
+      topStage: string | null;
+    }[];
     recent: {
       ts: number;
       stage: string;
