@@ -43,6 +43,7 @@ import {
   queryAccounts,
   matchAccounts,
   getAccountById,
+  getAccountsStorageInfo,
   getAuthBadgeIndex,
   migrateAccountSecretStorage,
   resyncAccountsFromDisk,
@@ -608,10 +609,22 @@ app.get('/api/accounts', asyncHandler(async (req, res) => {
   );
 }));
 
+/** 号池存储后端状态（JSON / SQLite） */
+app.get('/api/accounts/storage', asyncHandler(async (_req, res) => {
+  res.json(await getAccountsStorageInfo());
+}));
+
 /** 单账号完整记录（含 password/sso；列表分页不返回密钥） */
 app.get('/api/accounts/:id', asyncHandler(async (req, res) => {
   const id = String(req.params.id || '').trim();
-  if (!id || id === 'match' || id === 'resync' || id === 'import' || id === 'delete') {
+  if (
+    !id ||
+    id === 'match' ||
+    id === 'resync' ||
+    id === 'import' ||
+    id === 'delete' ||
+    id === 'storage'
+  ) {
     res.status(404).json({ error: 'not found' });
     return;
   }

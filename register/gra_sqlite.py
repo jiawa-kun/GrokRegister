@@ -91,6 +91,33 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_delivery_status
           ON delivery_jobs(status, next_retry_at);
+
+        -- 号池主表（由 accounts.json 迁移；Node 双写/优先读）
+        CREATE TABLE IF NOT EXISTS accounts (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL DEFAULT '',
+          email TEXT NOT NULL DEFAULT '',
+          password TEXT NOT NULL DEFAULT '',
+          sso TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL DEFAULT '',
+          sso_check_json TEXT NOT NULL DEFAULT '',
+          email_lc TEXT NOT NULL DEFAULT '',
+          sso_hash TEXT NOT NULL DEFAULT '',
+          has_sso INTEGER NOT NULL DEFAULT 0,
+          alive INTEGER,
+          data_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_accounts_created
+          ON accounts(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_accounts_email
+          ON accounts(email_lc);
+        CREATE INDEX IF NOT EXISTS idx_accounts_sso_hash
+          ON accounts(sso_hash);
+        CREATE INDEX IF NOT EXISTS idx_accounts_alive
+          ON accounts(alive);
+        CREATE INDEX IF NOT EXISTS idx_accounts_has_sso
+          ON accounts(has_sso);
         """
     )
 

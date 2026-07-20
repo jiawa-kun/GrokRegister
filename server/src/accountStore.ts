@@ -2,8 +2,8 @@
  * 账号记录存储。
  * registerBot 从 Python stdout 关联出 email/password/sso 后追加到这里。
  *
- * 落盘：DATA_DIR/accounts.json（Docker 默认 /data/accounts.json，挂载 ./data 持久化）。
- * 兼容：若新路径不存在，会尝试迁移 cwd/out/accounts.json，并从 SSO 目录导入历史 txt。
+ * 主库（规模化）：DATA_DIR/gra_store.sqlite accounts 表（经 Python CLI）。
+ * 兼容备份：DATA_DIR/accounts.json（双写；SQLite 不可用时仍可读 JSON）。
  * 验活结果写在每条 AccountRecord.ssoCheck 上，与号池同库持久化。
  */
 import { promises as fsp, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
@@ -18,6 +18,13 @@ import {
   isSecretEncryptionAvailable,
   warnIfSecretEncryptionUnavailable
 } from './secretCrypto.js';
+import {
+  migrateJsonToSqliteIfNeeded,
+  sqliteCountAccounts,
+  sqliteDumpAccounts,
+  sqliteGetAccount,
+  sqliteReplaceAccounts
+} from './accountSqlite.js';
 
 function accountsDir(): string {
   return dataDir();
@@ -150,11 +157,19 @@ async function writeAll(all: AccountRecord[]): Promise<void> {
   const path = accountsPath();
   const tmp = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   warnIfSecretEncryptionUnavailable('accounts store');
-  await fsp.writeFile(
-    tmp,
-    JSON.stringify(all.map(encryptRecordForDisk), null, 2),
-    'utf-8'
-  );
+  const diskRows = all.map(encryptRecordForDisk);
+  sqliteCacheGen += 1;
+  // 1) SQLite 主库（失败不阻断 JSON 备份）
+  try {
+    const ok = sqliteReplaceAccounts(diskRows);
+    if (!ok) {
+      console.warn('[accountStore] SQLite replace_accounts failed; JSON still written');
+    }
+  } catch (e) {
+    console.warn('[accountStore] SQLite write error', e);
+  }
+  // 2) JSON 备份（兼容旧路径 / 灾备）
+  await fsp.writeFile(tmp, JSON.stringify(diskRows, null, 2), 'utf-8');
   await fsp.rename(tmp, path);
   try {
     const st = await fsp.stat(path);
@@ -163,7 +178,7 @@ async function writeAll(all: AccountRecord[]): Promise<void> {
       size: Number(st.size) || 0
     });
   } catch {
-    invalidateAccountsCache();
+    setAccountsCache(all, { mtimeMs: sqliteCacheGen, size: all.length });
   }
 }
 
@@ -362,6 +377,9 @@ async function migrateLegacyIfNeeded(current: AccountRecord[]): Promise<AccountR
   return legacy;
 }
 
+/** SQLite 主库时的缓存世代（writeAll 递增；无 JSON mtime 时用） */
+let sqliteCacheGen = 1;
+
 async function readAll(): Promise<AccountRecord[]> {
   await ensureDir(accountsDir());
   const st = await accountsFileStat();
@@ -377,9 +395,51 @@ async function readAll(): Promise<AccountRecord[]> {
       ssoCheck: r.ssoCheck ? { ...r.ssoCheck } : r.ssoCheck
     }));
   }
+  // SQLite 主路径：JSON 可能不存在，用 gen 命中缓存
+  if (
+    accountsCache &&
+    !st &&
+    accountsCache.mtimeMs === sqliteCacheGen &&
+    accountsCache.size === accountsCache.records.length
+  ) {
+    return accountsCache.records.map((r) => ({
+      ...r,
+      ssoCheck: r.ssoCheck ? { ...r.ssoCheck } : r.ssoCheck
+    }));
+  }
+
+  // 优先 SQLite（规模化主库）
+  try {
+    const cnt = sqliteCountAccounts();
+    if (cnt != null && cnt > 0) {
+      const dumped = sqliteDumpAccounts();
+      if (dumped && dumped.length > 0) {
+        const runtime = dumped.map(decryptRecordForRuntime);
+        const stAfter = st || (await accountsFileStat());
+        if (stAfter) {
+          setAccountsCache(runtime, stAfter);
+        } else {
+          setAccountsCache(runtime, {
+            mtimeMs: sqliteCacheGen,
+            size: runtime.length
+          });
+        }
+        return runtime;
+      }
+    }
+  } catch (e) {
+    console.warn('[accountStore] SQLite read failed, fallback JSON', e);
+  }
 
   let all = await readJsonAccounts(accountsPath());
   all = await migrateLegacyIfNeeded(all);
+
+  // JSON → SQLite 一次性迁移（SQLite 空时）
+  try {
+    migrateJsonToSqliteIfNeeded(all.map(encryptRecordForDisk));
+  } catch {
+    /* optional */
+  }
 
   // 若库空或明显少于历史 sso 文件可恢复项，尝试从 /data/sso 导入
   const merged = importFromSsoFiles(all);
@@ -852,12 +912,47 @@ export async function getAccountById(id: string): Promise<AccountRecord | null> 
   const key = String(id || '').trim();
   if (!key) return null;
   return withAccountsLock(async () => {
+    // 优先 SQLite 单行（避免全量 dump）
+    try {
+      const row = sqliteGetAccount(key);
+      if (row) {
+        const runtime = decryptRecordForRuntime(row);
+        const [withTags] = await attachTagsToRecords([runtime]);
+        return withTags || runtime;
+      }
+    } catch {
+      /* fall through */
+    }
     const all = await loadAccountsBase();
     const hit = all.find((a) => a.id === key);
     if (!hit) return null;
     const [withTags] = await attachTagsToRecords([hit]);
     return withTags || hit;
   });
+}
+
+/** 运维：号池存储状态（JSON / SQLite） */
+export async function getAccountsStorageInfo(): Promise<{
+  jsonPath: string;
+  jsonCount: number;
+  sqliteCount: number | null;
+  sqlitePreferred: boolean;
+}> {
+  const jsonPath = accountsPath();
+  let jsonCount = 0;
+  try {
+    const all = await readJsonAccounts(jsonPath);
+    jsonCount = all.length;
+  } catch {
+    jsonCount = 0;
+  }
+  const sqliteCount = sqliteCountAccounts();
+  return {
+    jsonPath,
+    jsonCount,
+    sqliteCount,
+    sqlitePreferred: sqliteCount != null && sqliteCount > 0
+  };
 }
 
 function matchAccountQuery(
