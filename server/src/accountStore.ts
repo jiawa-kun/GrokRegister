@@ -672,23 +672,32 @@ async function scanAuthIndexLight(dir: string): Promise<AuthIndex> {
         const ch = resolveMintChannelFromNameData(name, data);
         if (emailKey) addAuthChannel(index.emailChannels, emailKey, ch);
 
-        let sso = '';
-        if (typeof data.sso === 'string') sso = data.sso;
-        else if (data.extra && typeof data.extra === 'object') {
-          const s = (data.extra as Record<string, unknown>).sso;
-          if (typeof s === 'string') sso = s;
-        }
-        sso = String(sso || '')
+        // 优先预计算 sso_hash，避免对长 JWT 再 sha256
+        let hash = String(data.sso_hash || data.ssoHash || '')
           .trim()
-          .replace(/^sso=/i, '')
-          .trim();
-        let hash = '';
-        if (sso.length >= 8) {
-          hash = createHash('sha256').update(sso, 'utf8').digest('hex');
+          .toLowerCase();
+        if (!/^[a-f0-9]{64}$/.test(hash)) {
+          let sso = '';
+          if (typeof data.sso === 'string') sso = data.sso;
+          else if (data.extra && typeof data.extra === 'object') {
+            const s = (data.extra as Record<string, unknown>).sso;
+            if (typeof s === 'string') sso = s;
+          }
+          sso = String(sso || '')
+            .trim()
+            .replace(/^sso=/i, '')
+            .trim();
+          hash = '';
+          if (sso.length >= 8) {
+            hash = createHash('sha256').update(sso, 'utf8').digest('hex');
+          }
+        }
+        if (hash) {
           index.ssoHashes.add(hash);
           addAuthChannel(index.hashChannels, hash, ch);
         }
-        const bot = readBotFlagFromAuthRecord(data);
+        // 徽章冷扫：侧车优先，无侧车不 decode JWT（默认 None）
+        const bot = readBotFlagFromAuthRecord(data, { jwt: false });
         preferAuthBotFlag(index.emailBotFlags, emailKey, bot);
         preferAuthBotFlag(index.hashBotFlags, hash, bot);
       } catch {
@@ -851,9 +860,17 @@ function matchAccountQuery(
   const q = String(opts.q || '').trim().toLowerCase();
   if (q) {
     const email = String(a.email || '').toLowerCase();
-    const sso = String(a.sso || '').toLowerCase();
     const id = String(a.id || '').toLowerCase();
-    if (!email.includes(q) && !sso.includes(q) && !id.includes(q)) return false;
+    if (email.includes(q) || id.includes(q)) return true;
+    // 长查询才扫 SSO（避免每条对完整 JWT 做 includes）
+    if (q.length >= 12) {
+      const sso = String(a.sso || '')
+        .replace(/^sso=/i, '')
+        .trim()
+        .toLowerCase();
+      if (sso && sso.includes(q)) return true;
+    }
+    return false;
   }
   return true;
 }

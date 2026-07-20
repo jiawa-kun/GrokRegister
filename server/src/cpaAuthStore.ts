@@ -460,13 +460,16 @@ export async function listCpaAuth(opts?: {
   const poolPw = await buildPoolPasswordMap();
   const accountTags = loadAccountTags();
   const names = await fsp.readdir(dir);
+  const jsonNames = names.filter((n) => n.endsWith('.json'));
   const items: CpaAuthItem[] = [];
-  for (const name of names) {
-    if (!name.endsWith('.json')) continue;
+  // 并发读目录，冷扫延迟对齐 badge-index
+  const concurrency = 24;
+  let cursor = 0;
+  async function scanOne(name: string): Promise<CpaAuthItem | null> {
     const full = join(dir, name);
     try {
       const st = await fsp.stat(full);
-      if (!st.isFile()) continue;
+      if (!st.isFile() || st.size > 2_000_000) return null;
       let data: Record<string, unknown> = {};
       try {
         data = JSON.parse(await fsp.readFile(full, 'utf-8')) as Record<string, unknown>;
@@ -474,10 +477,20 @@ export async function listCpaAuth(opts?: {
         data = {};
       }
       const flags = xaiFlags(name, data);
-      const bot = readBotFlagFromAuthRecord(data);
+      // 列表冷扫：侧车优先，无侧车不 decode JWT
+      const bot = readBotFlagFromAuthRecord(data, { jwt: false });
       const rawSso = extractSsoFromAuthData(data);
-      const ssoHash = hashSsoToken(rawSso);
-      const hasSso = Boolean(rawSso && rawSso.trim());
+      // 优先预计算 sso_hash 字段，避免对长 JWT 再 sha256
+      let ssoHash: string | null = null;
+      const preHash = String(data.sso_hash || data.ssoHash || '')
+        .trim()
+        .toLowerCase();
+      if (/^[a-f0-9]{64}$/.test(preHash)) {
+        ssoHash = preHash;
+      } else {
+        ssoHash = hashSsoToken(rawSso);
+      }
+      const hasSso = Boolean((rawSso && rawSso.trim()) || ssoHash);
       // 0 是合法 None：禁止用 !bot.botFlagSource / || null 吞掉
       let botFlagSource: number | string | null =
         bot.botFlagSource !== undefined && bot.botFlagSource !== null && bot.botFlagSource !== ''
@@ -592,7 +605,7 @@ export async function listCpaAuth(opts?: {
       };
       const mergedPushTag: AccountTagEntry = { ...fileTag, ...(sideTag || {}) };
       const pushSt = allPushStatusesFromTag(mergedPushTag);
-      items.push({
+      return {
         filename: name,
         path: full,
         email: emailStr,
@@ -630,11 +643,22 @@ export async function listCpaAuth(opts?: {
         authCpaError: pushSt.authCpaError || null,
         authSub2apiError: pushSt.authSub2apiError || null,
         ...flags
-      });
+      };
     } catch {
-      /* skip unreadable */
+      return null;
     }
   }
+  async function worker() {
+    while (cursor < jsonNames.length) {
+      const i = cursor++;
+      const name = jsonNames[i]!;
+      const item = await scanOne(name);
+      if (item) items.push(item);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, jsonNames.length || 1) }, () => worker())
+  );
   items.sort((a, b) => b.mtime - a.mtime);
 
   // 无 sso 时无法做号池 SSO 哈希匹配（仅靠 email）

@@ -85,7 +85,7 @@ export function readBotFlagFromToken(token: string): BotFlagInfo {
 }
 
 /** 优先读 auth JSON 侧车字段 bot_flag_source / botFlagSource（mint 时写入） */
-function readBotFlagSidecar(data: Record<string, unknown>): BotFlagInfo | null {
+export function readBotFlagSidecar(data: Record<string, unknown>): BotFlagInfo | null {
   const keys = ['bot_flag_source', 'botFlagSource', 'bot_flag', 'botFlag'] as const;
   for (const k of keys) {
     if (!(k in data)) continue;
@@ -114,8 +114,12 @@ function readBotFlagSidecar(data: Record<string, unknown>): BotFlagInfo | null {
  * 优先侧车字段，其次 access_token / sso / id_token JWT。
  * 注意：access 无 bot_flag_source claim 时必须继续读 sso。
  * 有 sso 但 claim 全缺时默认 0（None）——与号池 SSO 绿 None 一致，避免列表永远 —。
+ * opts.jwt=false：仅侧车；有 token 无侧车时默认 0（列表/徽章冷扫加速）。
  */
-export function readBotFlagFromAuthRecord(data: Record<string, unknown>): BotFlagInfo {
+export function readBotFlagFromAuthRecord(
+  data: Record<string, unknown>,
+  opts?: { jwt?: boolean }
+): BotFlagInfo {
   const fromFile = readBotFlagSidecar(data);
   if (fromFile) return fromFile;
 
@@ -128,6 +132,12 @@ export function readBotFlagFromAuthRecord(data: Record<string, unknown>): BotFla
     }
   }
   const idToken = String(data.id_token || '').trim();
+  const hasToken = Boolean(sso || access || idToken);
+
+  if (opts?.jwt === false) {
+    if (hasToken) return { botFlagSource: 0, isBotFlag1: false };
+    return { botFlagSource: null, isBotFlag1: false, error: 'no token' };
+  }
 
   const tryToken = (tok: string): BotFlagInfo | null => {
     if (!tok) return null;
@@ -146,7 +156,7 @@ export function readBotFlagFromAuthRecord(data: Record<string, unknown>): BotFla
   if (fromId) return fromId;
 
   // 有 sso（或 access）但 JWT 无 claim：展示 None(0)，与「正常号」一致
-  if (sso || access || idToken) {
+  if (hasToken) {
     return { botFlagSource: 0, isBotFlag1: false };
   }
   return { botFlagSource: null, isBotFlag1: false, error: 'no token' };
