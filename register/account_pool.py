@@ -212,3 +212,238 @@ def find_id_by_sso(sso: str) -> Optional[str]:
             "SELECT id FROM accounts WHERE sso_hash = ? LIMIT 1", (h,)
         ).fetchone()
     return str(row["id"]) if row else None
+
+
+def _chunked(seq: list[str], size: int = 400) -> list[list[str]]:
+    return [seq[i : i + size] for i in range(0, len(seq), size)] or [[]]
+
+
+def _build_where(
+    *,
+    q: str = "",
+    sso: str = "all",
+    alive: str = "all",
+    auth: str = "all",
+    require_sso: bool = False,
+    auth_emails: Optional[list[str]] = None,
+    auth_hashes: Optional[list[str]] = None,
+) -> tuple[str, list[Any]]:
+    """构造 WHERE；auth 筛选用 email_lc / sso_hash IN 列表。"""
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    sso_mode = str(sso or "all").strip().lower()
+    if sso_mode == "has_sso" or require_sso:
+        clauses.append("has_sso = 1")
+    elif sso_mode == "no_sso":
+        clauses.append("has_sso = 0")
+
+    alive_mode = str(alive or "all").strip().lower()
+    if alive_mode == "unchecked":
+        clauses.append("alive IS NULL")
+    elif alive_mode == "alive":
+        clauses.append("alive = 1")
+    elif alive_mode == "dead":
+        clauses.append("alive = 0")
+
+    auth_mode = str(auth or "all").strip().lower()
+    emails = [str(e).strip().lower() for e in (auth_emails or []) if str(e).strip()]
+    hashes = [str(h).strip().lower() for h in (auth_hashes or []) if str(h).strip()]
+    if auth_mode in ("converted", "unconverted") and (emails or hashes):
+        # (email_lc IN (...) OR sso_hash IN (...))
+        parts: list[str] = []
+        for chunk in _chunked(emails, 400):
+            if not chunk:
+                continue
+            ph = ",".join("?" * len(chunk))
+            parts.append(f"email_lc IN ({ph})")
+            params.extend(chunk)
+        for chunk in _chunked(hashes, 400):
+            if not chunk:
+                continue
+            ph = ",".join("?" * len(chunk))
+            parts.append(f"sso_hash IN ({ph})")
+            params.extend(chunk)
+        if parts:
+            expr = "(" + " OR ".join(parts) + ")"
+            if auth_mode == "converted":
+                clauses.append(expr)
+            else:
+                clauses.append(f"NOT {expr}")
+        elif auth_mode == "converted":
+            # 无 Auth 索引时视为无人已转
+            clauses.append("0 = 1")
+        # unconverted + 空索引：全部未转，不加条件
+
+    qq = str(q or "").strip().lower()
+    if qq:
+        # email / id；长查询再扫 sso 列（加密后可能匹配不到明文 JWT，与 Node 行为一致）
+        if len(qq) >= 12:
+            clauses.append("(email_lc LIKE ? OR id LIKE ? OR lower(sso) LIKE ?)")
+            like = f"%{qq}%"
+            params.extend([like, f"%{qq}%", like])
+        else:
+            clauses.append("(email_lc LIKE ? OR id LIKE ?)")
+            like = f"%{qq}%"
+            params.extend([like, f"%{qq}%"])
+
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+def query_page(
+    *,
+    page: int = 1,
+    page_size: int = 20,
+    q: str = "",
+    sso: str = "all",
+    alive: str = "all",
+    auth: str = "all",
+    auth_emails: Optional[list[str]] = None,
+    auth_hashes: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """SQL 筛选 + 分页 + 全局 facets（含 auth 交叉）。"""
+    page_size = max(1, min(2000, int(page_size or 20)))
+    page = max(1, int(page or 1))
+    where, params = _build_where(
+        q=q,
+        sso=sso,
+        alive=alive,
+        auth=auth,
+        auth_emails=auth_emails,
+        auth_hashes=auth_hashes,
+    )
+
+    with transaction(immediate=False) as conn:
+        # facets：全库（不受 q/sso/alive/auth 筛选）
+        fac = conn.execute(
+            """
+            SELECT
+              COUNT(*) AS all_n,
+              COALESCE(SUM(has_sso), 0) AS has_sso,
+              COALESCE(SUM(CASE WHEN alive IS NULL THEN 1 ELSE 0 END), 0) AS unchecked,
+              COALESCE(SUM(CASE WHEN alive = 1 THEN 1 ELSE 0 END), 0) AS alive_n,
+              COALESCE(SUM(CASE WHEN alive = 0 THEN 1 ELSE 0 END), 0) AS dead_n
+            FROM accounts
+            """
+        ).fetchone()
+        all_n = int(fac["all_n"] or 0)
+        has_sso_n = int(fac["has_sso"] or 0)
+        unchecked = int(fac["unchecked"] or 0)
+        alive_n = int(fac["alive_n"] or 0)
+        dead_n = int(fac["dead_n"] or 0)
+
+        emails = [str(e).strip().lower() for e in (auth_emails or []) if str(e).strip()]
+        hashes = [str(h).strip().lower() for h in (auth_hashes or []) if str(h).strip()]
+        auth_converted = 0
+        if emails or hashes:
+            # 已转 = email 或 sso_hash 命中
+            parts: list[str] = []
+            ap: list[Any] = []
+            for chunk in _chunked(emails, 400):
+                if not chunk:
+                    continue
+                ph = ",".join("?" * len(chunk))
+                parts.append(f"email_lc IN ({ph})")
+                ap.extend(chunk)
+            for chunk in _chunked(hashes, 400):
+                if not chunk:
+                    continue
+                ph = ",".join("?" * len(chunk))
+                parts.append(f"sso_hash IN ({ph})")
+                ap.extend(chunk)
+            if parts:
+                sql = f"SELECT COUNT(*) AS n FROM accounts WHERE ({' OR '.join(parts)})"
+                row = conn.execute(sql, ap).fetchone()
+                auth_converted = int(row["n"] or 0)
+
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM accounts{where}", params
+        ).fetchone()
+        total = int(total_row["n"] or 0)
+        total_pages = max(1, (total + page_size - 1) // page_size if page_size else 1)
+        page = min(page, total_pages)
+        offset = (page - 1) * page_size
+        rows = conn.execute(
+            f"""
+            SELECT * FROM accounts
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, page_size, offset],
+        ).fetchall()
+
+    items = [_row_to_record(r) for r in rows]
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+        "totalPages": total_pages,
+        "facets": {
+            "all": all_n,
+            "hasSso": has_sso_n,
+            "noSso": max(0, all_n - has_sso_n),
+            "unchecked": unchecked,
+            "alive": alive_n,
+            "dead": dead_n,
+            "authConverted": auth_converted,
+            "authUnconverted": max(0, all_n - auth_converted),
+        },
+    }
+
+
+def query_match(
+    *,
+    q: str = "",
+    sso: str = "all",
+    alive: str = "all",
+    auth: str = "all",
+    limit: int = 500,
+    require_sso: bool = False,
+    auth_emails: Optional[list[str]] = None,
+    auth_hashes: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """SQL 筛选后截断返回（批量验活/导出）。"""
+    limit = max(1, min(2000, int(limit or 500)))
+    where, params = _build_where(
+        q=q,
+        sso=sso,
+        alive=alive,
+        auth=auth,
+        require_sso=require_sso,
+        auth_emails=auth_emails,
+        auth_hashes=auth_hashes,
+    )
+    with transaction(immediate=False) as conn:
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM accounts{where}", params
+        ).fetchone()
+        total = int(total_row["n"] or 0)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM accounts
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+    items = [
+        {
+            "id": rec["id"],
+            "email": rec["email"],
+            "password": rec["password"],
+            "sso": rec["sso"],
+            "createdAt": rec["createdAt"],
+        }
+        for rec in (_row_to_record(r) for r in rows)
+    ]
+    return {
+        "items": items,
+        "total": total,
+        "returned": len(items),
+        "truncated": total > len(items),
+        "limit": limit,
+    }

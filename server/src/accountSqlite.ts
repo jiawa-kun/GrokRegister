@@ -116,3 +116,127 @@ export function migrateJsonToSqliteIfNeeded(
   console.log(`[accountSqlite] migrated ${jsonAccounts.length} accounts from accounts.json → SQLite`);
   return { migrated: true, count: jsonAccounts.length };
 }
+
+export type SqliteQueryPage = {
+  items: AccountRecord[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  facets: {
+    all: number;
+    hasSso: number;
+    noSso: number;
+    unchecked: number;
+    alive: number;
+    dead: number;
+    authConverted: number;
+    authUnconverted: number;
+  };
+};
+
+export type SqliteMatchResult = {
+  items: {
+    id: string;
+    email: string;
+    password: string;
+    sso: string;
+    createdAt: string;
+  }[];
+  total: number;
+  returned: number;
+  truncated: boolean;
+  limit: number;
+};
+
+/** SQL 分页筛选（auth 交叉由 Node 传入 emails/hashes） */
+export function sqliteQueryAccounts(opts: {
+  page?: number;
+  pageSize?: number;
+  q?: string;
+  sso?: string;
+  alive?: string;
+  auth?: string;
+  authEmails?: string[];
+  authHashes?: string[];
+}): SqliteQueryPage | null {
+  const r = runCli('query_accounts', {
+    page: opts.page ?? 1,
+    pageSize: opts.pageSize ?? 20,
+    q: opts.q || '',
+    sso: opts.sso || 'all',
+    alive: opts.alive || 'all',
+    auth: opts.auth || 'all',
+    authEmails: opts.authEmails || [],
+    authHashes: opts.authHashes || []
+  });
+  if (!r?.ok || !r.data || typeof r.data !== 'object') return null;
+  const d = r.data as Record<string, unknown>;
+  const items = Array.isArray(d.items) ? (d.items as unknown[]).filter(isRecord) : [];
+  const facetsRaw = (d.facets && typeof d.facets === 'object' ? d.facets : {}) as Record<
+    string,
+    number
+  >;
+  return {
+    items,
+    total: Number(d.total) || 0,
+    page: Number(d.page) || 1,
+    pageSize: Number(d.pageSize) || 20,
+    totalPages: Number(d.totalPages) || 1,
+    facets: {
+      all: Number(facetsRaw.all) || 0,
+      hasSso: Number(facetsRaw.hasSso) || 0,
+      noSso: Number(facetsRaw.noSso) || 0,
+      unchecked: Number(facetsRaw.unchecked) || 0,
+      alive: Number(facetsRaw.alive) || 0,
+      dead: Number(facetsRaw.dead) || 0,
+      authConverted: Number(facetsRaw.authConverted) || 0,
+      authUnconverted: Number(facetsRaw.authUnconverted) || 0
+    }
+  };
+}
+
+export function sqliteMatchAccounts(opts: {
+  q?: string;
+  sso?: string;
+  alive?: string;
+  auth?: string;
+  limit?: number;
+  requireSso?: boolean;
+  authEmails?: string[];
+  authHashes?: string[];
+}): SqliteMatchResult | null {
+  const r = runCli('match_accounts', {
+    q: opts.q || '',
+    sso: opts.sso || 'all',
+    alive: opts.alive || 'all',
+    auth: opts.auth || 'all',
+    limit: opts.limit ?? 500,
+    requireSso: Boolean(opts.requireSso),
+    authEmails: opts.authEmails || [],
+    authHashes: opts.authHashes || []
+  });
+  if (!r?.ok || !r.data || typeof r.data !== 'object') return null;
+  const d = r.data as Record<string, unknown>;
+  const rawItems = Array.isArray(d.items) ? d.items : [];
+  const items: SqliteMatchResult['items'] = [];
+  for (const it of rawItems) {
+    if (!it || typeof it !== 'object') continue;
+    const o = it as Record<string, unknown>;
+    if (typeof o.id !== 'string') continue;
+    items.push({
+      id: o.id,
+      email: String(o.email || ''),
+      password: String(o.password || ''),
+      sso: String(o.sso || ''),
+      createdAt: String(o.createdAt || '')
+    });
+  }
+  return {
+    items,
+    total: Number(d.total) || 0,
+    returned: Number(d.returned) || items.length,
+    truncated: Boolean(d.truncated),
+    limit: Number(d.limit) || opts.limit || 500
+  };
+}

@@ -98,6 +98,36 @@ def main() -> int:
             aid = find_id_by_sso(str(body.get("sso") or ""))
             _out({"ok": True, "data": {"id": aid}})
             return 0
+        if cmd == "query_accounts":
+            from account_pool import query_page
+
+            data = query_page(
+                page=int(body.get("page") or 1),
+                page_size=int(body.get("pageSize") or body.get("page_size") or 20),
+                q=str(body.get("q") or ""),
+                sso=str(body.get("sso") or "all"),
+                alive=str(body.get("alive") or "all"),
+                auth=str(body.get("auth") or "all"),
+                auth_emails=body.get("authEmails") or body.get("auth_emails") or [],
+                auth_hashes=body.get("authHashes") or body.get("auth_hashes") or [],
+            )
+            _out({"ok": True, "data": data})
+            return 0
+        if cmd == "match_accounts":
+            from account_pool import query_match
+
+            data = query_match(
+                q=str(body.get("q") or ""),
+                sso=str(body.get("sso") or "all"),
+                alive=str(body.get("alive") or "all"),
+                auth=str(body.get("auth") or "all"),
+                limit=int(body.get("limit") or 500),
+                require_sso=bool(body.get("requireSso") or body.get("require_sso")),
+                auth_emails=body.get("authEmails") or body.get("auth_emails") or [],
+                auth_hashes=body.get("authHashes") or body.get("auth_hashes") or [],
+            )
+            _out({"ok": True, "data": data})
+            return 0
         _out({"ok": False, "error": f"unknown cmd: {cmd}"})
         return 2
     except Exception as e:

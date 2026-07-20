@@ -23,6 +23,8 @@ import {
   sqliteCountAccounts,
   sqliteDumpAccounts,
   sqliteGetAccount,
+  sqliteMatchAccounts,
+  sqliteQueryAccounts,
   sqliteReplaceAccounts
 } from './accountSqlite.js';
 
@@ -1038,12 +1040,45 @@ function buildFacets(
   };
 }
 
-/** 服务端筛选 + 分页（主库仍为 accounts.json；为规模化铺路） */
+/** 服务端筛选 + 分页：优先 SQLite SQL；失败回退内存 filter */
 export async function queryAccounts(opts: AccountListQuery = {}): Promise<AccountListPage> {
   return withAccountsLock(async () => {
-    // 筛选/facets 不需要 tags；仅当前页挂 NSFW/ZDR
-    const all = await loadAccountsBase();
+    const pageSize = Math.min(2000, Math.max(1, Math.floor(Number(opts.pageSize) || 20)));
+    const pageReq = Math.max(1, Math.floor(Number(opts.page) || 1));
     const authIndex = await loadAuthIndex();
+    const authEmails = Array.from(authIndex.emails);
+    const authHashes = Array.from(authIndex.ssoHashes);
+
+    // SQL 真分页（万级号池不全量进 Node）
+    try {
+      const sqlPage = sqliteQueryAccounts({
+        page: pageReq,
+        pageSize,
+        q: opts.q,
+        sso: opts.sso,
+        alive: opts.alive,
+        auth: opts.auth,
+        authEmails,
+        authHashes
+      });
+      if (sqlPage) {
+        const runtime = sqlPage.items.map(decryptRecordForRuntime);
+        const tagged = await attachTagsToRecords(runtime);
+        return {
+          items: tagged.map(toAccountListItem),
+          total: sqlPage.total,
+          page: sqlPage.page,
+          pageSize: sqlPage.pageSize,
+          totalPages: sqlPage.totalPages,
+          facets: sqlPage.facets
+        };
+      }
+    } catch (e) {
+      console.warn('[accountStore] SQL query failed, fallback memory', e);
+    }
+
+    // 回退：内存 filter（JSON / 缓存）
+    const all = await loadAccountsBase();
     let ssoHashOf = (sso: string) =>
       createHash('sha256').update(String(sso || '').trim(), 'utf8').digest('hex');
     try {
@@ -1077,11 +1112,9 @@ export async function queryAccounts(opts: AccountListQuery = {}): Promise<Accoun
     const filtered = all.filter((a) =>
       matchAccountQuery(a, opts, { authIndex, ssoHashOf })
     );
-    // 单页上限与前端 PaginationBar 对齐（最大 2000）；默认 20
-    const pageSize = Math.min(2000, Math.max(1, Math.floor(Number(opts.pageSize) || 20)));
     const total = filtered.length;
     const totalPages = Math.max(1, Math.ceil(total / pageSize) || 1);
-    const page = Math.min(totalPages, Math.max(1, Math.floor(Number(opts.page) || 1)));
+    const page = Math.min(totalPages, pageReq);
     const start = (page - 1) * pageSize;
     const pageItems = filtered.slice(start, start + pageSize);
     const tagged = await attachTagsToRecords(pageItems);
@@ -1121,12 +1154,56 @@ export type AccountMatchResult = {
 
 /**
  * 按筛选返回匹配账号（用于「筛后全部」验活/导出/补签）。
- * 返回精简字段，不挂 tags。
+ * 返回精简字段，不挂 tags。优先 SQL match。
  */
 export async function matchAccounts(opts: AccountMatchQuery = {}): Promise<AccountMatchResult> {
   return withAccountsLock(async () => {
-    const all = await loadAccountsBase();
     const authIndex = await loadAuthIndex();
+    const authEmails = Array.from(authIndex.emails);
+    const authHashes = Array.from(authIndex.ssoHashes);
+    const limit = Math.min(2000, Math.max(1, Math.floor(Number(opts.limit) || 500)));
+
+    try {
+      const sqlMatch = sqliteMatchAccounts({
+        q: opts.q,
+        sso: opts.sso,
+        alive: opts.alive,
+        auth: opts.auth,
+        limit,
+        requireSso: opts.requireSso,
+        authEmails,
+        authHashes
+      });
+      if (sqlMatch) {
+        return {
+          items: sqlMatch.items.map((a) => {
+            const runtime = decryptRecordForRuntime({
+              id: a.id,
+              runId: '',
+              email: a.email,
+              password: a.password,
+              sso: a.sso,
+              createdAt: a.createdAt
+            });
+            return {
+              id: runtime.id,
+              email: runtime.email,
+              password: runtime.password,
+              sso: runtime.sso,
+              createdAt: runtime.createdAt
+            };
+          }),
+          total: sqlMatch.total,
+          returned: sqlMatch.returned,
+          truncated: sqlMatch.truncated,
+          limit: sqlMatch.limit
+        };
+      }
+    } catch (e) {
+      console.warn('[accountStore] SQL match failed, fallback memory', e);
+    }
+
+    const all = await loadAccountsBase();
     let ssoHashOf = (sso: string) =>
       createHash('sha256').update(String(sso || '').trim(), 'utf8').digest('hex');
     try {
@@ -1141,7 +1218,6 @@ export async function matchAccounts(opts: AccountMatchQuery = {}): Promise<Accou
     if (opts.requireSso) {
       filtered = filtered.filter((a) => Boolean(String(a.sso || '').trim()));
     }
-    const limit = Math.min(2000, Math.max(1, Math.floor(Number(opts.limit) || 500)));
     const total = filtered.length;
     const slice = filtered.slice(0, limit);
     return {
