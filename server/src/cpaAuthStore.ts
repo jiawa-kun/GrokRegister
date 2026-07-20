@@ -14,7 +14,7 @@ import { proxiedRequest, requestWithProxyFallback, errorMessage } from './httpCl
 import { broadcastAppEvent } from './appEvents.js';
 import type { ReloginStage } from '@shared/runEvents.js';
 import {
-  loadAccountTags,
+  loadAccountTagsAsync,
   lookupNsfwTag,
   zdrStatusFromTag,
   nsfwStatusFromTag,
@@ -458,7 +458,8 @@ export async function listCpaAuth(opts?: {
   }
 
   const poolPw = await buildPoolPasswordMap();
-  const accountTags = loadAccountTags();
+  const { loadAccountTagsAsync } = await import('./accountTags.js');
+  const accountTags = await loadAccountTagsAsync();
   const names = await fsp.readdir(dir);
   const jsonNames = names.filter((n) => n.endsWith('.json'));
   const items: CpaAuthItem[] = [];
@@ -977,7 +978,8 @@ export async function backfillCpaAuthSsoFromPool(input?: {
       .filter((f) => f.endsWith('.json'))
   );
 
-  const accounts = await listAccounts();
+  const { listAccountsLite } = await import('./accountStore.js');
+  const accounts = await listAccountsLite();
   // email(lower) → 最佳 sso（有 sso 的优先，createdAt 新的优先）
   const emailToSso = new Map<string, { sso: string; createdAt: string }>();
   for (const a of accounts) {
@@ -1402,7 +1404,7 @@ export async function pushCpaAuthRemoteBatch(input: {
   const results: CpaAuthBatchResultItem[] = [];
   let idx = 0;
   // 批次开始时快照侧车标签，用于 already_pushed 跳过（force 时忽略）
-  const pushTagsSnapshot = loadAccountTags();
+  const pushTagsSnapshot = await loadAccountTagsAsync();
 
   async function worker() {
     while (idx < unique.length) {
@@ -1618,7 +1620,7 @@ export async function pushSub2apiAuthRemoteBatch(input: {
   const force = Boolean(input.force);
   const results: CpaAuthBatchResultItem[] = [];
   let idx = 0;
-  const pushTagsSnapshot = loadAccountTags();
+  const pushTagsSnapshot = await loadAccountTagsAsync();
 
   function normalizeExpiresAt(raw: unknown): string {
     if (raw == null || raw === '') return '';
@@ -2410,8 +2412,8 @@ export async function reloginCpaAuth(input: {
 
   let password = '';
   try {
-    const { listAccounts } = await import('./accountStore.js');
-    const accounts = await listAccounts();
+    const { listAccountsLite } = await import('./accountStore.js');
+    const accounts = await listAccountsLite();
     const em = emailHint.toLowerCase();
     for (const a of accounts) {
       if (String(a.email || '').trim().toLowerCase() === em) {
@@ -2576,8 +2578,8 @@ export async function probeCpaAuthBatch(input: {
   // 预载号池 email→password，403 时密码重登二次测活
   let passwordByEmail = new Map<string, string>();
   try {
-    const { listAccounts } = await import('./accountStore.js');
-    const accounts = await listAccounts();
+    const { listAccountsLite } = await import('./accountStore.js');
+    const accounts = await listAccountsLite();
     for (const a of accounts) {
       const em = String(a.email || '')
         .trim()
@@ -2708,8 +2710,8 @@ print(json.dumps(r, ensure_ascii=False))
     ];
     if (emails.length > 0) {
       try {
-        const { listAccounts, deleteAccounts } = await import('./accountStore.js');
-        const accounts = await listAccounts();
+        const { listAccountsLite, deleteAccounts } = await import('./accountStore.js');
+        const accounts = await listAccountsLite();
         const ids = accounts
           .filter((a) => emails.includes(String(a.email || '').trim().toLowerCase()))
           .map((a) => a.id);

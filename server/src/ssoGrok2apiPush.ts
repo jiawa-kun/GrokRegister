@@ -143,7 +143,8 @@ except Exception as e:
   let ok = 0;
   let failed = 0;
   let skipped = 0;
-  const pushTagsSnapshot = loadAccountTags();
+  const { loadAccountTagsAsync } = await import('./accountTags.js');
+  const pushTagsSnapshot = await loadAccountTagsAsync();
 
   let idx = 0;
   async function worker() {

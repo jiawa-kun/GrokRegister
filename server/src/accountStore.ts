@@ -575,21 +575,24 @@ export async function appendAccount(
 /** 读号池 + 修复脏行 + 排序；不挂 NSFW/ZDR tags（筛选/match 用） */
 async function loadAccountsBase(): Promise<AccountRecord[]> {
   const raw = await readAll();
-  let dirty = false;
+  const dirtyRows: AccountRecord[] = [];
   const all = raw.map((a) => {
     const fixed = repairAccountFields(a);
     if (
       fixed !== a &&
       (fixed.email !== a.email || fixed.password !== a.password || fixed.sso !== a.sso)
     ) {
-      dirty = true;
+      dirtyRows.push(fixed);
     }
     return fixed;
   });
-  if (dirty) {
+  if (dirtyRows.length) {
     try {
-      await writeAll(all);
-      console.log('[accountStore] repaired hybrid email|password|sso rows in accounts.json');
+      // 仅 upsert 脏行，禁止整表 replace
+      await commitIncremental(all, dirtyRows);
+      console.log(
+        `[accountStore] repaired ${dirtyRows.length} hybrid email|password|sso rows (incremental)`
+      );
     } catch {
       /* ignore */
     }
@@ -602,13 +605,13 @@ async function attachTagsToRecords(records: AccountRecord[]): Promise<AccountRec
   if (!records.length) return records;
   try {
     const {
-      loadAccountTags,
+      loadAccountTagsAsync,
       lookupNsfwTag,
       nsfwStatusFromTag,
       zdrStatusFromTag,
       ssoHashHex
     } = await import('./accountTags.js');
-    const tags = loadAccountTags();
+    const tags = await loadAccountTagsAsync();
     return records.map((a) => {
       const side = nsfwStatusFromTag(
         lookupNsfwTag(tags, {

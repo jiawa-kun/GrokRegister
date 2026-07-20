@@ -125,48 +125,72 @@ export function invalidateAccountTagsCache(): void {
   tagsCache = null;
 }
 
-export function loadAccountTags(): AccountTagsFile {
-  const now = Date.now();
-  if (tagsCache && now - tagsCache.at < TAGS_CACHE_TTL_MS) {
-    return tagsCache.data;
-  }
+function parseTagsPayload(raw: Partial<AccountTagsFile> | null | undefined): AccountTagsFile {
+  return {
+    by_email: (
+      raw?.by_email && typeof raw.by_email === 'object' ? raw.by_email : {}
+    ) as Record<string, AccountTagEntry>,
+    by_sso_hash: (
+      raw?.by_sso_hash && typeof raw.by_sso_hash === 'object' ? raw.by_sso_hash : {}
+    ) as Record<string, AccountTagEntry>
+  };
+}
 
-  const viaCli = runGraStoreCli('dump_tags');
-  if (viaCli?.ok && viaCli.data && typeof viaCli.data === 'object') {
-    const raw = viaCli.data as Partial<AccountTagsFile>;
-    const data: AccountTagsFile = {
-      by_email: (
-        raw.by_email && typeof raw.by_email === 'object' ? raw.by_email : {}
-      ) as Record<string, AccountTagEntry>,
-      by_sso_hash: (
-        raw.by_sso_hash && typeof raw.by_sso_hash === 'object' ? raw.by_sso_hash : {}
-      ) as Record<string, AccountTagEntry>
-    };
-    tagsCache = { at: now, data };
-    return data;
-  }
-
-  // 回退：低优先级路径先读，高优先级后覆盖
+function loadTagsFromJsonFiles(): AccountTagsFile {
   let merged: AccountTagsFile = { by_email: {}, by_sso_hash: {} };
   const paths = tagsPathCandidates().slice().reverse();
   for (const p of paths) {
     try {
       if (!existsSync(p)) continue;
       const raw = JSON.parse(readFileSync(p, 'utf-8')) as Partial<AccountTagsFile>;
-      const one: AccountTagsFile = {
-        by_email: (
-          raw.by_email && typeof raw.by_email === 'object' ? raw.by_email : {}
-        ) as Record<string, AccountTagEntry>,
-        by_sso_hash: (
-          raw.by_sso_hash && typeof raw.by_sso_hash === 'object' ? raw.by_sso_hash : {}
-        ) as Record<string, AccountTagEntry>
-      };
-      merged = mergeTagFiles(merged, one);
+      merged = mergeTagFiles(merged, parseTagsPayload(raw));
     } catch {
       /* try next */
     }
   }
+  return merged;
+}
+
+/**
+ * 同步读：仅 cache + JSON 回退（不 spawn，避免阻塞 event loop）。
+ * 热路径请用 loadAccountTagsAsync（worker）。
+ */
+export function loadAccountTags(): AccountTagsFile {
+  const now = Date.now();
+  if (tagsCache && now - tagsCache.at < TAGS_CACHE_TTL_MS) {
+    return tagsCache.data;
+  }
+  const merged = loadTagsFromJsonFiles();
   tagsCache = { at: now, data: merged };
+  return merged;
+}
+
+/** 异步读：优先 gra_store worker，失败再 CLI/JSON */
+export async function loadAccountTagsAsync(): Promise<AccountTagsFile> {
+  const now = Date.now();
+  if (tagsCache && now - tagsCache.at < TAGS_CACHE_TTL_MS) {
+    return tagsCache.data;
+  }
+  try {
+    const { runCliAsync } = await import('./accountSqlite.js');
+    const via = await runCliAsync('dump_tags');
+    if (via?.ok && via.data && typeof via.data === 'object') {
+      const data = parseTagsPayload(via.data as Partial<AccountTagsFile>);
+      tagsCache = { at: Date.now(), data };
+      return data;
+    }
+  } catch {
+    /* fallthrough */
+  }
+  // 兼容：spawnSync CLI（worker 不可用时）
+  const viaCli = runGraStoreCli('dump_tags');
+  if (viaCli?.ok && viaCli.data && typeof viaCli.data === 'object') {
+    const data = parseTagsPayload(viaCli.data as Partial<AccountTagsFile>);
+    tagsCache = { at: Date.now(), data };
+    return data;
+  }
+  const merged = loadTagsFromJsonFiles();
+  tagsCache = { at: Date.now(), data: merged };
   return merged;
 }
 
