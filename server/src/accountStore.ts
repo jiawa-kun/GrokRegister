@@ -19,13 +19,16 @@ import {
   warnIfSecretEncryptionUnavailable
 } from './secretCrypto.js';
 import {
+  invalidateSqliteCountCache,
   migrateJsonToSqliteIfNeeded,
   sqliteCountAccounts,
+  sqliteDeleteAccounts,
   sqliteDumpAccounts,
   sqliteGetAccount,
   sqliteMatchAccounts,
   sqliteQueryAccounts,
-  sqliteReplaceAccounts
+  sqliteReplaceAccounts,
+  sqliteUpsertAccounts
 } from './accountSqlite.js';
 
 function accountsDir(): string {
@@ -153,15 +156,31 @@ function setAccountsCache(records: AccountRecord[], st?: { mtimeMs: number; size
   };
 }
 
-async function writeAll(all: AccountRecord[]): Promise<void> {
+/** JSON 备份落盘（与 SQLite 解耦；增量写路径也调） */
+async function writeJsonBackup(all: AccountRecord[]): Promise<void> {
   const dir = accountsDir();
   await ensureDir(dir);
   const path = accountsPath();
   const tmp = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
   warnIfSecretEncryptionUnavailable('accounts store');
   const diskRows = all.map(encryptRecordForDisk);
+  await fsp.writeFile(tmp, JSON.stringify(diskRows, null, 2), 'utf-8');
+  await fsp.rename(tmp, path);
+}
+
+function bumpCache(all: AccountRecord[]): void {
   sqliteCacheGen += 1;
-  // 1) SQLite 主库（失败不阻断 JSON 备份）
+  invalidateSqliteCountCache();
+  facetsCache = null;
+  setAccountsCache(all, { mtimeMs: sqliteCacheGen, size: all.length });
+}
+
+/**
+ * 全量同步（仅 bulk：import 大包 / migrate / resync / 加密迁移）。
+ * 日常 append/delete/验活走增量 upsert/delete。
+ */
+async function writeAll(all: AccountRecord[]): Promise<void> {
+  const diskRows = all.map(encryptRecordForDisk);
   try {
     const ok = sqliteReplaceAccounts(diskRows);
     if (!ok) {
@@ -170,18 +189,41 @@ async function writeAll(all: AccountRecord[]): Promise<void> {
   } catch (e) {
     console.warn('[accountStore] SQLite write error', e);
   }
-  // 2) JSON 备份（兼容旧路径 / 灾备）
-  await fsp.writeFile(tmp, JSON.stringify(diskRows, null, 2), 'utf-8');
-  await fsp.rename(tmp, path);
-  try {
-    const st = await fsp.stat(path);
-    setAccountsCache(all, {
-      mtimeMs: Number(st.mtimeMs) || 0,
-      size: Number(st.size) || 0
-    });
-  } catch {
-    setAccountsCache(all, { mtimeMs: sqliteCacheGen, size: all.length });
+  await writeJsonBackup(all);
+  bumpCache(all);
+}
+
+/** 增量：upsert 若干行到 SQLite + 更新内存/JSON */
+async function commitIncremental(
+  all: AccountRecord[],
+  changed: AccountRecord[]
+): Promise<void> {
+  if (changed.length > 0) {
+    const disk = changed.map(encryptRecordForDisk);
+    const n = sqliteUpsertAccounts(disk);
+    if (n == null) {
+      // 增量失败：回退全量，保证一致
+      console.warn('[accountStore] upsert_accounts failed; fallback replace_all');
+      await writeAll(all);
+      return;
+    }
   }
+  await writeJsonBackup(all);
+  bumpCache(all);
+}
+
+/** 增量：按 id 删除 */
+async function commitDelete(all: AccountRecord[], ids: string[]): Promise<void> {
+  if (ids.length > 0) {
+    const n = sqliteDeleteAccounts(ids);
+    if (n == null) {
+      console.warn('[accountStore] delete_accounts failed; fallback replace_all');
+      await writeAll(all);
+      return;
+    }
+  }
+  await writeJsonBackup(all);
+  bumpCache(all);
 }
 
 async function readJsonAccounts(path: string): Promise<AccountRecord[]> {
@@ -484,13 +526,13 @@ export async function appendAccount(
         }
         if (touched) {
           const next = all.map((a) => (a.id === existing.id ? patch : a));
-          await writeAll(next);
+          await commitIncremental(next, [patch]);
         }
         return { id: existing.id, created: false };
       }
     }
     all.push(record);
-    await writeAll(all);
+    await commitIncremental(all, [record]);
     return { id: record.id, created: true };
   });
 }
@@ -1255,7 +1297,7 @@ export async function deleteAccounts(
     const next = all.filter((a) => !idSet.has(a.id));
     const deleted = all.length - next.length;
     if (deleted > 0) {
-      await writeAll(next);
+      await commitDelete(next, Array.from(idSet));
     }
     return { deleted, requested: idSet.size, remaining: next.length };
   });
@@ -1326,6 +1368,7 @@ export async function importAccountsFromText(input: {
     );
     let imported = 0;
     let skipped = 0;
+    const newOnes: AccountRecord[] = [];
     for (const rec of candidates) {
       const sso = rec.sso.trim();
       if (sso && seenSso.has(sso)) {
@@ -1338,12 +1381,14 @@ export async function importAccountsFromText(input: {
         continue;
       }
       all.push(rec);
+      newOnes.push(rec);
       if (sso) seenSso.add(sso);
       seenKey.add(key);
       imported++;
     }
     if (imported > 0) {
-      await writeAll(all);
+      // 导入：批量 upsert 一次 spawn（非整表 replace）
+      await commitIncremental(all, newOnes);
     }
     return {
       totalLines: lines.filter((l) => l.trim() && !l.trim().startsWith('#')).length,
@@ -1364,6 +1409,7 @@ export async function resyncAccountsFromDisk(): Promise<{ total: number; importe
     const beforeCount = all.length;
     all = importFromSsoFiles(all);
     if (all.length !== beforeCount) {
+      // resync 可能大量新增：全量 replace 更稳
       await writeAll(all);
     }
     return { total: all.length, imported: Math.max(0, all.length - beforeCount) };
@@ -1403,6 +1449,7 @@ export async function applyAccountSsoChecks(
     const all = await readAll();
     let updated = 0;
     let emailsFilled = 0;
+    const changed: AccountRecord[] = [];
     const next = all.map((a) => {
       const r = byId.get(a.id);
       if (!r) return a;
@@ -1432,11 +1479,13 @@ export async function applyAccountSsoChecks(
         email = fromCheck;
         emailsFilled++;
       }
-      return { ...a, email, ssoCheck };
+      const row = { ...a, email, ssoCheck };
+      changed.push(row);
+      return row;
     });
 
     if (updated > 0) {
-      await writeAll(next);
+      await commitIncremental(next, changed);
     }
     if (emailsFilled > 0) {
       console.log(

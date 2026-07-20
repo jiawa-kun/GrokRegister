@@ -160,6 +160,26 @@ def replace_all(records: list[dict[str, Any]]) -> int:
     return len(items)
 
 
+_UPSERT_SQL = """
+INSERT INTO accounts(
+  id, run_id, email, password, sso, created_at,
+  sso_check_json, email_lc, sso_hash, has_sso, alive, data_json
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(id) DO UPDATE SET
+  run_id=excluded.run_id,
+  email=excluded.email,
+  password=excluded.password,
+  sso=excluded.sso,
+  created_at=excluded.created_at,
+  sso_check_json=excluded.sso_check_json,
+  email_lc=excluded.email_lc,
+  sso_hash=excluded.sso_hash,
+  has_sso=excluded.has_sso,
+  alive=excluded.alive,
+  data_json=excluded.data_json
+"""
+
+
 def upsert_one(rec: dict[str, Any]) -> bool:
     if not isinstance(rec, dict):
         return False
@@ -167,28 +187,22 @@ def upsert_one(rec: dict[str, Any]) -> bool:
     if not params[0]:
         return False
     with transaction(immediate=True) as conn:
-        conn.execute(
-            """
-            INSERT INTO accounts(
-              id, run_id, email, password, sso, created_at,
-              sso_check_json, email_lc, sso_hash, has_sso, alive, data_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(id) DO UPDATE SET
-              run_id=excluded.run_id,
-              email=excluded.email,
-              password=excluded.password,
-              sso=excluded.sso,
-              created_at=excluded.created_at,
-              sso_check_json=excluded.sso_check_json,
-              email_lc=excluded.email_lc,
-              sso_hash=excluded.sso_hash,
-              has_sso=excluded.has_sso,
-              alive=excluded.alive,
-              data_json=excluded.data_json
-            """,
-            params,
-        )
+        conn.execute(_UPSERT_SQL, params)
     return True
+
+
+def upsert_many(records: list[dict[str, Any]]) -> int:
+    """批量 upsert（一次事务，供 Node 单次 spawn）。"""
+    items = [
+        _record_to_params(r)
+        for r in (records or [])
+        if isinstance(r, dict) and str(r.get("id") or "").strip()
+    ]
+    if not items:
+        return 0
+    with transaction(immediate=True) as conn:
+        conn.executemany(_UPSERT_SQL, items)
+    return len(items)
 
 
 def delete_ids(ids: list[str]) -> int:

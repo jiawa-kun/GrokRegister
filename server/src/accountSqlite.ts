@@ -96,11 +96,38 @@ export function sqliteUpsertAccount(account: AccountRecord): boolean {
   return Boolean(r?.ok);
 }
 
+/** 批量 upsert（一次 spawn + 一次事务） */
+export function sqliteUpsertAccounts(items: AccountRecord[]): number | null {
+  if (!items.length) return 0;
+  const r = runCli('upsert_accounts', { items });
+  if (!r?.ok || !r.data || typeof r.data !== 'object') return null;
+  const n = Number((r.data as { count?: number }).count);
+  return Number.isFinite(n) ? Math.floor(n) : null;
+}
+
 export function sqliteDeleteAccounts(ids: string[]): number | null {
   const r = runCli('delete_accounts', { ids });
   if (!r?.ok || !r.data || typeof r.data !== 'object') return null;
   const n = Number((r.data as { deleted?: number }).deleted);
   return Number.isFinite(n) ? Math.floor(n) : null;
+}
+
+/** health 用：短缓存 count，避免 30s 轮询每次 spawn */
+let countCache: { at: number; n: number | null } | null = null;
+const COUNT_CACHE_TTL_MS = 20_000;
+
+export function sqliteCountAccountsCached(): number | null {
+  const now = Date.now();
+  if (countCache && now - countCache.at < COUNT_CACHE_TTL_MS) {
+    return countCache.n;
+  }
+  const n = sqliteCountAccounts();
+  countCache = { at: now, n };
+  return n;
+}
+
+export function invalidateSqliteCountCache(): void {
+  countCache = null;
 }
 
 /** 启动时：JSON → SQLite 一次性迁移（仅当 SQLite 空且 JSON 有数据） */

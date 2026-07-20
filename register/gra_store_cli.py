@@ -83,6 +83,15 @@ def main() -> int:
             ok = upsert_one(rec if isinstance(rec, dict) else {})
             _out({"ok": bool(ok), "data": {"ok": bool(ok)}})
             return 0 if ok else 1
+        if cmd == "upsert_accounts":
+            from account_pool import upsert_many
+
+            raw_items = body.get("items") or body.get("accounts") or []
+            if not isinstance(raw_items, list):
+                raw_items = []
+            n = upsert_many([x for x in raw_items if isinstance(x, dict)])
+            _out({"ok": True, "data": {"count": n}})
+            return 0
         if cmd == "delete_accounts":
             from account_pool import delete_ids
 

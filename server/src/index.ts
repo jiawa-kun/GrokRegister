@@ -1981,6 +1981,7 @@ async function buildSystemHealth(): Promise<SystemHealth> {
   pushCheck(await checkRegisterScript(settings));
   pushCheck(await checkDataDirWritable());
   pushCheck(await checkDiskSpace());
+  pushCheck(await checkAccountsSqlite());
   pushCheck(await checkMailConfig(settings));
   pushCheck(await checkSingBoxHealth(settings));
   pushCheck(await checkChromiumBinary());
@@ -2050,6 +2051,37 @@ async function checkDataDirWritable(): Promise<SystemHealthCheck> {
   }
 }
 
+async function checkAccountsSqlite(): Promise<SystemHealthCheck> {
+  try {
+    const { sqliteCountAccountsCached } = await import('./accountSqlite.js');
+    const n = sqliteCountAccountsCached();
+    if (n == null) {
+      return {
+        id: 'accounts-sqlite',
+        label: '号池 SQLite',
+        level: 'warn',
+        message: 'CLI/SQLite 不可用，号池可能回退 JSON',
+        detail: 'gra_store.sqlite · gra_store_cli'
+      };
+    }
+    return {
+      id: 'accounts-sqlite',
+      label: '号池 SQLite',
+      level: n > 0 ? 'ok' : 'warn',
+      message: n > 0 ? `${n} 条账号` : '表为空（可从 accounts.json 迁移）',
+      detail: 'DATA_DIR/gra_store.sqlite'
+    };
+  } catch (err) {
+    return {
+      id: 'accounts-sqlite',
+      label: '号池 SQLite',
+      level: 'warn',
+      message: '检查失败',
+      detail: err instanceof Error ? err.message : String(err)
+    };
+  }
+}
+
 async function checkDiskSpace(): Promise<SystemHealthCheck> {
   const targetDir = dataDir();
   try {
@@ -2084,11 +2116,11 @@ async function checkDiskSpace(): Promise<SystemHealthCheck> {
     } catch {
       /* no /dev/shm */
     }
-    const detail = `${targetDir} · 剩余 ${freeGb.toFixed(1)}G / 共 ${totalGb.toFixed(1)}G · 已用 ${usedPct}%${shmNote}`;
+    const detail = `DATA_DIR ${targetDir} · 剩余 ${freeGb.toFixed(1)}G / 共 ${totalGb.toFixed(1)}G · 已用 ${usedPct}%${shmNote}`;
     if (freeGb < 1) {
       return {
         id: 'disk',
-        label: '磁盘空间',
+        label: 'DATA_DIR 磁盘',
         level: 'error',
         message: `剩余不足 1GB（${freeGb.toFixed(2)}G）`,
         detail
@@ -2097,7 +2129,7 @@ async function checkDiskSpace(): Promise<SystemHealthCheck> {
     if (freeGb < 3 || usedPct >= 90) {
       return {
         id: 'disk',
-        label: '磁盘空间',
+        label: 'DATA_DIR 磁盘',
         level: 'warn',
         message: `空间偏紧：剩余 ${freeGb.toFixed(1)}G`,
         detail
@@ -2105,7 +2137,7 @@ async function checkDiskSpace(): Promise<SystemHealthCheck> {
     }
     return {
       id: 'disk',
-      label: '磁盘空间',
+      label: 'DATA_DIR 磁盘',
       level: 'ok',
       message: `剩余 ${freeGb.toFixed(1)}G`,
       detail
@@ -2113,7 +2145,7 @@ async function checkDiskSpace(): Promise<SystemHealthCheck> {
   } catch (err) {
     return {
       id: 'disk',
-      label: '磁盘空间',
+      label: 'DATA_DIR 磁盘',
       level: 'warn',
       message: '无法检测磁盘空间',
       detail: err instanceof Error ? err.message : String(err)
