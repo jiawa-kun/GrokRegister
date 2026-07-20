@@ -407,6 +407,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
           'all'
         )
       );
+      setSelected(new Set());
     };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
@@ -415,6 +416,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   const [listTotalPages, setListTotalPages] = useState(1);
   const [facets, setFacets] = useState<{
     all: number;
+    xai: number;
     noSso: number;
     noEmail: number;
     needFill: number;
@@ -423,6 +425,12 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     http401: number;
     http403: number;
     otherErr: number;
+    cpaNone: number;
+    cpaOk: number;
+    cpaFail: number;
+    s2aNone: number;
+    s2aOk: number;
+    s2aFail: number;
   } | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   /** 全量缓存：批量操作仍需要；与分页展示分离 */
@@ -524,6 +532,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
             totalPages: number;
             facets?: {
               all: number;
+              xai: number;
               noSso: number;
               noEmail: number;
               needFill: number;
@@ -532,6 +541,12 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
               http401: number;
               http403: number;
               otherErr: number;
+              cpaNone: number;
+              cpaOk: number;
+              cpaFail: number;
+              s2aNone: number;
+              s2aOk: number;
+              s2aFail: number;
             };
           }>;
         };
@@ -716,6 +731,11 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   const pageStart = (currentPage - 1) * pageSize;
   const rangeFrom = listTotal === 0 ? 0 : pageStart + 1;
   const rangeTo = Math.min(pageStart + pageSize, listTotal || items.length);
+  const isServerPaged = Boolean(facets && allItems.length === 0);
+  const authTotalCount = facets?.all ?? (allItems.length || items.length);
+  const filteredTotalCount = listTotal || filteredItems.length;
+  const hasAuthFiles = authTotalCount > 0;
+  const hasFilteredAuthFiles = filteredTotalCount > 0;
 
   const resetPage = () => setPage(1);
   const changePageSize = (size: PageSize) => {
@@ -731,6 +751,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   const changeMetaFilter = (f: MetaFilter) => {
     setMetaFilter(f);
     resetPage();
+    setSelected(new Set());
     try {
       localStorage.setItem(META_FILTER_KEY, f);
     } catch {
@@ -741,6 +762,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   const changeStatusFilter = (f: StatusFilter) => {
     setStatusFilter(f);
     resetPage();
+    setSelected(new Set());
     try {
       localStorage.setItem(STATUS_FILTER_KEY, f);
     } catch {
@@ -751,6 +773,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   const changePushFilter = (f: PushFilter) => {
     setPushFilter(f);
     resetPage();
+    setSelected(new Set());
     try {
       localStorage.setItem(PUSH_FILTER_KEY, f);
     } catch {
@@ -762,20 +785,24 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
 
   // 列表/筛选变化时清理无效选中
   useEffect(() => {
+    if (isServerPaged) return;
     const names = new Set(filteredItems.map((i) => i.filename));
     setSelected((prev) => {
       const next = new Set([...prev].filter((n) => names.has(n)));
       return next.size === prev.size ? prev : next;
     });
-  }, [filteredItems]);
+  }, [filteredItems, isServerPaged]);
 
+  const selectableTotalCount = Math.min(filteredTotalCount, 2000);
   const allSelected =
-    filteredItems.length > 0 && filteredItems.every((i) => selected.has(i.filename));
+    isServerPaged
+      ? selectableTotalCount > 0 && selected.size >= selectableTotalCount
+      : filteredItems.length > 0 && filteredItems.every((i) => selected.has(i.filename));
   const pageAllSelected =
     pageItems.length > 0 && pageItems.every((i) => selected.has(i.filename));
   const xaiCount = useMemo(
-    () => (allItems.length ? allItems : items).filter((i) => i.xai).length,
-    [allItems, items]
+    () => facets?.xai ?? (allItems.length ? allItems : items).filter((i) => i.xai).length,
+    [facets, allItems, items]
   );
   const busy = batchBusy !== null || rowBusy !== null;
 
@@ -787,12 +814,34 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       return next;
     });
 
-  /** 全选：当前筛选结果全部 */
-  const selectAll = () => {
-    if (filteredItems.length === 0) return;
-    setSelected(
-      allSelected ? new Set() : new Set(filteredItems.map((i) => i.filename))
-    );
+  /** 全选：当前筛选结果全部；服务端分页时通过 match 接口拿 filename */
+  const selectAll = async () => {
+    if (filteredTotalCount === 0) return;
+    if (allSelected) {
+      setSelected(new Set());
+      return;
+    }
+    if (isServerPaged) {
+      try {
+        const r = await resolveTargetNames({ limit: 2000, ignoreSelected: true });
+        setSelected(new Set(r.names));
+        if (r.truncated) {
+          push({
+            tone: 'warn',
+            title: `匹配 ${r.total} 条，本次选择 ${r.names.length}`,
+            description: '前端一次最多持有 2000 个文件名'
+          });
+        }
+      } catch (err) {
+        push({
+          tone: 'danger',
+          title: '全选筛选失败',
+          description: err instanceof Error ? err.message : String(err)
+        });
+      }
+      return;
+    }
+    setSelected(new Set(filteredItems.map((i) => i.filename)));
   };
 
   /** 本页：仅当前分页 */
@@ -810,11 +859,18 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   };
 
   /** 当前筛选参数（与服务端 match/paged 一致） */
-  const authFilterQuery = () => ({
-    q: searchQuery.trim() || undefined,
-    meta: metaFilter === 'all' ? undefined : metaFilter,
-    status: statusFilter === 'all' ? undefined : statusFilter,
-    push: pushFilter === 'all' ? undefined : pushFilter
+  const authFilterQuery = (
+    overrides?: Partial<{
+      q: string;
+      meta: string;
+      status: string;
+      push: string;
+    }>
+  ) => ({
+    q: overrides?.q ?? (searchQuery.trim() || undefined),
+    meta: overrides?.meta ?? (metaFilter === 'all' ? undefined : metaFilter),
+    status: overrides?.status ?? (statusFilter === 'all' ? undefined : statusFilter),
+    push: overrides?.push ?? (pushFilter === 'all' ? undefined : pushFilter)
   });
 
   /**
@@ -826,12 +882,16 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   const resolveTargetNames = async (opts?: {
     limit?: number;
     requireSso?: boolean;
+    requireMissingSso?: boolean;
     requireEmail?: boolean;
+    ignoreSelected?: boolean;
+    query?: ReturnType<typeof authFilterQuery>;
   }): Promise<{ names: string[]; total: number; truncated: boolean; scope: string }> => {
-    if (selected.size > 0) {
+    if (!opts?.ignoreSelected && selected.size > 0) {
       return { names: [...selected], total: selected.size, truncated: false, scope: 'selected' };
     }
     const limit = opts?.limit ?? 500;
+    const query = opts?.query ?? authFilterQuery();
     const api = window.api as {
       matchCpaAuth?: (q?: {
         q?: string;
@@ -840,6 +900,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
         push?: string;
         limit?: number;
         requireSso?: boolean;
+        requireMissingSso?: boolean;
         requireEmail?: boolean;
       }) => Promise<{
         items: { filename: string }[];
@@ -850,9 +911,10 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     };
     if (api.matchCpaAuth) {
       const r = await api.matchCpaAuth({
-        ...authFilterQuery(),
+        ...query,
         limit,
         requireSso: opts?.requireSso,
+        requireMissingSso: opts?.requireMissingSso,
         requireEmail: opts?.requireEmail
       });
       return {
@@ -865,6 +927,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     // 兼容：本地筛选
     let list = filteredItems;
     if (opts?.requireSso) list = list.filter((i) => i.hasSso);
+    if (opts?.requireMissingSso) list = list.filter((i) => !i.hasSso);
     if (opts?.requireEmail) list = list.filter((i) => String(i.email || '').trim());
     const names = list.slice(0, limit).map((i) => i.filename);
     return {
@@ -1491,28 +1554,32 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
    * 范围：已选 > 状态筛 401 > 当前筛选中的 401。
    */
   const refresh401Batch = async () => {
-    const byName = new Map(items.map((it) => [it.filename, it]));
-    const pool =
-      selected.size > 0
-        ? [...selected]
-        : statusFilter === '401'
-          ? filteredItems.map((i) => i.filename)
-          : items
-              .filter((i) => {
-                const { http, action } = resolveProbe(i);
-                return http === 401 || action === 'dead';
-              })
-              .map((i) => i.filename);
-
-    const targets = pool.filter((fn) => {
-      const it = byName.get(fn);
-      if (!it) return false;
-      const { http } = resolveProbe(it);
-      // 明确 401；若选中但未测活且有 refresh/sso 也允许尝试
-      if (http === 401) return true;
-      if (selected.size > 0 && (it.hasRefresh || it.hasSso)) return true;
-      return false;
-    });
+    let targets: string[] = [];
+    try {
+      if (selected.size > 0) {
+        targets = [...selected];
+      } else {
+        const r = await resolveTargetNames({
+          query: authFilterQuery({ status: '401' }),
+          limit: 500
+        });
+        targets = r.names;
+        if (r.truncated) {
+          push({
+            tone: 'warn',
+            title: `匹配 ${r.total} 条，本次只处理 ${r.names.length}`,
+            description: '死者苏生单次上限 500'
+          });
+        }
+      }
+    } catch (err) {
+      push({
+        tone: 'danger',
+        title: '加载筛选失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
+      return;
+    }
 
     if (targets.length === 0) {
       push({
@@ -1900,7 +1967,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   };
 
   const onPushPointerDown = (kind: 'push' | 'pushS2a') => {
-    if (busy || filteredItems.length === 0) return;
+    if (busy || filteredTotalCount === 0) return;
     if (kind === 'push' && !remoteReady) return;
     if (kind === 'pushS2a' && !sub2RemoteReady) return;
     clearPushHold();
@@ -1919,7 +1986,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     clearPushHold();
     pushHoldRef.current.kind = null;
     if (wasHold) return;
-    if (busy || filteredItems.length === 0) return;
+    if (busy || filteredTotalCount === 0) return;
     if (kind === 'push') void pushRemoteBatch({ force: false });
     else void pushSub2apiBatch({ force: false });
   };
@@ -2311,8 +2378,11 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     [facets, allItems, items]
   );
   const needFillCount = useMemo(
-    () => items.filter((i) => !hasSso(i) || !hasEmail(i)).length,
-    [items]
+    () =>
+      facets?.needFill ??
+      (allItems.length ? allItems : items).filter((i) => !hasSso(i) || !hasEmail(i))
+        .length,
+    [facets, allItems, items]
   );
   const statusCounts = useMemo(() => {
     if (facets) {
@@ -2350,6 +2420,16 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     return { unprobed, c200, c401, c403, other };
   }, [facets, allItems, items, resolveProbe]);
   const pushCounts = useMemo(() => {
+    if (facets) {
+      return {
+        cpaNone: facets.cpaNone,
+        cpaOk: facets.cpaOk,
+        cpaFail: facets.cpaFail,
+        s2aNone: facets.s2aNone,
+        s2aOk: facets.s2aOk,
+        s2aFail: facets.s2aFail
+      };
+    }
     let cpaNone = 0;
     let cpaOk = 0;
     let cpaFail = 0;
@@ -2368,7 +2448,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       else s2aNone += 1;
     }
     return { cpaNone, cpaOk, cpaFail, s2aNone, s2aOk, s2aFail };
-  }, [allItems, items]);
+  }, [facets, allItems, items]);
   const hasActiveMetaFilter = metaFilter !== 'all';
   const hasActiveStatusFilter = statusFilter !== 'all';
   const hasActivePushFilter = pushFilter !== 'all';
@@ -2393,21 +2473,74 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
 
   const backfillSso = async (opts?: { force?: boolean }) => {
     const force = Boolean(opts?.force);
-    // 有勾选用勾选，否则用当前筛选列表（方便先筛「无sso」再回填）
-    const pool =
-      selected.size > 0
-        ? items.filter((i) => selected.has(i.filename))
-        : filteredItems;
-    // 非 force：只处理无 sso；force：处理池内全部（含已有 sso）
-    const targets = force ? pool : pool.filter((i) => !hasSso(i));
-    if (targets.length === 0) {
+    let filenames: string[] = [];
+    let noEmail = 0;
+    let already = 0;
+    try {
+      if (selected.size > 0) {
+        filenames = [...selected];
+      } else {
+        let queryMeta: string | undefined;
+        if (force) {
+          queryMeta = metaFilter === 'all' ? undefined : metaFilter;
+        } else if (metaFilter === 'all') {
+          queryMeta = 'no_sso';
+        } else if (metaFilter === 'no_email') {
+          queryMeta = 'need_fill';
+        } else {
+          queryMeta = metaFilter;
+        }
+        const query = authFilterQuery({ meta: queryMeta });
+        if (window.api.matchCpaAuth) {
+          const r = await window.api.matchCpaAuth({
+            ...query,
+            limit: 2000,
+            requireMissingSso: !force
+          });
+          const matched = r.items || [];
+          filenames = matched.map((i) => i.filename);
+          noEmail = matched.filter((i) => !String(i.email || '').trim()).length;
+          already = matched.filter((i) => i.hasSso).length;
+          if (r.truncated) {
+            push({
+              tone: 'warn',
+              title: `匹配 ${r.total} 条，本次只处理 ${matched.length}`,
+              description: '回填SSO单次上限 2000'
+            });
+          }
+        } else {
+          const r = await resolveTargetNames({
+            query,
+            limit: 2000,
+            requireMissingSso: !force
+          });
+          filenames = r.names;
+          if (r.truncated) {
+            push({
+              tone: 'warn',
+              title: `匹配 ${r.total} 条，本次只处理 ${r.names.length}`,
+              description: '回填SSO单次上限 2000'
+            });
+          }
+        }
+      }
+    } catch (err) {
+      push({
+        tone: 'danger',
+        title: '加载筛选失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
+      return;
+    }
+
+    if (filenames.length === 0) {
       push({
         tone: 'warn',
         title: force ? '没有可覆盖的目标' : '无需回填',
         description: force
           ? selected.size > 0
             ? '当前选择为空'
-            : 'Auth 列表为空'
+            : '当前筛选为空'
           : selected.size > 0
             ? '所选均已有 sso（长按按钮可强制覆盖）'
             : '全部 auth 已含 sso（长按按钮可强制覆盖）'
@@ -2415,14 +2548,10 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       return;
     }
 
-    const noEmail = targets.filter((t) => !String(t.email || '').trim()).length;
-    const hasEmail = targets.length - noEmail;
-    const already = targets.filter((t) => t.hasSso).length;
-
     if (force) {
       const step1 = window.confirm(
         `【强制覆盖】从 SSO 列表按 email 重写 sso\n\n` +
-          `将处理 ${targets.length} 个文件` +
+          `将处理 ${filenames.length} 个文件` +
           (already > 0 ? `（其中 ${already} 个已有 sso，将被覆盖）` : '') +
           `。\n` +
           `匹配：SSO 列表同邮箱最新记录。\n\n` +
@@ -2433,16 +2562,20 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       if (!step1) return;
       const step2 = window.confirm(
         `再次确认：强制覆盖已有 sso，不可撤销（除非再回填/重签）。\n` +
-          `有邮箱可匹配约 ${hasEmail} 个 · 无邮箱跳过 ${noEmail} 个。\n\n` +
+          (selected.size > 0
+            ? `当前选择 ${filenames.length} 个。\n\n`
+            : `有邮箱可匹配约 ${filenames.length - noEmail} 个 · 无邮箱跳过 ${noEmail} 个。\n\n`) +
           `确定强制写入？`
       );
       if (!step2) return;
     } else {
       const ok = window.confirm(
         `从 SSO 列表按 email 回填 sso\n\n` +
-          `将处理 ${targets.length} 个无 sso 文件（已有 sso 跳过）。\n` +
+          `将处理 ${filenames.length} 个候选文件（已有 sso 跳过）。\n` +
           `匹配：SSO 列表同邮箱（忽略大小写）的最新记录。\n\n` +
-          `无邮箱 auth（${noEmail} 个）无法回填，需重新 mint 或手工补 sso。\n` +
+          (selected.size > 0
+            ? '当前来自已选文件。\n'
+            : `无邮箱 auth（${noEmail} 个）无法回填，需重新 mint 或手工补 sso。\n`) +
           `需要覆盖已有 sso 时：长按「回填SSO」约 0.6 秒进入强制模式。`
       );
       if (!ok) return;
@@ -2451,17 +2584,17 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     const signal = beginBatch('backfill');
     setProg({
       kind: 'backfill',
-      total: targets.length,
+      total: filenames.length,
       done: 0,
       ok: 0,
       failed: 0,
       running: true,
-      current: targets[0]?.email || targets[0]?.filename
+      current: filenames[0]
     });
     try {
       throwIfAborted(signal);
       const r = await window.api.backfillCpaAuthSso({
-        filenames: targets.map((t) => t.filename),
+        filenames,
         force
       });
       if (signal.aborted) {
@@ -2506,7 +2639,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   };
 
   const onBackfillPointerDown = () => {
-    if (busy || items.length === 0) return;
+    if (busy || !hasAuthFiles) return;
     clearBackfillHold();
     backfillHoldRef.current.fired = false;
     backfillHoldRef.current.timer = setTimeout(() => {
@@ -2520,7 +2653,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     const wasHold = backfillHoldRef.current.fired;
     clearBackfillHold();
     if (wasHold) return; // 长按已触发 force
-    if (busy || items.length === 0) return;
+    if (busy || !hasAuthFiles) return;
     void backfillSso({ force: false });
   };
 
@@ -2584,7 +2717,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       <section className="terminal-grid">
         <AuthMetric
           label="Auth 文件"
-          value={String(facets?.all ?? (allItems.length || items.length))}
+          value={String(authTotalCount)}
           Icon={KeyRound}
         />
         <AuthMetric label="xai 标识" value={String(xaiCount)} Icon={KeyRound} />
@@ -2714,8 +2847,8 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                   {selected.size > 0 ? `已选 ${selected.size}` : '未选择'}
                 </span>
                 {hasActiveFilter
-                  ? ` · 筛选 ${listTotal || filteredItems.length}/${facets?.all ?? (allItems.length || items.length)}`
-                  : ` · 共 ${facets?.all ?? (allItems.length || items.length)}`}
+                  ? ` · 筛选 ${filteredTotalCount}/${authTotalCount}`
+                  : ` · 共 ${authTotalCount}`}
                 {` · 服务端分页`}
                 {missingSsoCount > 0 ? ` · 无sso ${missingSsoCount}` : ''}
                 {noEmailAuthCount > 0 ? ` · 无邮箱 ${noEmailAuthCount}` : ''}
@@ -2765,6 +2898,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 onChange={(e) => {
                   setSearchQuery(e.target.value);
                   resetPage();
+                  setSelected(new Set());
                 }}
                 placeholder="搜索邮箱 / 文件名 / sub…"
                 className="h-8 w-full rounded-full border border-border/70 bg-background/80 py-1 pl-8 pr-3 text-[12px] tracking-tight placeholder:text-muted-foreground/70 focus-visible:border-primary/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
@@ -2776,7 +2910,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
               value={metaFilter}
               onChange={changeMetaFilter}
               options={[
-                { id: 'all', label: '全部', count: items.length, title: '不限制标记' },
+                { id: 'all', label: '全部', count: authTotalCount, title: '不限制标记' },
                 { id: 'no_sso', label: '无SSO', count: missingSsoCount, title: '无 sso 字段，可回填', tone: 'warn' },
                 { id: 'no_email', label: '无邮箱', count: noEmailAuthCount, title: '无邮箱，无法 email 回填', tone: 'warn' },
                 { id: 'need_fill', label: '待补全', count: needFillCount, title: '无 sso 或无邮箱' }
@@ -2787,7 +2921,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
               value={statusFilter}
               onChange={changeStatusFilter}
               options={[
-                { id: 'all', label: '全部', count: items.length, title: '不限制状态' },
+                { id: 'all', label: '全部', count: authTotalCount, title: '不限制状态' },
                 { id: 'unprobed', label: '未测', count: statusCounts.unprobed, title: '尚未测活（无状态码）', tone: 'muted' },
                 { id: '200', label: '200', count: statusCounts.c200, title: 'HTTP 200 / 测活通过', tone: 'ok' },
                 { id: '401', label: '401', count: statusCounts.c401, title: 'HTTP 401 未授权 · 可死者苏生', tone: 'danger' },
@@ -2800,7 +2934,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
               value={pushFilter}
               onChange={changePushFilter}
               options={[
-                { id: 'all', label: '全部', count: items.length, title: '不限制推送状态' },
+                { id: 'all', label: '全部', count: authTotalCount, title: '不限制推送状态' },
                 {
                   id: 'cpa_none',
                   label: 'CPA未推',
@@ -2855,13 +2989,13 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 variant="secondary"
                 size="sm"
                 className="min-w-[4.75rem] justify-center"
-                onClick={selectAll}
-                disabled={filteredItems.length === 0 || busy}
+                onClick={() => void selectAll()}
+                disabled={filteredTotalCount === 0 || busy}
                 title={
                   allSelected
                     ? '取消全选'
                     : selected.size > 0
-                      ? `已选 ${selected.size}，点此全选筛选结果`
+                      ? `已选 ${selected.size}，点此全选当前筛选结果`
                       : '全选当前筛选列表'
                 }
               >
@@ -2892,7 +3026,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 variant={batchBusy === 'probe' ? 'danger' : 'primary'}
                 disabled={
                   (Boolean(busy) && batchBusy !== 'probe') ||
-                  (batchBusy !== 'probe' && filteredItems.length === 0)
+                  (batchBusy !== 'probe' && filteredTotalCount === 0)
                 }
                 title={
                   batchBusy === 'probe'
@@ -2900,7 +3034,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                     : (selected.size > 0
                         ? `测活已选 ${selected.size} 条`
                         : hasActiveFilter
-                          ? `测活筛选 ${filteredItems.length} 条`
+                          ? `测活筛选 ${filteredTotalCount} 条`
                           : '测活全部') +
                       (deleteOnDead ? ' · 401/402/403 将删除' : ' · 死号仅标记不删')
                 }
@@ -2918,7 +3052,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 {...batchBtnProps('relogin', () => void reloginBatch())}
                 disabled={
                   (Boolean(busy) && batchBusy !== 'relogin') ||
-                  (batchBusy !== 'relogin' && filteredItems.length === 0)
+                  (batchBusy !== 'relogin' && filteredTotalCount === 0)
                 }
                 title={
                   batchBusy === 'relogin'
@@ -2926,7 +3060,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                     : (selected.size > 0
                         ? `密码重登已选 ${selected.size} 条`
                         : hasActiveFilter
-                          ? `密码重登筛选 ${filteredItems.length} 条`
+                          ? `密码重登筛选 ${filteredTotalCount} 条`
                           : '批量密码重登') + ' · 串行并发 1（浏览器登录）'
                 }
               >
@@ -2943,7 +3077,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 {...batchBtnProps('resign', () => void resignBatch('cli'))}
                 disabled={
                   (Boolean(busy) && batchBusy !== 'resign') ||
-                  (batchBusy !== 'resign' && filteredItems.length === 0)
+                  (batchBusy !== 'resign' && filteredTotalCount === 0)
                 }
                 title={
                   batchBusy === 'resign'
@@ -2951,7 +3085,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                     : (selected.size > 0
                         ? `重签 cli 已选 ${selected.size} 条`
                         : hasActiveFilter
-                          ? `重签 cli 筛选 ${filteredItems.length} 条`
+                          ? `重签 cli 筛选 ${filteredTotalCount} 条`
                           : '批量重签 cli') +
                       ' · base=cli-chat-proxy 满额' +
                       (resignPushRemote ? ' · 成功后推远程' : ' · 仅本地')
@@ -2970,7 +3104,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 className="min-w-[5.25rem] justify-center tabular-nums"
                 disabled={
                   (Boolean(busy) && batchBusy !== 'resign') ||
-                  (batchBusy !== 'resign' && filteredItems.length === 0)
+                  (batchBusy !== 'resign' && filteredTotalCount === 0)
                 }
                 onClick={() => {
                   if (batchBusy === 'resign') cancelBatch('resign');
@@ -2982,7 +3116,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                     : (selected.size > 0
                         ? `重签 api 已选 ${selected.size} 条`
                         : hasActiveFilter
-                          ? `重签 api 筛选 ${filteredItems.length} 条`
+                          ? `重签 api 筛选 ${filteredTotalCount} 条`
                           : '批量重签 api') +
                       ' · base=api.x.ai 防风控·约50%额度' +
                       (resignPushRemote ? ' · 成功后推远程' : ' · 仅本地')
@@ -3001,7 +3135,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 {...batchBtnProps('refresh401', () => void refresh401Batch())}
                 disabled={
                   (Boolean(busy) && batchBusy !== 'refresh401') ||
-                  (batchBusy !== 'refresh401' && items.length === 0)
+                  (batchBusy !== 'refresh401' && !hasAuthFiles)
                 }
                 title={
                   batchBusy === 'refresh401'
@@ -3009,7 +3143,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                     : selected.size > 0
                       ? `死者苏生 · 已选中的 401（并发 ${resignConcurrency}）`
                       : statusFilter === '401'
-                        ? `死者苏生 · 筛选 401 · ${filteredItems.length} 条`
+                        ? `死者苏生 · 筛选 401 · ${filteredTotalCount} 条`
                         : `死者苏生 · 全部 401（mode=refresh|sso · 并发 ${resignConcurrency}）`
                 }
               >
@@ -3026,7 +3160,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 className="min-w-[5.5rem] justify-center"
                 disabled={
                   (Boolean(busy) && batchBusy !== 'backfill') ||
-                  (batchBusy !== 'backfill' && items.length === 0)
+                  (batchBusy !== 'backfill' && !hasAuthFiles)
                 }
                 onClick={() => {
                   if (batchBusy === 'backfill') cancelBatch('backfill');
@@ -3081,7 +3215,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 }}
                 disabled={
                   (Boolean(busy) && batchBusy !== 'export') ||
-                  (batchBusy !== 'export' && filteredItems.length === 0)
+                  (batchBusy !== 'export' && filteredTotalCount === 0)
                 }
                 title={
                   batchBusy === 'export'
@@ -3089,7 +3223,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                     : selected.size > 0
                       ? `导出已选 ${selected.size} 条`
                       : hasActiveFilter
-                        ? `导出筛选 ${filteredItems.length} 条`
+                        ? `导出筛选 ${filteredTotalCount} 条`
                         : '导出全部 JSON'
                 }
               >
@@ -3105,7 +3239,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 className="min-w-[5rem] justify-center tabular-nums"
                 disabled={
                   (Boolean(busy) && batchBusy !== 'push') ||
-                  (batchBusy !== 'push' && filteredItems.length === 0)
+                  (batchBusy !== 'push' && filteredTotalCount === 0)
                 }
                 onClick={() => {
                   if (batchBusy === 'push') cancelBatch('push');
@@ -3128,7 +3262,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                       ? (selected.size > 0
                           ? `推送 CPA · 已选 ${selected.size} 条`
                           : hasActiveFilter
-                            ? `推送 CPA · 筛选 ${filteredItems.length} 条`
+                            ? `推送 CPA · 筛选 ${filteredTotalCount} 条`
                             : '推送 CPA') +
                         ' · 长按约 0.6 秒强制重推（忽略已推）'
                       : '请先在设置中配置远程 CPA 地址与密钥'
@@ -3147,7 +3281,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 className="min-w-[5.5rem] justify-center tabular-nums"
                 disabled={
                   (Boolean(busy) && batchBusy !== 'pushS2a') ||
-                  (batchBusy !== 'pushS2a' && filteredItems.length === 0) ||
+                  (batchBusy !== 'pushS2a' && filteredTotalCount === 0) ||
                   !sub2RemoteReady
                 }
                 onClick={() => {
@@ -3171,7 +3305,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                       ? (selected.size > 0
                           ? `推送 S2A · 已选 ${selected.size}`
                           : hasActiveFilter
-                            ? `推送 S2A · 筛选 ${filteredItems.length}`
+                            ? `推送 S2A · 筛选 ${filteredTotalCount}`
                             : 'CPA auth → 转 grok 格式 → S2A（sub2api）') +
                         ' · 长按约 0.6 秒强制重推（忽略已推）'
                       : '请在设置开启 Auth→sub2api 并填写地址与 Token'
@@ -3219,7 +3353,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
 
       {/* 无邮箱筛选：引导号池验活补邮箱后再回填 */}
       {!loading &&
-        items.length > 0 &&
+        hasAuthFiles &&
         noEmailAuthCount > 0 &&
         (metaFilter === 'no_email' || metaFilter === 'need_fill') && (
           <div className="rounded-[14px] border border-orange-500/30 bg-orange-500/10 px-4 py-3 text-[13px]">
@@ -3253,15 +3387,15 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
           </div>
         )}
 
-      {loading && items.length === 0 ? (
+      {loading && !hasAuthFiles ? (
         <div className="rounded-[16px] border border-dashed border-border bg-card p-12 text-center text-[13px] text-muted-foreground">
           加载中…
         </div>
-      ) : items.length === 0 ? (
+      ) : !hasAuthFiles ? (
         <div className="rounded-[16px] border border-dashed border-border bg-card p-12 text-center text-[13px] text-muted-foreground">
           Auth 目录为空。注册成功自动导出，或在 SSO 页点「补签 Auth」。
         </div>
-      ) : filteredItems.length === 0 ? (
+      ) : !hasFilteredAuthFiles ? (
         <div className="rounded-[16px] border border-dashed border-border bg-card p-12 text-center text-[13px] text-muted-foreground">
           <p>
             当前筛选下没有 Auth 文件。
@@ -3660,7 +3794,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
           totalPages={totalPages}
           rangeFrom={rangeFrom}
           rangeTo={rangeTo}
-          total={listTotal || filteredItems.length}
+          total={filteredTotalCount}
           pageSize={pageSize}
           onChange={setPage}
           onPageSizeChange={changePageSize}
@@ -3790,4 +3924,3 @@ function AuthMetric({
     </div>
   );
 }
-

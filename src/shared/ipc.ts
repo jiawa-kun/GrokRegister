@@ -167,6 +167,7 @@ export interface CpaAuthListResult {
   totalPages?: number;
   facets?: {
     all: number;
+    xai: number;
     noSso: number;
     noEmail: number;
     needFill: number;
@@ -175,6 +176,12 @@ export interface CpaAuthListResult {
     http401: number;
     http403: number;
     otherErr: number;
+    cpaNone: number;
+    cpaOk: number;
+    cpaFail: number;
+    s2aNone: number;
+    s2aOk: number;
+    s2aFail: number;
   };
 }
 
@@ -516,6 +523,7 @@ export interface RendererApi {
     push?: string;
     limit?: number;
     requireSso?: boolean;
+    requireMissingSso?: boolean;
     requireEmail?: boolean;
   }): Promise<{
     dir: string;

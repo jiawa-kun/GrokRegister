@@ -251,6 +251,7 @@ const webApi: RendererApi = {
     if (query?.push) qs.set('push', query.push);
     if (query?.limit != null) qs.set('limit', String(query.limit));
     if (query?.requireSso) qs.set('requireSso', '1');
+    if (query?.requireMissingSso) qs.set('requireMissingSso', '1');
     if (query?.requireEmail) qs.set('requireEmail', '1');
     const q = qs.toString();
     return http('GET', q ? `/api/cpa-auth/match?${q}` : '/api/cpa-auth/match');

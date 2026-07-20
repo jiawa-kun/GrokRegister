@@ -825,7 +825,7 @@ app.get('/api/cpa-auth', asyncHandler(async (req, res) => {
 
 /**
  * 按筛选返回 Auth filename 列表（批量操作：测活/重签/推送/导出）。
- * query: q, meta, status, push, limit, requireSso, requireEmail
+ * query: q, meta, status, push, limit, requireSso, requireMissingSso, requireEmail
  */
 app.get('/api/cpa-auth/match', asyncHandler(async (req, res) => {
   try {
@@ -839,6 +839,9 @@ app.get('/api/cpa-auth/match', asyncHandler(async (req, res) => {
         requireSso:
           String(req.query.requireSso || '') === '1' ||
           String(req.query.requireSso || '').toLowerCase() === 'true',
+        requireMissingSso:
+          String(req.query.requireMissingSso || '') === '1' ||
+          String(req.query.requireMissingSso || '').toLowerCase() === 'true',
         requireEmail:
           String(req.query.requireEmail || '') === '1' ||
           String(req.query.requireEmail || '').toLowerCase() === 'true'

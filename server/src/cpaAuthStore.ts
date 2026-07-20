@@ -694,6 +694,7 @@ export type CpaAuthListQuery = {
 
 export type CpaAuthListFacets = {
   all: number;
+  xai: number;
   noSso: number;
   noEmail: number;
   needFill: number;
@@ -702,6 +703,12 @@ export type CpaAuthListFacets = {
   http401: number;
   http403: number;
   otherErr: number;
+  cpaNone: number;
+  cpaOk: number;
+  cpaFail: number;
+  s2aNone: number;
+  s2aOk: number;
+  s2aFail: number;
 };
 
 export type CpaAuthListPage = {
@@ -764,6 +771,7 @@ function matchCpaAuthItem(i: CpaAuthItem, opts: CpaAuthListQuery): boolean {
 }
 
 function buildCpaAuthFacets(all: CpaAuthItem[]): CpaAuthListFacets {
+  let xai = 0;
   let noSso = 0;
   let noEmail = 0;
   let needFill = 0;
@@ -772,7 +780,14 @@ function buildCpaAuthFacets(all: CpaAuthItem[]): CpaAuthListFacets {
   let http401 = 0;
   let http403 = 0;
   let otherErr = 0;
+  let cpaNone = 0;
+  let cpaOk = 0;
+  let cpaFail = 0;
+  let s2aNone = 0;
+  let s2aOk = 0;
+  let s2aFail = 0;
   for (const i of all) {
+    if (i.xai) xai++;
     const hasSso = Boolean(i.hasSso);
     const hasEmail = Boolean(String(i.email || '').trim());
     if (!hasSso) noSso++;
@@ -786,9 +801,19 @@ function buildCpaAuthFacets(all: CpaAuthItem[]): CpaAuthListFacets {
     else if (http === 401) http401++;
     else if (http === 403) http403++;
     else otherErr++;
+
+    const cpa = i.authCpaStatus ?? 'none';
+    const s2a = i.authSub2apiStatus ?? 'none';
+    if (cpa === 'ok') cpaOk++;
+    else if (cpa === 'fail') cpaFail++;
+    else cpaNone++;
+    if (s2a === 'ok') s2aOk++;
+    else if (s2a === 'fail') s2aFail++;
+    else s2aNone++;
   }
   return {
     all: all.length,
+    xai,
     noSso,
     noEmail,
     needFill,
@@ -796,7 +821,13 @@ function buildCpaAuthFacets(all: CpaAuthItem[]): CpaAuthListFacets {
     http200,
     http401,
     http403,
-    otherErr
+    otherErr,
+    cpaNone,
+    cpaOk,
+    cpaFail,
+    s2aNone,
+    s2aOk,
+    s2aFail
   };
 }
 
@@ -878,6 +909,8 @@ export type CpaAuthMatchQuery = CpaAuthListQuery & {
   limit?: number;
   /** 仅返回有 sso 的 */
   requireSso?: boolean;
+  /** 仅返回缺 sso 的 */
+  requireMissingSso?: boolean;
   /** 仅返回有邮箱的 */
   requireEmail?: boolean;
 };
@@ -909,6 +942,9 @@ export async function matchCpaAuth(opts: CpaAuthMatchQuery = {}): Promise<CpaAut
   let filtered = all.filter((i) => matchCpaAuthItem(i, opts));
   if (opts.requireSso) {
     filtered = filtered.filter((i) => Boolean(i.hasSso));
+  }
+  if (opts.requireMissingSso) {
+    filtered = filtered.filter((i) => !i.hasSso);
   }
   if (opts.requireEmail) {
     filtered = filtered.filter((i) => Boolean(String(i.email || '').trim()));
