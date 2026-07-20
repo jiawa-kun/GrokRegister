@@ -614,30 +614,9 @@ app.get('/api/accounts/storage', asyncHandler(async (_req, res) => {
   res.json(await getAccountsStorageInfo());
 }));
 
-/** 单账号完整记录（含 password/sso；列表分页不返回密钥） */
-app.get('/api/accounts/:id', asyncHandler(async (req, res) => {
-  const id = String(req.params.id || '').trim();
-  if (
-    !id ||
-    id === 'match' ||
-    id === 'resync' ||
-    id === 'import' ||
-    id === 'delete' ||
-    id === 'storage'
-  ) {
-    res.status(404).json({ error: 'not found' });
-    return;
-  }
-  const row = await getAccountById(id);
-  if (!row) {
-    res.status(404).json({ error: 'account not found' });
-    return;
-  }
-  res.json(row);
-}));
-
 /**
  * 按筛选返回匹配账号（筛后全部操作：验活/导出/补签）。
+ * 必须在 /api/accounts/:id 之前注册，否则 match 会被当成 id。
  * query: q, sso, alive, auth, limit, requireSso=1
  */
 app.get('/api/accounts/match', asyncHandler(async (req, res) => {
@@ -659,6 +638,28 @@ app.get('/api/accounts/match', asyncHandler(async (req, res) => {
       requireSso
     })
   );
+}));
+
+/** 单账号完整记录（含 password/sso；列表分页不返回密钥） */
+app.get('/api/accounts/:id', asyncHandler(async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  if (
+    !id ||
+    id === 'match' ||
+    id === 'resync' ||
+    id === 'import' ||
+    id === 'delete' ||
+    id === 'storage'
+  ) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  const row = await getAccountById(id);
+  if (!row) {
+    res.status(404).json({ error: 'account not found' });
+    return;
+  }
+  res.json(row);
 }));
 
 /** 从 DATA_DIR/sso 与旧路径重新扫描导入历史账号 */
