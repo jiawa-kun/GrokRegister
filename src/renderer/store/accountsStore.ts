@@ -276,8 +276,15 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
         },
         fullListMode: false
       });
-    } catch {
-      set({ loading: false });
+    } catch (err) {
+      console.error('[accountsStore] reloadPage failed', err);
+      // 分页失败时回退全量，避免号池空白
+      try {
+        await get().reload();
+      } catch (err2) {
+        console.error('[accountsStore] reload fallback failed', err2);
+        set({ loading: false });
+      }
     }
   },
 

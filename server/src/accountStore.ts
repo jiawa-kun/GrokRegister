@@ -485,6 +485,70 @@ async function authDirMtimeMs(): Promise<number> {
   }
 }
 
+/**
+ * 轻量扫描 auth 目录（仅 email + ssoHash），避免 listCpaAuth 全量解析拖慢号池分页。
+ * 规则与 listCpaAuth 尽量对齐：文件名 xai-<email>、JSON 内 email/sso。
+ */
+async function scanAuthIndexLight(dir: string): Promise<AuthIndex> {
+  const emails = new Set<string>();
+  const ssoHashes = new Set<string>();
+  let names: string[] = [];
+  try {
+    names = await fsp.readdir(dir);
+  } catch {
+    return { emails, ssoHashes };
+  }
+  // 并发限制，避免一次打开成百上千文件打满句柄
+  const jsonNames = names.filter((n) => n.endsWith('.json'));
+  const concurrency = 24;
+  let cursor = 0;
+  async function worker() {
+    while (cursor < jsonNames.length) {
+      const i = cursor++;
+      const name = jsonNames[i]!;
+      const full = join(dir, name);
+      try {
+        const st = await fsp.stat(full);
+        if (!st.isFile() || st.size > 2_000_000) continue;
+        // 文件名 email：xai-foo@bar.com.json / xai-foo@bar.com-pkce.json
+        const base = name.replace(/\.json$/i, '');
+        const m = base.match(/^xai-(.+?)(?:-(pkce|device|a|b))?$/i);
+        if (m?.[1] && m[1].includes('@')) {
+          emails.add(m[1].trim().toLowerCase());
+        }
+        const raw = await fsp.readFile(full, 'utf-8');
+        let data: Record<string, unknown> = {};
+        try {
+          data = JSON.parse(raw) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        const em = String(data.email || data.Email || '')
+          .trim()
+          .toLowerCase();
+        if (em) emails.add(em);
+        let sso = '';
+        if (typeof data.sso === 'string') sso = data.sso;
+        else if (data.extra && typeof data.extra === 'object') {
+          const s = (data.extra as Record<string, unknown>).sso;
+          if (typeof s === 'string') sso = s;
+        }
+        sso = String(sso || '')
+          .trim()
+          .replace(/^sso=/i, '')
+          .trim();
+        if (sso.length >= 8) {
+          ssoHashes.add(createHash('sha256').update(sso, 'utf8').digest('hex'));
+        }
+      } catch {
+        /* skip file */
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, jsonNames.length || 1) }, () => worker()));
+  return { emails, ssoHashes };
+}
+
 async function loadAuthIndex(): Promise<AuthIndex> {
   const now = Date.now();
   const mtimeMs = await authDirMtimeMs();
@@ -496,25 +560,29 @@ async function loadAuthIndex(): Promise<AuthIndex> {
   ) {
     return authIndexCache.index;
   }
-  const emails = new Set<string>();
-  const ssoHashes = new Set<string>();
+  const dir = join(dataDir(), 'auth');
+  let index: AuthIndex = { emails: new Set(), ssoHashes: new Set() };
   try {
-    const { listCpaAuth } = await import('./cpaAuthStore.js');
-    const { items } = await listCpaAuth();
-    for (const it of items || []) {
-      const e = String(it.email || '')
-        .trim()
-        .toLowerCase();
-      if (e) emails.add(e);
-      const h = String(it.ssoHash || '')
-        .trim()
-        .toLowerCase();
-      if (h) ssoHashes.add(h);
-    }
+    // 优先轻量扫描；失败再回退 listCpaAuth（兼容旧逻辑）
+    index = await scanAuthIndexLight(dir);
   } catch {
-    /* auth 目录不可用时视为无已转 */
+    try {
+      const { listCpaAuth } = await import('./cpaAuthStore.js');
+      const { items } = await listCpaAuth();
+      for (const it of items || []) {
+        const e = String(it.email || '')
+          .trim()
+          .toLowerCase();
+        if (e) index.emails.add(e);
+        const h = String(it.ssoHash || '')
+          .trim()
+          .toLowerCase();
+        if (h) index.ssoHashes.add(h);
+      }
+    } catch {
+      /* auth 目录不可用时视为无已转 */
+    }
   }
-  const index = { emails, ssoHashes };
   authIndexCache = { at: now, mtimeMs, index };
   return index;
 }

@@ -355,7 +355,12 @@ export function PoolPage() {
       } else {
         await fetchList();
       }
-      await reloadAuthEmails();
+      try {
+        await reloadAuthEmails();
+      } catch (authErr) {
+        // Auth 目录很大时可能慢/失败，不阻断号池主列表
+        console.warn('[PoolPage] reloadAuthEmails failed', authErr);
+      }
     } catch (err) {
       push({
         tone: 'danger',
