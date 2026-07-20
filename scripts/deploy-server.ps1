@@ -13,7 +13,7 @@ param(
 )
 
 # Local build image -> scp tar -> remote docker load + compose recreate.
-# After success: prune dangling images + build cache (keeps running containers).
+# After success: prune remote dangling images only; keep local BuildKit cache for faster rebuilds.
 $ErrorActionPreference = "Stop"
 
 function Write-Step {
@@ -162,9 +162,8 @@ services:
         "echo 'skip docker prune (-SkipPrune)'"
     } else {
         @"
-echo '==> prune dangling images + build cache (keep running containers)'
+echo '==> prune remote dangling images (keep running containers and build cache)'
 docker image prune -f || true
-docker builder prune -af || true
 docker system df || true
 "@
     }
@@ -210,18 +209,14 @@ echo "DEPLOY_OK build=$buildId"
 "@
     Invoke-Checked "ssh" ($sshBaseArgs + @($HostName, $remoteDeploy))
 
-    if (-not $SkipPrune) {
-        Write-Step "local prune dangling images + build cache"
-        docker image prune -f 1>$null 2>$null
-        docker builder prune -af 1>$null 2>$null
-    }
+    Write-Step "keep local Docker build cache for faster next deploy"
 
     Write-Host ""
     Write-Host "Deployed image: $ImageName"
     Write-Host "Remote dir: ${HostName}:$RemoteDir"
     Write-Host "URL: http://23.106.46.133:$WebPort"
     Write-Host "Logs: .\scripts\deploy-server.ps1 -Logs"
-    Write-Host "Skip prune next time: .\scripts\deploy-server.ps1 -SkipPrune"
+    Write-Host "Skip remote dangling-image prune next time: .\scripts\deploy-server.ps1 -SkipPrune"
 }
 finally {
     if (Test-Path -LiteralPath $imageTar) {
