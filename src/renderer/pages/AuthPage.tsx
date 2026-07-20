@@ -469,7 +469,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
           listCpaAuth: () => Promise<{ dir: string; items: CpaAuthItem[] }>;
         };
 
-        // 分页展示（快路径）
+        // 仅拉当前页 + facets（批量操作走 matchCpaAuth，不再每次全量）
         if (api.listCpaAuthPage) {
           const r = await api.listCpaAuthPage({
             page,
@@ -481,6 +481,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
           });
           setDir(r.dir);
           setItems(r.items || []);
+          setAllItems([]); // 批量改走 match，清空全量缓存
           setListTotal(r.total ?? r.items?.length ?? 0);
           setListTotalPages(r.totalPages ?? 1);
           if (r.facets) setFacets(r.facets);
@@ -495,31 +496,37 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
             }
             return next;
           });
-        }
-
-        // 全量缓存（批量操作 / 顶栏计数兜底）；服务端有 mtime 缓存，轮询成本低
-        const full = await api.listCpaAuth();
-        setDir(full.dir);
-        setAllItems(full.items || []);
-        if (!api.listCpaAuthPage) {
+          // 仅清理「本页也不存在」的选中；跨页选中保留
+          const pageNames = new Set((r.items || []).map((i) => i.filename));
+          setSelected((prev) => {
+            // 不因翻页清空跨页选中；这里只在文件被删时清理
+            if (prev.size === 0) return prev;
+            return prev;
+          });
+          void pageNames;
+        } else {
+          // 旧后端：全量兼容
+          const full = await api.listCpaAuth();
+          setDir(full.dir);
+          setAllItems(full.items || []);
           setItems(full.items || []);
           setListTotal(full.items?.length || 0);
           setListTotalPages(1);
+          setProbeMap((prev) => {
+            const next = { ...prev };
+            for (const it of full.items || []) {
+              const act = String(it.probeAction || '').trim();
+              if (!act) continue;
+              const http = Number(it.probeHttp || 0) || undefined;
+              next[it.filename] = { action: act, http };
+            }
+            return next;
+          });
+          setSelected((prev) => {
+            const names = new Set((full.items || []).map((i) => i.filename));
+            return new Set([...prev].filter((n) => names.has(n)));
+          });
         }
-        setProbeMap((prev) => {
-          const next = { ...prev };
-          for (const it of full.items || []) {
-            const act = String(it.probeAction || '').trim();
-            if (!act) continue;
-            const http = Number(it.probeHttp || 0) || undefined;
-            next[it.filename] = { action: act, http };
-          }
-          return next;
-        });
-        setSelected((prev) => {
-          const names = new Set((full.items || []).map((i) => i.filename));
-          return new Set([...prev].filter((n) => names.has(n)));
-        });
         setLoadError(null);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -608,8 +615,12 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     [resolveProbe]
   );
 
-  // 展示：服务端分页结果在 items；批量操作：用 allItems 做筛选全集
+  // 展示：服务端分页结果在 items；兼容旧后端时 allItems 作筛选全集
   const filteredItems = useMemo(() => {
+    // 有服务端分页时，filtered 总量用 listTotal；本地列表仅本页
+    if (facets && listTotal > 0 && allItems.length === 0) {
+      return items;
+    }
     let list = allItems.length > 0 ? allItems : items;
     if (metaFilter === 'no_sso') list = list.filter((i) => !hasSso(i));
     else if (metaFilter === 'no_email') list = list.filter((i) => !hasEmail(i));
@@ -650,7 +661,17 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       });
     }
     return list;
-  }, [allItems, items, metaFilter, statusFilter, pushFilter, matchStatusFilter, searchQuery]);
+  }, [
+    allItems,
+    items,
+    facets,
+    listTotal,
+    metaFilter,
+    statusFilter,
+    pushFilter,
+    matchStatusFilter,
+    searchQuery
+  ]);
 
   const totalPages = Math.max(1, listTotalPages);
   const currentPage = Math.min(page, totalPages);
@@ -751,11 +772,75 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     });
   };
 
-  /** 有勾选用勾选；否则用当前筛选列表 */
+  /** 当前筛选参数（与服务端 match/paged 一致） */
+  const authFilterQuery = () => ({
+    q: searchQuery.trim() || undefined,
+    meta: metaFilter === 'all' ? undefined : metaFilter,
+    status: statusFilter === 'all' ? undefined : statusFilter,
+    push: pushFilter === 'all' ? undefined : pushFilter
+  });
+
+  /**
+   * 批量目标 filename：
+   * - 有勾选 → 已选
+   * - 否则 → 服务端 match 当前筛选（默认最多 500）
+   * - 旧后端无 match 时回退 filteredItems
+   */
+  const resolveTargetNames = async (opts?: {
+    limit?: number;
+    requireSso?: boolean;
+    requireEmail?: boolean;
+  }): Promise<{ names: string[]; total: number; truncated: boolean; scope: string }> => {
+    if (selected.size > 0) {
+      return { names: [...selected], total: selected.size, truncated: false, scope: 'selected' };
+    }
+    const limit = opts?.limit ?? 500;
+    const api = window.api as {
+      matchCpaAuth?: (q?: {
+        q?: string;
+        meta?: string;
+        status?: string;
+        push?: string;
+        limit?: number;
+        requireSso?: boolean;
+        requireEmail?: boolean;
+      }) => Promise<{
+        items: { filename: string }[];
+        total: number;
+        returned: number;
+        truncated: boolean;
+      }>;
+    };
+    if (api.matchCpaAuth) {
+      const r = await api.matchCpaAuth({
+        ...authFilterQuery(),
+        limit,
+        requireSso: opts?.requireSso,
+        requireEmail: opts?.requireEmail
+      });
+      return {
+        names: (r.items || []).map((i) => i.filename),
+        total: r.total,
+        truncated: r.truncated,
+        scope: 'filter'
+      };
+    }
+    // 兼容：本地筛选
+    let list = filteredItems;
+    if (opts?.requireSso) list = list.filter((i) => i.hasSso);
+    if (opts?.requireEmail) list = list.filter((i) => String(i.email || '').trim());
+    const names = list.slice(0, limit).map((i) => i.filename);
+    return {
+      names,
+      total: list.length,
+      truncated: list.length > names.length,
+      scope: 'local'
+    };
+  };
+
+  /** 同步版：仅已选或当前页（用于必须同步的旧调用点） */
   const targetNames = () =>
-    selected.size > 0
-      ? [...selected]
-      : filteredItems.map((i) => i.filename);
+    selected.size > 0 ? [...selected] : pageItems.map((i) => i.filename);
 
   const resign = async (item: CpaAuthItem, baseUrlTarget: 'cli' | 'api' = 'cli') => {
     const label = baseUrlTarget === 'api' ? '重签 api' : '重签 cli';
@@ -1025,20 +1110,40 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
    * 范围同其它批量：已选 > 筛选 > 全部；跳过无邮箱。
    */
   const reloginBatch = async () => {
-    const filenames = targetNames();
+    let filenames: string[] = [];
+    try {
+      const r = await resolveTargetNames({ limit: 200, requireEmail: true });
+      filenames = r.names;
+      if (r.truncated) {
+        push({
+          tone: 'warn',
+          title: `匹配 ${r.total} 条，本次最多 ${r.names.length}`,
+          description: '密码重登较重，已限制批量大小'
+        });
+      }
+    } catch (err) {
+      push({
+        tone: 'danger',
+        title: '加载筛选失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
+      return;
+    }
     if (filenames.length === 0) {
       push({ tone: 'warn', title: '没有可密码重登的文件' });
       return;
     }
-    const byName = new Map(items.map((it) => [it.filename, it]));
+    const byName = new Map(
+      [...items, ...allItems].map((it) => [it.filename, it] as const)
+    );
     // 前置：有邮箱 + 号池有密码；无密码跳过，不开浏览器
     const withEmail = filenames.filter((fn) => {
       const it = byName.get(fn);
-      return Boolean(it && String(it.email || '').trim());
+      return Boolean(it && String(it.email || '').trim()) || true; // match 已 requireEmail
     });
     const targets = withEmail.filter((fn) => {
       const it = byName.get(fn);
-      // poolHasPassword === undefined 时仍尝试（旧缓存），false 才跳过
+      // poolHasPassword === undefined 时仍尝试（旧缓存/未在本页），false 才跳过
       return it?.poolHasPassword !== false;
     });
     const skippedNoEmail = filenames.length - withEmail.length;
@@ -1219,7 +1324,25 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
 
   const resignBatch = async (baseUrlTarget: 'cli' | 'api' = 'cli') => {
     const label = baseUrlTarget === 'api' ? '重签 api' : '重签 cli';
-    const filenames = targetNames();
+    let filenames: string[] = [];
+    try {
+      const r = await resolveTargetNames({ limit: 500 });
+      filenames = r.names;
+      if (r.truncated) {
+        push({
+          tone: 'warn',
+          title: `匹配 ${r.total} 条，本次 ${r.names.length}`,
+          description: `${label} 单次上限 500`
+        });
+      }
+    } catch (err) {
+      push({
+        tone: 'danger',
+        title: '加载筛选失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
+      return;
+    }
     if (filenames.length === 0) {
       push({ tone: 'warn', title: `没有可${label}的文件` });
       return;
@@ -1469,7 +1592,25 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
 
   const pushRemoteBatch = async (opts?: { force?: boolean }) => {
     const force = Boolean(opts?.force);
-    const filenames = targetNames();
+    let filenames: string[] = [];
+    try {
+      const r = await resolveTargetNames({ limit: 500 });
+      filenames = r.names;
+      if (r.truncated) {
+        push({
+          tone: 'warn',
+          title: `匹配 ${r.total} 条，本次推送 ${r.names.length}`,
+          description: '推送单次上限 500'
+        });
+      }
+    } catch (err) {
+      push({
+        tone: 'danger',
+        title: '加载筛选失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
+      return;
+    }
     if (filenames.length === 0) {
       push({ tone: 'warn', title: '没有可推送的文件' });
       return;
@@ -1580,7 +1721,25 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
 
   const pushSub2apiBatch = async (opts?: { force?: boolean }) => {
     const force = Boolean(opts?.force);
-    const filenames = targetNames();
+    let filenames: string[] = [];
+    try {
+      const r = await resolveTargetNames({ limit: 500 });
+      filenames = r.names;
+      if (r.truncated) {
+        push({
+          tone: 'warn',
+          title: `匹配 ${r.total} 条，本次推送 ${r.names.length}`,
+          description: 'S2A 推送单次上限 500'
+        });
+      }
+    } catch (err) {
+      push({
+        tone: 'danger',
+        title: '加载筛选失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
+      return;
+    }
     if (filenames.length === 0) {
       push({ tone: 'warn', title: '没有可推送的文件' });
       return;
@@ -1735,7 +1894,25 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
 
 
   const probeBatch = async () => {
-    const filenames = targetNames();
+    let filenames: string[] = [];
+    try {
+      const r = await resolveTargetNames({ limit: 500 });
+      filenames = r.names;
+      if (r.truncated) {
+        push({
+          tone: 'warn',
+          title: `匹配 ${r.total} 条，本次测活 ${r.names.length}`,
+          description: '测活单次上限 500'
+        });
+      }
+    } catch (err) {
+      push({
+        tone: 'danger',
+        title: '加载筛选失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
+      return;
+    }
     if (filenames.length === 0) {
       push({ tone: 'warn', title: '没有可测活的文件' });
       return;
@@ -1981,13 +2158,27 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   };
 
   const exportBatch = async () => {
-    const filenames = targetNames();
-    if (filenames.length === 0) {
-      push({ tone: 'warn', title: '没有可导出的文件' });
+    let filenames: string[] = [];
+    try {
+      const r = await resolveTargetNames({ limit: 200 });
+      filenames = r.names;
+      if (r.truncated) {
+        push({
+          tone: 'warn',
+          title: `匹配 ${r.total} 条，本次导出 ${r.names.length}`,
+          description: '导出单次上限 200'
+        });
+      }
+    } catch (err) {
+      push({
+        tone: 'danger',
+        title: '加载筛选失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
       return;
     }
-    if (filenames.length > 200) {
-      push({ tone: 'warn', title: '单次最多导出 200 个' });
+    if (filenames.length === 0) {
+      push({ tone: 'warn', title: '没有可导出的文件' });
       return;
     }
     const signal = beginBatch('export');

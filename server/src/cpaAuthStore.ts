@@ -796,6 +796,66 @@ export async function queryCpaAuth(opts: CpaAuthListQuery = {}): Promise<CpaAuth
   };
 }
 
+export type CpaAuthMatchQuery = CpaAuthListQuery & {
+  /** 最多返回条数（默认 500，硬顶 2000） */
+  limit?: number;
+  /** 仅返回有 sso 的 */
+  requireSso?: boolean;
+  /** 仅返回有邮箱的 */
+  requireEmail?: boolean;
+};
+
+export type CpaAuthMatchItem = {
+  filename: string;
+  email: string;
+  hasSso: boolean;
+  hasRefresh: boolean;
+  probeHttp?: number | null;
+  probeAction?: string | null;
+};
+
+export type CpaAuthMatchResult = {
+  dir: string;
+  items: CpaAuthMatchItem[];
+  total: number;
+  returned: number;
+  truncated: boolean;
+  limit: number;
+};
+
+/**
+ * 按筛选返回匹配 filename 列表（批量测活/重签/推送/导出用）。
+ * 不返回完整 CpaAuthItem，避免大批量 JSON。
+ */
+export async function matchCpaAuth(opts: CpaAuthMatchQuery = {}): Promise<CpaAuthMatchResult> {
+  const { dir, items: all } = await listCpaAuth();
+  let filtered = all.filter((i) => matchCpaAuthItem(i, opts));
+  if (opts.requireSso) {
+    filtered = filtered.filter((i) => Boolean(i.hasSso));
+  }
+  if (opts.requireEmail) {
+    filtered = filtered.filter((i) => Boolean(String(i.email || '').trim()));
+  }
+  const limit = Math.min(2000, Math.max(1, Math.floor(Number(opts.limit) || 500)));
+  const total = filtered.length;
+  const slice = filtered.slice(0, limit);
+  return {
+    dir,
+    items: slice.map((i) => ({
+      filename: i.filename,
+      email: String(i.email || ''),
+      hasSso: Boolean(i.hasSso),
+      hasRefresh: Boolean(i.hasRefresh),
+      probeHttp: i.probeHttp ?? null,
+      probeAction: i.probeAction ?? null
+    })),
+    total,
+    returned: slice.length,
+    truncated: total > slice.length,
+    limit
+  };
+}
+
 export interface BackfillCpaAuthSsoResult {
   dir: string;
   scanned: number;

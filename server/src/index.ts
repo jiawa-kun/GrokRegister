@@ -81,6 +81,7 @@ import {
   deleteCpaAuthBatch,
   listCpaAuth,
   queryCpaAuth,
+  matchCpaAuth,
   invalidateCpaAuthListCache,
   mintCpaAuthFromSso,
   probeCpaAuthBatch,
@@ -713,6 +714,33 @@ app.get('/api/cpa-auth', asyncHandler(async (req, res) => {
         meta: typeof req.query.meta === 'string' ? req.query.meta : '',
         status: typeof req.query.status === 'string' ? req.query.status : '',
         push: typeof req.query.push === 'string' ? req.query.push : ''
+      })
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: message });
+  }
+}));
+
+/**
+ * 按筛选返回 Auth filename 列表（批量操作：测活/重签/推送/导出）。
+ * query: q, meta, status, push, limit, requireSso, requireEmail
+ */
+app.get('/api/cpa-auth/match', asyncHandler(async (req, res) => {
+  try {
+    res.json(
+      await matchCpaAuth({
+        q: typeof req.query.q === 'string' ? req.query.q : '',
+        meta: typeof req.query.meta === 'string' ? req.query.meta : '',
+        status: typeof req.query.status === 'string' ? req.query.status : '',
+        push: typeof req.query.push === 'string' ? req.query.push : '',
+        limit: Number(req.query.limit || 500),
+        requireSso:
+          String(req.query.requireSso || '') === '1' ||
+          String(req.query.requireSso || '').toLowerCase() === 'true',
+        requireEmail:
+          String(req.query.requireEmail || '') === '1' ||
+          String(req.query.requireEmail || '').toLowerCase() === 'true'
       })
     );
   } catch (err) {

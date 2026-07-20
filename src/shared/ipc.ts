@@ -485,6 +485,33 @@ export interface RendererApi {
     status?: string;
     push?: string;
   }): Promise<CpaAuthListResult>;
+  /**
+   * 按筛选返回 filename 列表（批量操作，默认最多 500）。
+   * 避免前端为批量任务再拉全量 Auth。
+   */
+  matchCpaAuth?(query?: {
+    q?: string;
+    meta?: string;
+    status?: string;
+    push?: string;
+    limit?: number;
+    requireSso?: boolean;
+    requireEmail?: boolean;
+  }): Promise<{
+    dir: string;
+    items: {
+      filename: string;
+      email: string;
+      hasSso: boolean;
+      hasRefresh: boolean;
+      probeHttp?: number | null;
+      probeAction?: string | null;
+    }[];
+    total: number;
+    returned: number;
+    truncated: boolean;
+    limit: number;
+  }>;
   resignCpaAuth(input: CpaAuthResignInput): Promise<CpaAuthResignResult>;
   resignCpaAuthBatch(input: {
     filenames?: string[];

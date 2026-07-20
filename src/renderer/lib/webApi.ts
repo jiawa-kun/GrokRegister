@@ -241,6 +241,18 @@ const webApi: RendererApi = {
     if (query?.push) qs.set('push', query.push);
     return http('GET', `/api/cpa-auth?${qs.toString()}`);
   },
+  matchCpaAuth: (query) => {
+    const qs = new URLSearchParams();
+    if (query?.q) qs.set('q', query.q);
+    if (query?.meta) qs.set('meta', query.meta);
+    if (query?.status) qs.set('status', query.status);
+    if (query?.push) qs.set('push', query.push);
+    if (query?.limit != null) qs.set('limit', String(query.limit));
+    if (query?.requireSso) qs.set('requireSso', '1');
+    if (query?.requireEmail) qs.set('requireEmail', '1');
+    const q = qs.toString();
+    return http('GET', q ? `/api/cpa-auth/match?${q}` : '/api/cpa-auth/match');
+  },
   resignCpaAuth: (input) => http('POST', '/api/cpa-auth/resign', input),
   resignCpaAuthBatch: (input) => http('POST', '/api/cpa-auth/resign-batch', input),
   mintCpaAuthFromSso: (input) => http('POST', '/api/cpa-auth/mint', input),
