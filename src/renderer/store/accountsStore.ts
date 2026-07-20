@@ -10,6 +10,7 @@ export type AccountListQuery = {
   q?: string;
   sso?: string;
   alive?: string;
+  auth?: string;
 };
 
 export type AccountListFacets = {
@@ -19,6 +20,8 @@ export type AccountListFacets = {
   unchecked: number;
   alive: number;
   dead: number;
+  authConverted?: number;
+  authUnconverted?: number;
 };
 
 function loadSsoMapFromStorage(): Map<string, SsoCheckResult> {
@@ -238,7 +241,8 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
         pageSize: query.pageSize ?? 20,
         q: query.q || undefined,
         sso: query.sso || undefined,
-        alive: query.alive || undefined
+        alive: query.alive || undefined,
+        auth: query.auth || undefined
       });
       const accounts = page.items || [];
       const ssoMap = mergeSsoMaps(get().ssoMap, accounts, { pruneMissing: false });
@@ -249,7 +253,9 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
         noSso: 0,
         unchecked: 0,
         alive: 0,
-        dead: 0
+        dead: 0,
+        authConverted: 0,
+        authUnconverted: 0
       };
       set({
         accounts,
@@ -265,7 +271,8 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
           pageSize: page.pageSize,
           q: query.q,
           sso: query.sso,
-          alive: query.alive
+          alive: query.alive,
+          auth: query.auth
         },
         fullListMode: false
       });

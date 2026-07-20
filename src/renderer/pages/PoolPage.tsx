@@ -328,22 +328,19 @@ export function PoolPage() {
     }
   };
 
-  /** Auth 筛选需全量交叉匹配，其余走服务端分页 */
-  const needsFullList = authFilter !== 'all';
+  /** Auth 筛选已走服务端（email/ssoHash）；始终分页 */
+  const needsFullList = false;
 
   const fetchList = async (opts?: { page?: number; pageSize?: PageSize }) => {
     const p = opts?.page ?? page;
     const ps = opts?.pageSize ?? pageSize;
-    if (needsFullList) {
-      await reload();
-      return;
-    }
     await reloadPage({
       page: p,
       pageSize: ps,
       q: searchQuery.trim() || undefined,
       sso: ssoFilter === 'all' ? undefined : ssoFilter,
-      alive: aliveFilter === 'all' ? undefined : aliveFilter
+      alive: aliveFilter === 'all' ? undefined : aliveFilter,
+      auth: authFilter === 'all' ? undefined : authFilter
     });
   };
 
@@ -476,66 +473,24 @@ export function PoolPage() {
     return r.alive ? 'alive' : 'dead';
   };
 
-  // 服务端分页：accounts 已是当前页；Auth 全量模式：本地再筛
-  const filteredAccounts = useMemo(() => {
-    if (!needsFullList && !fullListMode) {
-      return accounts;
-    }
-    let list = accounts;
-    if (ssoFilter === 'has_sso') list = list.filter((a) => Boolean(String(a.sso || '').trim()));
-    else if (ssoFilter === 'no_sso') list = list.filter((a) => !String(a.sso || '').trim());
-    if (authFilter === 'converted') list = list.filter((a) => isAuthConverted(a));
-    else if (authFilter === 'unconverted') list = list.filter((a) => !isAuthConverted(a));
-    if (aliveFilter === 'unchecked') list = list.filter((a) => aliveStatusOf(a) === 'unchecked');
-    else if (aliveFilter === 'alive') list = list.filter((a) => aliveStatusOf(a) === 'alive');
-    else if (aliveFilter === 'dead') list = list.filter((a) => aliveStatusOf(a) === 'dead');
-    const q = searchQuery.trim().toLowerCase();
-    if (q) {
-      list = list.filter((a) => {
-        const email = String(a.email || '').toLowerCase();
-        const sso = String(a.sso || '').toLowerCase();
-        const id = String(a.id || '').toLowerCase();
-        return email.includes(q) || sso.includes(q) || id.includes(q);
-      });
-    }
-    return list;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    accounts,
-    fullListMode,
-    needsFullList,
-    authEmails,
-    authSsoHashes,
-    accountSsoHashes,
-    authFilter,
-    aliveFilter,
-    ssoFilter,
-    ssoMap,
-    searchQuery
-  ]);
-
-  // Auth 筛选仅在全量模式有精确计数；分页模式显示 —
-  const convertedCount = useMemo(() => {
-    if (!fullListMode && !needsFullList) return 0;
-    return accounts.filter((a) => isAuthConverted(a)).length;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accounts, fullListMode, needsFullList, authEmails, authSsoHashes, accountSsoHashes]);
+  // 服务端分页：accounts 已是当前页（含 auth 筛选）
+  const filteredAccounts = accounts;
+  const poolTotal = facets.all || listTotal || accounts.length;
+  const convertedCount = facets.authConverted ?? 0;
   const unconvertedCount =
-    fullListMode || needsFullList ? Math.max(0, accounts.length - convertedCount) : 0;
+    facets.authUnconverted ?? Math.max(0, poolTotal - convertedCount);
 
   const uncheckedCount = facets.unchecked;
   const aliveOnlyCount = facets.alive;
   const deadOnlyCount = facets.dead;
 
-  // 服务端分页：当前页即 pageAccounts；Auth 全量：本地 slice
-  const serverPaged = !needsFullList && !fullListMode;
+  // 始终服务端分页（Auth 也已服务端筛选）
+  const serverPaged = !fullListMode;
   const totalForPager = serverPaged ? listTotal : filteredAccounts.length;
   const totalPages = serverPaged
     ? Math.max(1, listTotalPages)
     : Math.max(1, Math.ceil(totalForPager / pageSize) || 1);
-  const currentPage = serverPaged
-    ? Math.min(page, totalPages)
-    : Math.min(page, totalPages);
+  const currentPage = Math.min(page, totalPages);
   const pageStart = (currentPage - 1) * pageSize;
   const pageAccounts = serverPaged
     ? accounts
@@ -600,7 +555,6 @@ export function PoolPage() {
   const ssoCount = facets.hasSso;
   const noSsoCount = facets.noSso;
   const aliveCount = aliveOnlyCount;
-  const poolTotal = facets.all || listTotal || accounts.length;
 
   const allSelected =
     !serverPaged &&
@@ -710,11 +664,12 @@ export function PoolPage() {
     createdAt?: string;
   };
 
-  /** 当前筛选参数（与服务端 match/paged 一致；Auth 筛选不在服务端） */
+  /** 当前筛选参数（与服务端 match/paged 一致） */
   const filterQuery = () => ({
     q: searchQuery.trim() || undefined,
     sso: ssoFilter === 'all' ? undefined : ssoFilter,
-    alive: aliveFilter === 'all' ? undefined : aliveFilter
+    alive: aliveFilter === 'all' ? undefined : aliveFilter,
+    auth: authFilter === 'all' ? undefined : authFilter
   });
 
   /**
@@ -771,6 +726,7 @@ export function PoolPage() {
           q?: string;
           sso?: string;
           alive?: string;
+          auth?: string;
           limit?: number;
           requireSso?: boolean;
         }) => Promise<{
@@ -1219,7 +1175,7 @@ export function PoolPage() {
                 {hasActiveFilter
                   ? ` · 筛选 ${totalForPager}/${poolTotal}`
                   : ` · 共 ${poolTotal}`}
-                {serverPaged ? ' · 服务端分页' : needsFullList ? ' · 全量(Auth筛选)' : ''}
+                {serverPaged ? ' · 服务端分页' : fullListMode ? ' · 全量' : ''}
                 {lastRefresh ? ` · 刷新于 ${fmtBeijingTime(lastRefresh)}` : ''}
               </p>
             </div>
@@ -1294,18 +1250,14 @@ export function PoolPage() {
                 {
                   id: 'unconverted',
                   label: '未转',
-                  count: needsFullList || fullListMode ? unconvertedCount : undefined,
-                  title: needsFullList || fullListMode
-                    ? '尚未转 Auth'
-                    : '需选此筛选项后全量匹配（分页模式无精确计数）'
+                  count: unconvertedCount,
+                  title: '尚未转 Auth（服务端按 email/ssoHash 匹配）'
                 },
                 {
                   id: 'converted',
                   label: '已转',
-                  count: needsFullList || fullListMode ? convertedCount : undefined,
-                  title: needsFullList || fullListMode
-                    ? '已匹配 Auth（email 或 SSO 哈希）'
-                    : '需选此筛选项后全量匹配（分页模式无精确计数）'
+                  count: convertedCount,
+                  title: '已匹配 Auth（email 或 SSO 哈希）'
                 }
               ]}
             />

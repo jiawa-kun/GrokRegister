@@ -171,6 +171,7 @@ const webApi: RendererApi = {
     if (query?.q) qs.set('q', query.q);
     if (query?.sso) qs.set('sso', query.sso);
     if (query?.alive) qs.set('alive', query.alive);
+    if (query?.auth) qs.set('auth', query.auth);
     return http('GET', `/api/accounts?${qs.toString()}`);
   },
   matchAccounts: (query) => {
@@ -178,6 +179,7 @@ const webApi: RendererApi = {
     if (query?.q) qs.set('q', query.q);
     if (query?.sso) qs.set('sso', query.sso);
     if (query?.alive) qs.set('alive', query.alive);
+    if (query?.auth) qs.set('auth', query.auth);
     if (query?.limit != null) qs.set('limit', String(query.limit));
     if (query?.requireSso) qs.set('requireSso', '1');
     const q = qs.toString();

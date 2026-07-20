@@ -559,6 +559,7 @@ app.get('/api/accounts', asyncHandler(async (req, res) => {
   const q = typeof req.query.q === 'string' ? req.query.q : '';
   const sso = typeof req.query.sso === 'string' ? req.query.sso : '';
   const alive = typeof req.query.alive === 'string' ? req.query.alive : '';
+  const auth = typeof req.query.auth === 'string' ? req.query.auth : '';
   const pageRaw = req.query.page;
   const pageSizeRaw = req.query.pageSize ?? req.query.limit;
   const wantsPage =
@@ -579,19 +580,21 @@ app.get('/api/accounts', asyncHandler(async (req, res) => {
       pageSize,
       q,
       sso,
-      alive
+      alive,
+      auth
     })
   );
 }));
 
 /**
  * 按筛选返回匹配账号（筛后全部操作：验活/导出/补签）。
- * query: q, sso, alive, limit, requireSso=1
+ * query: q, sso, alive, auth, limit, requireSso=1
  */
 app.get('/api/accounts/match', asyncHandler(async (req, res) => {
   const q = typeof req.query.q === 'string' ? req.query.q : '';
   const sso = typeof req.query.sso === 'string' ? req.query.sso : '';
   const alive = typeof req.query.alive === 'string' ? req.query.alive : '';
+  const auth = typeof req.query.auth === 'string' ? req.query.auth : '';
   const limit = Number(req.query.limit || 500);
   const requireSso =
     String(req.query.requireSso || '') === '1' ||
@@ -601,6 +604,7 @@ app.get('/api/accounts/match', asyncHandler(async (req, res) => {
       q,
       sso,
       alive,
+      auth,
       limit,
       requireSso
     })

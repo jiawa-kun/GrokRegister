@@ -339,6 +339,7 @@ export interface RendererApi {
     q?: string;
     sso?: string;
     alive?: string;
+    auth?: string;
     limit?: number;
     requireSso?: boolean;
   }): Promise<{
@@ -361,6 +362,7 @@ export interface RendererApi {
     q?: string;
     sso?: string;
     alive?: string;
+    auth?: string;
   }): Promise<{
     items: AccountRecord[];
     total: number;
@@ -374,6 +376,8 @@ export interface RendererApi {
       unchecked: number;
       alive: number;
       dead: number;
+      authConverted?: number;
+      authUnconverted?: number;
     };
   }>;
   /** 注册失败分阶段看板 */

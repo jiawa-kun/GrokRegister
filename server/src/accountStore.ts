@@ -8,7 +8,7 @@
  */
 import { promises as fsp, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { AccountRecord, AccountSsoCheck } from '@shared/runEvents';
 import { dataDir } from './settingsStore.js';
 import {
@@ -444,6 +444,8 @@ export type AccountListQuery = {
   sso?: string;
   /** all | unchecked | alive | dead */
   alive?: string;
+  /** all | converted | unconverted — 与 Auth 目录 email/ssoHash 交叉 */
+  auth?: string;
 };
 
 export type AccountListFacets = {
@@ -454,7 +456,65 @@ export type AccountListFacets = {
   unchecked: number;
   alive: number;
   dead: number;
+  /** Auth 已转 / 未转（基于 email 或 sso hash） */
+  authConverted: number;
+  authUnconverted: number;
 };
+
+type AuthIndex = {
+  emails: Set<string>;
+  ssoHashes: Set<string>;
+};
+
+let authIndexCache: { at: number; index: AuthIndex } | null = null;
+const AUTH_INDEX_TTL_MS = 15_000;
+
+async function loadAuthIndex(): Promise<AuthIndex> {
+  const now = Date.now();
+  if (authIndexCache && now - authIndexCache.at < AUTH_INDEX_TTL_MS) {
+    return authIndexCache.index;
+  }
+  const emails = new Set<string>();
+  const ssoHashes = new Set<string>();
+  try {
+    const { listCpaAuth } = await import('./cpaAuthStore.js');
+    const { items } = await listCpaAuth();
+    for (const it of items || []) {
+      const e = String(it.email || '')
+        .trim()
+        .toLowerCase();
+      if (e) emails.add(e);
+      const h = String(it.ssoHash || '')
+        .trim()
+        .toLowerCase();
+      if (h) ssoHashes.add(h);
+    }
+  } catch {
+    /* auth 目录不可用时视为无已转 */
+  }
+  const index = { emails, ssoHashes };
+  authIndexCache = { at: now, index };
+  return index;
+}
+
+function isAuthConvertedAccount(
+  a: AccountRecord,
+  index: AuthIndex,
+  ssoHashOf: (sso: string) => string
+): boolean {
+  const e = String(a.email || '')
+    .trim()
+    .toLowerCase();
+  if (e && index.emails.has(e)) return true;
+  const sso = String(a.sso || '').trim();
+  if (!sso) return false;
+  try {
+    const h = ssoHashOf(sso).toLowerCase();
+    return Boolean(h && index.ssoHashes.has(h));
+  } catch {
+    return false;
+  }
+}
 
 export type AccountListPage = {
   items: AccountRecord[];
@@ -467,7 +527,14 @@ export type AccountListPage = {
   facets: AccountListFacets;
 };
 
-function matchAccountQuery(a: AccountRecord, opts: AccountListQuery): boolean {
+function matchAccountQuery(
+  a: AccountRecord,
+  opts: AccountListQuery,
+  ctx?: {
+    authIndex?: AuthIndex;
+    ssoHashOf?: (sso: string) => string;
+  }
+): boolean {
   const ssoMode = String(opts.sso || 'all').trim().toLowerCase();
   const hasSso = Boolean(String(a.sso || '').trim());
   if (ssoMode === 'has_sso' && !hasSso) return false;
@@ -482,6 +549,17 @@ function matchAccountQuery(a: AccountRecord, opts: AccountListQuery): boolean {
     if (!a.ssoCheck || a.ssoCheck.alive !== false) return false;
   }
 
+  const authMode = String(opts.auth || 'all').trim().toLowerCase();
+  if (authMode === 'converted' || authMode === 'unconverted') {
+    const idx = ctx?.authIndex;
+    const hashOf = ctx?.ssoHashOf;
+    if (idx && hashOf) {
+      const conv = isAuthConvertedAccount(a, idx, hashOf);
+      if (authMode === 'converted' && !conv) return false;
+      if (authMode === 'unconverted' && conv) return false;
+    }
+  }
+
   const q = String(opts.q || '').trim().toLowerCase();
   if (q) {
     const email = String(a.email || '').toLowerCase();
@@ -492,17 +570,25 @@ function matchAccountQuery(a: AccountRecord, opts: AccountListQuery): boolean {
   return true;
 }
 
-function buildFacets(all: AccountRecord[]): AccountListFacets {
+function buildFacets(
+  all: AccountRecord[],
+  authIndex?: AuthIndex,
+  ssoHashOf?: (sso: string) => string
+): AccountListFacets {
   let hasSso = 0;
   let unchecked = 0;
   let alive = 0;
   let dead = 0;
+  let authConverted = 0;
   for (const a of all) {
     if (String(a.sso || '').trim()) hasSso++;
     const c = a.ssoCheck;
     if (!c || typeof c.alive !== 'boolean') unchecked++;
     else if (c.alive) alive++;
     else dead++;
+    if (authIndex && ssoHashOf && isAuthConvertedAccount(a, authIndex, ssoHashOf)) {
+      authConverted++;
+    }
   }
   return {
     all: all.length,
@@ -510,7 +596,9 @@ function buildFacets(all: AccountRecord[]): AccountListFacets {
     noSso: all.length - hasSso,
     unchecked,
     alive,
-    dead
+    dead,
+    authConverted,
+    authUnconverted: Math.max(0, all.length - authConverted)
   };
 }
 
@@ -518,8 +606,19 @@ function buildFacets(all: AccountRecord[]): AccountListFacets {
 export async function queryAccounts(opts: AccountListQuery = {}): Promise<AccountListPage> {
   return withAccountsLock(async () => {
     const all = await loadAccountsWithTags();
-    const facets = buildFacets(all);
-    const filtered = all.filter((a) => matchAccountQuery(a, opts));
+    const authIndex = await loadAuthIndex();
+    let ssoHashOf = (sso: string) =>
+      createHash('sha256').update(String(sso || '').trim(), 'utf8').digest('hex');
+    try {
+      const { hashSsoToken } = await import('./cpaAuthStore.js');
+      ssoHashOf = (sso: string) => hashSsoToken(sso) || '';
+    } catch {
+      /* fallback sha256 above */
+    }
+    const facets = buildFacets(all, authIndex, ssoHashOf);
+    const filtered = all.filter((a) =>
+      matchAccountQuery(a, opts, { authIndex, ssoHashOf })
+    );
     // 单页上限与前端 PaginationBar 对齐（最大 2000）；默认 20
     const pageSize = Math.min(2000, Math.max(1, Math.floor(Number(opts.pageSize) || 20)));
     const total = filtered.length;
@@ -567,7 +666,18 @@ export type AccountMatchResult = {
 export async function matchAccounts(opts: AccountMatchQuery = {}): Promise<AccountMatchResult> {
   return withAccountsLock(async () => {
     const all = await loadAccountsWithTags();
-    let filtered = all.filter((a) => matchAccountQuery(a, opts));
+    const authIndex = await loadAuthIndex();
+    let ssoHashOf = (sso: string) =>
+      createHash('sha256').update(String(sso || '').trim(), 'utf8').digest('hex');
+    try {
+      const { hashSsoToken } = await import('./cpaAuthStore.js');
+      ssoHashOf = (sso: string) => hashSsoToken(sso) || '';
+    } catch {
+      /* fallback */
+    }
+    let filtered = all.filter((a) =>
+      matchAccountQuery(a, opts, { authIndex, ssoHashOf })
+    );
     if (opts.requireSso) {
       filtered = filtered.filter((a) => Boolean(String(a.sso || '').trim()));
     }
