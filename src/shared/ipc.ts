@@ -740,8 +740,26 @@ export interface RendererApi {
   parseSingBoxNodes(
     nodes: string
   ): Promise<{ nodes: SingBoxNodeSummary[]; parseable: number }>;
-  /** 按已保存配置启动/重载 sing-box */
-  startSingBox(): Promise<SingBoxStatus & { ok?: boolean; error?: string }>;
+  /** 拉取订阅 URL 并解析为节点分享链接（不写盘） */
+  importSingBoxSubscription(input: {
+    url: string;
+    mode?: 'replace' | 'append';
+    existing?: string;
+  }): Promise<{
+    ok: boolean;
+    url: string;
+    links: string[];
+    nodes: SingBoxNodeSummary[];
+    nodesText: string;
+    message: string;
+    error?: string;
+  }>;
+  /** 启动/重载 sing-box；force 时可用 draft 节点临时启用（未保存也可试） */
+  startSingBox(opts?: {
+    force?: boolean;
+    nodes?: string;
+    selected?: string;
+  }): Promise<SingBoxStatus & { ok?: boolean; error?: string; hint?: string }>;
   /** 停止 sing-box 进程 */
   stopSingBox(): Promise<SingBoxStatus & { ok?: boolean }>;
   /** 按 settings 同步启停 */

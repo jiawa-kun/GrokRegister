@@ -16,6 +16,8 @@ import {
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
+import https from 'node:https';
+import http from 'node:http';
 import type { AppSettings } from '@shared/settings';
 import { buildSingBoxLocalProxyUrl } from '@shared/settings';
 
@@ -299,16 +301,19 @@ function parseVlessOrTrojan(url: string, idx: number, kind: 'vless' | 'trojan'):
     };
     if (kind === 'vless') {
       outbound.uuid = user;
-      outbound.flow = params.flow || undefined;
-      outbound.packet_encoding = params.packetEncoding || undefined;
+      if (params.flow) outbound.flow = params.flow;
+      // packetEncoding / packet_encoding → sing-box packet_encoding
+      const pe = params.packetEncoding || params.packet_encoding || params['packet-encoding'];
+      if (pe) outbound.packet_encoding = pe;
     } else {
       outbound.password = user;
     }
     const security = (params.security || '').toLowerCase();
+    const sni = params.sni || params.peer || params.servername || host;
     if (security === 'tls' || security === 'reality') {
       const tls: Record<string, unknown> = {
         enabled: true,
-        server_name: params.sni || params.peer || host,
+        server_name: sni,
         insecure: params.allowInsecure === '1' || params.insecure === '1'
       };
       if (params.fp) tls.utls = { enabled: true, fingerprint: params.fp };
@@ -323,11 +328,14 @@ function parseVlessOrTrojan(url: string, idx: number, kind: 'vless' | 'trojan'):
       outbound.tls = tls;
     }
     const net = (params.type || params.network || 'tcp').toLowerCase();
+    // CF VLESS-WS：缺 host 时用 sni 作 Host（否则 Cloudflare 回 403）
+    const wsHost = params.host || params.Host || (net === 'ws' || net === 'http' ? sni : '');
+    const wsPath = params.path || '/';
     if (net === 'ws') {
       outbound.transport = {
         type: 'ws',
-        path: params.path || '/',
-        headers: params.host ? { Host: params.host } : undefined
+        path: wsPath,
+        headers: wsHost ? { Host: wsHost } : undefined
       };
     } else if (net === 'grpc') {
       outbound.transport = {
@@ -337,8 +345,8 @@ function parseVlessOrTrojan(url: string, idx: number, kind: 'vless' | 'trojan'):
     } else if (net === 'http') {
       outbound.transport = {
         type: 'http',
-        host: params.host ? [params.host] : undefined,
-        path: params.path || '/'
+        host: wsHost ? [wsHost] : undefined,
+        path: wsPath
       };
     }
     return {
@@ -476,11 +484,221 @@ function parseTuic(url: string, idx: number): ParsedNode | null {
   }
 }
 
+/**
+ * anytls://password@host:port?params#name
+ * 对齐 sing-box 1.13 outbound type=anytls（TLS 必选）。
+ * 常见 query: sni / peer / fp / insecure / allowInsecure / alpn
+ * 可选: idleSessionCheckInterval / idleSessionTimeout / minIdleSession
+ */
+function parseAnytls(url: string, idx: number): ParsedNode | null {
+  try {
+    let body = url.slice('anytls://'.length);
+    let name = '';
+    const hash = body.indexOf('#');
+    if (hash >= 0) {
+      name = decodeURIComponent(body.slice(hash + 1) || '');
+      body = body.slice(0, hash);
+    }
+    let query = '';
+    const q = body.indexOf('?');
+    if (q >= 0) {
+      query = body.slice(q + 1);
+      body = body.slice(0, q);
+    }
+    const at = body.lastIndexOf('@');
+    if (at < 0) return null;
+    const password = decodeURIComponent(body.slice(0, at));
+    const hostport = body.slice(at + 1);
+    const colon = hostport.lastIndexOf(':');
+    if (colon < 0) return null;
+    const host = hostport.slice(0, colon);
+    const port = Number(hostport.slice(colon + 1));
+    if (!host || !port || !password) return null;
+    const params = parseQuery(query);
+    const tag = safeTag('anytls', url, idx);
+    const sni = params.sni || params.peer || params.servername || host;
+    const tls: Record<string, unknown> = {
+      enabled: true,
+      server_name: sni,
+      insecure: params.allowInsecure === '1' || params.insecure === '1'
+    };
+    if (params.fp) tls.utls = { enabled: true, fingerprint: params.fp };
+    if (params.alpn) tls.alpn = String(params.alpn).split(',');
+    const outbound: Record<string, unknown> = {
+      type: 'anytls',
+      tag,
+      server: host,
+      server_port: port,
+      password,
+      tls
+    };
+    // 可选会话调优（时长字符串，如 30s；数值则当秒）
+    const idleCheck =
+      params.idleSessionCheckInterval ||
+      params.idle_session_check_interval ||
+      params['idle-session-check-interval'];
+    const idleTimeout =
+      params.idleSessionTimeout ||
+      params.idle_session_timeout ||
+      params['idle-session-timeout'];
+    const minIdle =
+      params.minIdleSession || params.min_idle_session || params['min-idle-session'];
+    if (idleCheck) outbound.idle_session_check_interval = idleCheck;
+    if (idleTimeout) outbound.idle_session_timeout = idleTimeout;
+    if (minIdle != null && minIdle !== '') {
+      const n = Number(minIdle);
+      outbound.min_idle_session = Number.isFinite(n) ? n : minIdle;
+    }
+    return {
+      tag,
+      name: name || `anytls ${host}:${port}`,
+      type: 'anytls',
+      server: host,
+      port,
+      raw: url,
+      outbound
+    };
+  } catch {
+    return null;
+  }
+}
+
+
+/**
+ * 上游 HTTP(S) / SOCKS 代理（sing-box outbound type=http|socks）。
+ * 支持：
+ *   http://host:port
+ *   http://user:pass@host:port
+ *   https://host:port          （TLS 到代理，outbound.tls.enabled）
+ *   socks:// / socks5:// / socks5h://host:port
+ *   socks4:// / socks4a://host:port
+ *   host:port                 （默认按 socks5）
+ *   user:pass@host:port
+ * 行尾 #备注 可选
+ */
+function parseHttpOrSocks(url: string, idx: number): ParsedNode | null {
+  try {
+    let raw = String(url || '').trim();
+    if (!raw) return null;
+    let name = '';
+    // fragment 备注（非标准但方便）
+    const hash = raw.indexOf('#');
+    if (hash >= 0) {
+      name = decodeURIComponent(raw.slice(hash + 1) || '');
+      raw = raw.slice(0, hash);
+    }
+
+    let scheme = '';
+    let rest = raw;
+    const lower = raw.toLowerCase();
+    if (lower.startsWith('https://')) {
+      scheme = 'https';
+      rest = raw.slice('https://'.length);
+    } else if (lower.startsWith('http://')) {
+      scheme = 'http';
+      rest = raw.slice('http://'.length);
+    } else if (lower.startsWith('socks5h://')) {
+      scheme = 'socks5';
+      rest = raw.slice('socks5h://'.length);
+    } else if (lower.startsWith('socks5://')) {
+      scheme = 'socks5';
+      rest = raw.slice('socks5://'.length);
+    } else if (lower.startsWith('socks4a://')) {
+      scheme = 'socks4';
+      rest = raw.slice('socks4a://'.length);
+    } else if (lower.startsWith('socks4://')) {
+      scheme = 'socks4';
+      rest = raw.slice('socks4://'.length);
+    } else if (lower.startsWith('socks://')) {
+      scheme = 'socks5';
+      rest = raw.slice('socks://'.length);
+    } else {
+      // bare host:port or user:pass@host:port → socks5
+      scheme = 'socks5';
+      rest = raw;
+    }
+
+    // 去掉 path（代理 URL 一般无 path；有则忽略）
+    const slash = rest.indexOf('/');
+    if (slash >= 0) rest = rest.slice(0, slash);
+
+    let username = '';
+    let password = '';
+    let hostport = rest;
+    const at = rest.lastIndexOf('@');
+    if (at >= 0) {
+      const userinfo = rest.slice(0, at);
+      hostport = rest.slice(at + 1);
+      const colon = userinfo.indexOf(':');
+      if (colon >= 0) {
+        username = decodeURIComponent(userinfo.slice(0, colon));
+        password = decodeURIComponent(userinfo.slice(colon + 1));
+      } else {
+        username = decodeURIComponent(userinfo);
+      }
+    }
+
+    // IPv6 [addr]:port
+    let host = '';
+    let port = 0;
+    if (hostport.startsWith('[')) {
+      const end = hostport.indexOf(']');
+      if (end < 0) return null;
+      host = hostport.slice(1, end);
+      const p = hostport.slice(end + 1);
+      if (!p.startsWith(':')) return null;
+      port = Number(p.slice(1));
+    } else {
+      const colon = hostport.lastIndexOf(':');
+      if (colon < 0) return null;
+      host = hostport.slice(0, colon).trim();
+      port = Number(hostport.slice(colon + 1));
+    }
+    if (!host || !Number.isFinite(port) || port <= 0 || port > 65535) return null;
+
+    // 排除误把订阅/网页 URL 当代理（有明确 path 的 http(s) 已在上方截断；再挡常见非代理口误填）
+    // 不拦截：用户确实可能用 80/443 的 HTTP 代理
+
+    const isHttp = scheme === 'http' || scheme === 'https';
+    const type = isHttp ? 'http' : 'socks';
+    const tag = safeTag(isHttp ? 'http' : scheme === 'socks4' ? 'socks4' : 'socks', raw, idx);
+    const outbound: Record<string, unknown> = {
+      type,
+      tag,
+      server: host,
+      server_port: port
+    };
+    if (username) outbound.username = username;
+    if (password) outbound.password = password;
+    // sing-box socks version: "4" | "5"（默认 5）
+    if (type === 'socks' && scheme === 'socks4') {
+      outbound.version = '4';
+    }
+    if (scheme === 'https') {
+      outbound.tls = { enabled: true, server_name: host };
+    }
+
+    const authHint = username ? ' · auth' : '';
+    return {
+      tag,
+      name: name || `${scheme} ${host}:${port}${authHint}`,
+      type,
+      server: host,
+      port,
+      raw: url,
+      outbound
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function parseSingBoxNodeLine(line: string, idx = 0): ParsedNode | null {
   const { url } = stripNodeComment(line);
   const u = url.trim();
   if (!u) return null;
   const lower = u.toLowerCase();
+  // 分享协议
   if (lower.startsWith('ss://')) return parseSs(u, idx);
   if (lower.startsWith('vmess://')) return parseVmess(u, idx);
   if (lower.startsWith('vless://')) return parseVlessOrTrojan(u, idx, 'vless');
@@ -488,6 +706,23 @@ export function parseSingBoxNodeLine(line: string, idx = 0): ParsedNode | null {
   if (lower.startsWith('hysteria2://') || lower.startsWith('hy2://'))
     return parseHysteria2(u, idx);
   if (lower.startsWith('tuic://')) return parseTuic(u, idx);
+  if (lower.startsWith('anytls://')) return parseAnytls(u, idx);
+  // 上游 HTTP / SOCKS 代理
+  if (
+    lower.startsWith('http://') ||
+    lower.startsWith('https://') ||
+    lower.startsWith('socks://') ||
+    lower.startsWith('socks4://') ||
+    lower.startsWith('socks4a://') ||
+    lower.startsWith('socks5://') ||
+    lower.startsWith('socks5h://')
+  ) {
+    return parseHttpOrSocks(u, idx);
+  }
+  // bare host:port / user:pass@host:port（默认 socks5）
+  if (/^(?:\S+@)?(?:\[[^\]]+\]|[^:\s/]+):\d{1,5}$/.test(u.split('#')[0].trim())) {
+    return parseHttpOrSocks(u, idx);
+  }
   return null;
 }
 
@@ -524,6 +759,752 @@ export function listSingBoxNodeSummaries(text: string): SingBoxNodeSummary[] {
     raw
   }));
 }
+
+
+/** 分享链接协议前缀（与 parseSingBoxNodeLine 一致） */
+const SHARE_LINK_RE =
+  /(?:^|[\s"'<>])((?:ss|vmess|vless|trojan|hysteria2|hy2|tuic|anytls|https?|socks5h?|socks4a?|socks):\/\/[^\s"'<>]+)/gi;
+
+function tryBase64Decode(raw: string): string | null {
+  let s = String(raw || '')
+    .trim()
+    // 去 BOM / 空白 / 换行
+    .replace(/^\uFEFF/, '')
+    .replace(/\s+/g, '');
+  if (!s || s.length < 8) return null;
+  // 标准 + URL-safe Base64
+  if (!/^[A-Za-z0-9+/_\-=]+$/.test(s)) return null;
+  // URL-safe → 标准
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = s.length % 4;
+  if (pad) s += '='.repeat(4 - pad);
+  try {
+    const buf = Buffer.from(s, 'base64');
+    if (!buf.length) return null;
+    const text = buf.toString('utf8');
+    // 解码后应多为可打印字符（分享链接或 YAML）
+    if (!/[\x09\x0a\x0d\x20-\x7e\u4e00-\u9fff]{8,}/.test(text)) return null;
+    return text;
+  } catch {
+    return null;
+  }
+}
+
+function extractShareLinksFromText(body: string): string[] {
+  const text = String(body || '');
+  const found: string[] = [];
+  const seen = new Set<string>();
+
+  // 1) 明文 / 解码后：逐行
+  for (const line of text.split(/\r?\n/)) {
+    const u = line.trim();
+    if (!u || u.startsWith('#')) continue;
+    // 行内可能带备注：scheme://...#name 或 scheme://... 空格备注
+    const m = u.match(
+      /^(ss|vmess|vless|trojan|hysteria2|hy2|tuic|anytls|https?|socks5h?|socks4a?|socks):\/\/\S+/i
+    );
+    if (m) {
+      const link = m[0].replace(/[),;]+$/, '');
+      const key = link.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        found.push(link);
+      }
+    }
+  }
+
+  // 2) 正则扫全文（YAML/JSON 嵌套）
+  SHARE_LINK_RE.lastIndex = 0;
+  let mm: RegExpExecArray | null;
+  while ((mm = SHARE_LINK_RE.exec(text)) !== null) {
+    const link = String(mm[1] || '').replace(/[),;]+$/, '');
+    const key = link.toLowerCase();
+    if (!seen.has(key) && parseSingBoxNodeLine(link, 0)) {
+      seen.add(key);
+      found.push(link);
+    }
+  }
+  return found;
+}
+
+/**
+ * Clash YAML proxies 列表 → 分享链接（无 yaml 依赖的轻量解析）。
+ * 支持 block 列表与 flow map：`- { name: a, type: ss, ... }`
+ */
+export function parseClashProxiesToShareLinks(yamlText: string): string[] {
+  const text = String(yamlText || '').replace(/^\uFEFF/, '');
+  if (!/^\s*proxies\s*:/m.test(text) && !/\nproxies\s*:/m.test(text)) {
+    // 有的文件顶层就是 proxies，有的夹在 config 里
+    if (!/type:\s*(ss|ssr|vmess|vless|trojan|hysteria2|hy2|tuic|anytls)\b/i.test(text)) {
+      return [];
+    }
+  }
+
+  const links: string[] = [];
+  const seen = new Set<string>();
+  const pushLink = (link: string | null) => {
+    if (!link) return;
+    const k = link.toLowerCase();
+    if (seen.has(k)) return;
+    if (!parseSingBoxNodeLine(link, 0)) return;
+    seen.add(k);
+    links.push(link);
+  };
+
+  // —— flow style: - { name: x, type: ss, ... }
+  const flowRe = /-\s*\{([^{}]+)\}/g;
+  let fm: RegExpExecArray | null;
+  while ((fm = flowRe.exec(text)) !== null) {
+    const obj = parseClashFlowMap(fm[1] || '');
+    if (obj) pushLink(clashProxyToShareLink(obj));
+  }
+
+  // —— block style under proxies:
+  // 支持嵌套 ws-opts.path / ws-opts.headers.Host（CF VLESS 必需）
+  const lines = text.split(/\r?\n/);
+  let inProxies = false;
+  let proxiesIndent = 0;
+  let cur: Record<string, string> | null = null;
+  let itemIndent = -1;
+  /** 0=item 字段, 1=ws-opts/opts, 2=headers under opts */
+  let nest = 0;
+  let nestIndent = -1;
+
+  const flush = () => {
+    if (cur && Object.keys(cur).length) pushLink(clashProxyToShareLink(cur));
+    cur = null;
+    itemIndent = -1;
+    nest = 0;
+    nestIndent = -1;
+  };
+
+  for (const rawLine of lines) {
+    if (!rawLine.trim() || /^\s*#/.test(rawLine)) continue;
+    const indent = rawLine.match(/^\s*/)?.[0].length ?? 0;
+    const trimmed = rawLine.trim();
+
+    if (/^proxies\s*:/.test(trimmed)) {
+      flush();
+      inProxies = true;
+      proxiesIndent = indent;
+      continue;
+    }
+
+    // 离开 proxies 段（同级或更外的新 key）
+    if (inProxies && indent <= proxiesIndent && !trimmed.startsWith('-') && /:\s*/.test(trimmed)) {
+      // 例如 proxy-groups: / rules:
+      if (!trimmed.startsWith('#')) {
+        flush();
+        inProxies = false;
+      }
+    }
+
+    if (!inProxies) {
+      // 无 proxies 头时：见到 list item 且含 type: 也尝试
+      if (/^-\s+/.test(trimmed) && /type\s*:/.test(text.slice(text.indexOf(rawLine), text.indexOf(rawLine) + 400))) {
+        // fallthrough only when whole file looks like proxy dump
+      } else {
+        continue;
+      }
+    }
+
+    // 新 list item
+    if (/^-\s+/.test(trimmed) || /^-\s*$/.test(trimmed)) {
+      flush();
+      cur = {};
+      itemIndent = indent;
+      nest = 0;
+      nestIndent = -1;
+      // `- { ... }` 已在 flow 处理；block: `- name: xx` 或 `-`
+      const rest = trimmed.replace(/^-\s*/, '');
+      if (rest.startsWith('{')) {
+        const inner = rest.replace(/^\{/, '').replace(/\}$/, '');
+        const obj = parseClashFlowMap(inner);
+        if (obj) {
+          pushLink(clashProxyToShareLink(obj));
+          cur = null;
+        }
+      } else if (rest.includes(':')) {
+        const { k, v } = splitYamlKv(rest);
+        if (k) applyClashProxyField(cur, k, v, 0);
+      }
+      continue;
+    }
+
+    // item / 嵌套字段
+    if (cur && itemIndent >= 0 && indent > itemIndent) {
+      // 回退嵌套层
+      if (nest > 0 && indent <= nestIndent) {
+        if (nest === 2) {
+          nest = 1;
+          nestIndent = itemIndent + 2;
+        } else {
+          nest = 0;
+          nestIndent = -1;
+        }
+        if (nest > 0 && indent <= nestIndent) {
+          nest = 0;
+          nestIndent = -1;
+        }
+      }
+      const { k, v } = splitYamlKv(trimmed);
+      if (!k) continue;
+      const kl = k.toLowerCase();
+      if (nest === 0 && (kl === 'ws-opts' || kl === 'opts' || kl === 'ws_opts')) {
+        nest = 1;
+        nestIndent = indent;
+        // 同行内联 map: ws-opts: { path: /, headers: { Host: x } }
+        if (v && v.includes(':')) {
+          const inline = parseClashFlowMap(v.replace(/^\{/, '').replace(/\}$/, ''));
+          if (inline) {
+            for (const [ik, iv] of Object.entries(inline)) {
+              applyClashProxyField(cur, ik, iv, 1);
+            }
+          }
+        }
+        continue;
+      }
+      if (nest === 1 && (kl === 'headers' || kl === 'header')) {
+        nest = 2;
+        nestIndent = indent;
+        if (v && v.includes(':')) {
+          const inline = parseClashFlowMap(v.replace(/^\{/, '').replace(/\}$/, ''));
+          if (inline) {
+            for (const [ik, iv] of Object.entries(inline)) {
+              applyClashProxyField(cur, ik, iv, 2);
+            }
+          }
+        }
+        continue;
+      }
+      applyClashProxyField(cur, k, v, nest);
+    }
+  }
+  flush();
+  return links;
+}
+
+/** 把 Clash 字段摊平到 proxy map（含嵌套 ws-opts 语义） */
+function applyClashProxyField(
+  cur: Record<string, string>,
+  k: string,
+  v: string,
+  nest: number
+): void {
+  const kl = k.toLowerCase();
+  if (nest === 2) {
+    // headers.Host → host
+    if (kl === 'host') {
+      cur.host = v;
+      return;
+    }
+    cur[`header-${kl}`] = v;
+    return;
+  }
+  if (nest === 1) {
+    if (kl === 'path') {
+      cur.path = v;
+      cur['ws-path'] = v;
+      return;
+    }
+    if (kl === 'host') {
+      cur.host = v;
+      return;
+    }
+    cur[kl] = v;
+    return;
+  }
+  // reality-opts 等扁平别名
+  if (kl === 'public-key' || kl === 'public_key') cur.pbk = v;
+  if (kl === 'short-id' || kl === 'short_id') cur.sid = v;
+  cur[kl] = v;
+}
+
+function splitYamlKv(line: string): { k: string; v: string } {
+  const m = line.match(/^([^:#]+):\s*(.*)$/);
+  if (!m) return { k: '', v: '' };
+  let v = (m[2] || '').trim();
+  // 去引号
+  if (
+    (v.startsWith('"') && v.endsWith('"')) ||
+    (v.startsWith("'") && v.endsWith("'"))
+  ) {
+    v = v.slice(1, -1);
+  }
+  return { k: m[1].trim().toLowerCase(), v };
+}
+
+function parseClashFlowMap(inner: string): Record<string, string> | null {
+  const obj: Record<string, string> = {};
+  // 简易逗号分割，忽略引号内逗号
+  let buf = '';
+  let q: '"' | "'" | null = null;
+  const parts: string[] = [];
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (q) {
+      buf += ch;
+      if (ch === q && inner[i - 1] !== '\\\\') q = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      q = ch;
+      buf += ch;
+      continue;
+    }
+    if (ch === ',') {
+      parts.push(buf.trim());
+      buf = '';
+      continue;
+    }
+    buf += ch;
+  }
+  if (buf.trim()) parts.push(buf.trim());
+  for (const p of parts) {
+    const { k, v } = splitYamlKv(p);
+    if (k) obj[k] = v;
+  }
+  return Object.keys(obj).length ? obj : null;
+}
+
+function clashProxyToShareLink(p: Record<string, string>): string | null {
+  const type = String(p.type || '').toLowerCase();
+  const server = String(p.server || p.servername || '').trim();
+  const port = String(p.port || '').trim();
+  const name = String(p.name || p.ps || `${server}:${port}`).trim() || 'node';
+  if (!server || !port) return null;
+
+  const q: string[] = [];
+  const add = (k: string, v: string | undefined) => {
+    if (v == null || v === '') return;
+    q.push(`${encodeURIComponent(k)}=${encodeURIComponent(v)}`);
+  };
+
+  if (type === 'ss' || type === 'shadowsocks') {
+    const method = p.cipher || p.method || 'aes-256-gcm';
+    const password = p.password || '';
+    if (!password) return null;
+    const userinfo = Buffer.from(`${method}:${password}`, 'utf8').toString('base64');
+    return `ss://${userinfo}@${server}:${port}#${encodeURIComponent(name)}`;
+  }
+
+  if (type === 'vmess') {
+    const uuid = p.uuid || p.id || '';
+    if (!uuid) return null;
+    const net = (p.network || p.net || 'tcp').toLowerCase();
+    const tls = String(p.tls || '').toLowerCase();
+    const obj: Record<string, unknown> = {
+      v: '2',
+      ps: name,
+      add: server,
+      port: Number(port) || port,
+      id: uuid,
+      aid: Number(p.alterid || p.alterId || p.aid || 0),
+      scy: p.cipher || p.security || 'auto',
+      net,
+      type: p.type_header || 'none',
+      host: p.host || p['ws-opts'] || '',
+      path: p.path || '/',
+      tls: tls === 'true' || tls === 'tls' ? 'tls' : '',
+      sni: p.sni || p.servername || p.host || ''
+    };
+    // ws path / host 常见字段
+    if (p['ws-path']) obj.path = p['ws-path'];
+    if (p['ws-headers-host']) obj.host = p['ws-headers-host'];
+    const b64 = Buffer.from(JSON.stringify(obj), 'utf8').toString('base64');
+    return `vmess://${b64}`;
+  }
+
+  if (type === 'vless') {
+    const uuid = p.uuid || p.id || '';
+    if (!uuid) return null;
+    const network = (p.network || p.net || 'tcp').toLowerCase();
+    const sni = p.sni || p.servername || p['server-name'] || '';
+    // CF / 机场常见：tls 布尔 或 security: tls|reality
+    let security = String(p.security || '').toLowerCase();
+    if (!security || security === 'none') {
+      if (p.tls === 'true' || p.tls === 'tls' || p.tls === '1') security = 'tls';
+      else if (p.reality === 'true' || p['reality-opts'] || p.pbk) security = 'reality';
+      else security = 'none';
+    }
+    const host =
+      p.host ||
+      p['ws-headers-host'] ||
+      p['header-host'] ||
+      (network === 'ws' || network === 'http' ? sni : '') ||
+      '';
+    const path =
+      p.path ||
+      p['ws-path'] ||
+      (network === 'ws' || network === 'http' || network === 'grpc' ? '/' : '');
+    add('encryption', p.encryption || 'none');
+    add('type', network);
+    add('security', security);
+    add('sni', sni || host);
+    if (path) add('path', path);
+    if (host) add('host', host);
+    add('fp', p['client-fingerprint'] || p.fp || p.fingerprint);
+    add('flow', p.flow);
+    add('serviceName', p['grpc-service-name'] || p.servicename || p['service-name']);
+    add('pbk', p.pbk || p['public-key'] || p.public_key);
+    add('sid', p.sid || p['short-id'] || p.short_id);
+    // 多数现代 VLESS 订阅带 xudp；有则保留，无则 ws 默认 xudp
+    const pe =
+      p.packetencoding ||
+      p['packet-encoding'] ||
+      p.packet_encoding ||
+      p.packetEncoding ||
+      (network === 'ws' ? 'xudp' : '');
+    add('packetEncoding', pe);
+    const qs = q.length ? `?${q.join('&')}` : '';
+    // uuid 保持原样（勿过度 encode，兼容客户端）
+    return `vless://${uuid}@${server}:${port}${qs}#${encodeURIComponent(name)}`;
+  }
+
+  if (type === 'trojan') {
+    const password = p.password || '';
+    if (!password) return null;
+    const network = (p.network || 'tcp').toLowerCase();
+    const sni = p.sni || p.servername || p['server-name'] || '';
+    const host =
+      p.host ||
+      p['ws-headers-host'] ||
+      p['header-host'] ||
+      (network === 'ws' || network === 'http' ? sni : '') ||
+      '';
+    const path = p.path || p['ws-path'] || (network === 'ws' || network === 'http' ? '/' : '');
+    add('type', network);
+    add('security', 'tls');
+    add('sni', sni || host);
+    if (path) add('path', path);
+    if (host) add('host', host);
+    add('fp', p['client-fingerprint'] || p.fp || p.fingerprint);
+    const qs = q.length ? `?${q.join('&')}` : '';
+    return `trojan://${encodeURIComponent(password)}@${server}:${port}${qs}#${encodeURIComponent(name)}`;
+  }
+
+  if (type === 'hysteria2' || type === 'hy2') {
+    const password = p.password || p.auth || '';
+    if (!password) return null;
+    add('sni', p.sni || p.servername);
+    add('insecure', p['skip-cert-verify'] === 'true' ? '1' : undefined);
+    add('obfs', p.obfs);
+    add('obfs-password', p['obfs-password'] || p.obfsPassword);
+    const qs = q.length ? `?${q.join('&')}` : '';
+    return `hysteria2://${encodeURIComponent(password)}@${server}:${port}${qs}#${encodeURIComponent(name)}`;
+  }
+
+  if (type === 'tuic') {
+    const uuid = p.uuid || '';
+    const password = p.password || '';
+    if (!uuid) return null;
+    add('sni', p.sni || p.servername);
+    add('congestion_control', p['congestion-controller'] || p.congestion_control);
+    add('udp_relay_mode', p['udp-relay-mode']);
+    add('alpn', p.alpn);
+    const qs = q.length ? `?${q.join('&')}` : '';
+    const user = password ? `${uuid}:${password}` : uuid;
+    return `tuic://${encodeURIComponent(user)}@${server}:${port}${qs}#${encodeURIComponent(name)}`;
+  }
+
+  if (type === 'anytls') {
+    const password = p.password || p.pass || '';
+    if (!password) return null;
+    const sni = p.sni || p.servername || p['server-name'] || '';
+    add('sni', sni);
+    add('fp', p['client-fingerprint'] || p.fp || p.fingerprint);
+    add('alpn', p.alpn);
+    if (p['skip-cert-verify'] === 'true' || p.insecure === 'true' || p.insecure === '1') {
+      add('insecure', '1');
+    }
+    add(
+      'idleSessionCheckInterval',
+      p['idle-session-check-interval'] || p.idle_session_check_interval
+    );
+    add(
+      'idleSessionTimeout',
+      p['idle-session-timeout'] || p.idle_session_timeout
+    );
+    add('minIdleSession', p['min-idle-session'] || p.min_idle_session);
+    const qs = q.length ? `?${q.join('&')}` : '';
+    return `anytls://${encodeURIComponent(password)}@${server}:${port}${qs}#${encodeURIComponent(name)}`;
+  }
+
+  if (type === 'http' || type === 'https') {
+    const user = p.username || p.user || '';
+    const pass = p.password || p.pass || '';
+    const auth =
+      user && pass
+        ? `${encodeURIComponent(user)}:${encodeURIComponent(pass)}@`
+        : user
+          ? `${encodeURIComponent(user)}@`
+          : '';
+    const sch = type === 'https' || p.tls === 'true' ? 'https' : 'http';
+    return `${sch}://${auth}${server}:${port}#${encodeURIComponent(name)}`;
+  }
+
+  if (type === 'socks' || type === 'socks5' || type === 'socks4') {
+    const user = p.username || p.user || '';
+    const pass = p.password || p.pass || '';
+    const auth =
+      user && pass
+        ? `${encodeURIComponent(user)}:${encodeURIComponent(pass)}@`
+        : user
+          ? `${encodeURIComponent(user)}@`
+          : '';
+    const sch =
+      type === 'socks4' || p.version === '4' || p.version === 'socks4'
+        ? 'socks4'
+        : 'socks5';
+    return `${sch}://${auth}${server}:${port}#${encodeURIComponent(name)}`;
+  }
+
+  return null;
+}
+
+function expandSubscriptionBody(raw: string): string[] {
+  const body0 = String(raw || '').replace(/^\uFEFF/, '').trim();
+  if (!body0) return [];
+
+  const merge = (into: string[], extra: string[]) => {
+    for (const x of extra) {
+      if (!into.includes(x)) into.push(x);
+    }
+    return into;
+  };
+
+  // 1) 明文分享链接
+  let links = extractShareLinksFromText(body0);
+  if (links.length > 0) return links;
+
+  // 2) Clash YAML proxies（明文）
+  links = merge(links, parseClashProxiesToShareLinks(body0));
+  if (links.length > 0) return links;
+
+  // 3) 整包 Base64（标准 / URL-safe）→ 再抽链接或 Clash
+  const decoded = tryBase64Decode(body0);
+  if (decoded) {
+    links = merge(links, extractShareLinksFromText(decoded));
+    if (links.length > 0) return links;
+    links = merge(links, parseClashProxiesToShareLinks(decoded));
+    if (links.length > 0) return links;
+  }
+
+  // 4) 多行各自可能是 Base64 段
+  for (const line of body0.split(/\r?\n/)) {
+    const d = tryBase64Decode(line.trim());
+    if (!d) continue;
+    links = merge(links, extractShareLinksFromText(d));
+    links = merge(links, parseClashProxiesToShareLinks(d));
+  }
+  return links;
+}
+
+function httpGetText(url: string, timeoutMs = 25000): Promise<string> {
+  return new Promise((resolvePromise, reject) => {
+    let settled = false;
+    const done = (err: Error | null, text?: string) => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err);
+      else resolvePromise(text || '');
+    };
+    try {
+      const u = new URL(url);
+      const lib = u.protocol === 'http:' ? http : https;
+      const req = lib.request(
+        u,
+        {
+          method: 'GET',
+          timeout: timeoutMs,
+          headers: {
+            // 部分订阅站按 UA 分流；用常见 Clash 客户端标识提高兼容
+            'User-Agent':
+              'clash-meta/1.18.0 GrokRegisterAgent/1.0 (+subscription-import)',
+            Accept: 'text/plain,application/octet-stream,*/*'
+          }
+        },
+        (res) => {
+          const code = res.statusCode || 0;
+          // 简单跟随 1 次重定向
+          if (
+            code >= 300 &&
+            code < 400 &&
+            res.headers.location &&
+            typeof res.headers.location === 'string'
+          ) {
+            const next = new URL(res.headers.location, u).toString();
+            res.resume();
+            httpGetText(next, timeoutMs).then(
+              (t) => done(null, t),
+              (e) => done(e instanceof Error ? e : new Error(String(e)))
+            );
+            return;
+          }
+          const chunks: Buffer[] = [];
+          res.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+          res.on('end', () => {
+            const buf = Buffer.concat(chunks);
+            if (code < 200 || code >= 300) {
+              done(
+                new Error(
+                  `HTTP ${code}: ${buf.toString('utf8').slice(0, 120) || 'empty'}`
+                )
+              );
+              return;
+            }
+            done(null, buf.toString('utf8'));
+          });
+        }
+      );
+      req.on('error', (e) => done(e));
+      req.on('timeout', () => {
+        req.destroy();
+        done(new Error(`timeout ${timeoutMs}ms`));
+      });
+      req.end();
+    } catch (e) {
+      done(e instanceof Error ? e : new Error(String(e)));
+    }
+  });
+}
+
+export type SubscriptionImportResult = {
+  ok: boolean;
+  url: string;
+  /** 抽到的分享链接（可 parse） */
+  links: string[];
+  /** 可被 sing-box 解析的节点摘要 */
+  nodes: SingBoxNodeSummary[];
+  /** 合并后的节点文本（每行一条） */
+  nodesText: string;
+  message: string;
+  error?: string;
+};
+
+/**
+ * 拉取订阅 URL → 解码/抽取分享链接 → 用现有 parse 校验。
+ * 说明：官方 sing-box 内核不提供「订阅 URL 命令」；订阅解析由客户端完成，
+ * 本函数即客户端侧解析，再交给本仓库的节点列表 / 配置生成。
+ */
+export async function fetchSubscriptionLinks(
+  urlRaw: string,
+  opts?: { timeoutMs?: number; existingText?: string; mode?: 'replace' | 'append' }
+): Promise<SubscriptionImportResult> {
+  const url = String(urlRaw || '').trim();
+  const mode = opts?.mode === 'append' ? 'append' : 'replace';
+  if (!url) {
+    return {
+      ok: false,
+      url: '',
+      links: [],
+      nodes: [],
+      nodesText: '',
+      message: '请填写订阅链接',
+      error: 'empty url'
+    };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return {
+      ok: false,
+      url,
+      links: [],
+      nodes: [],
+      nodesText: '',
+      message: '订阅地址不是合法 URL',
+      error: 'invalid url'
+    };
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return {
+      ok: false,
+      url,
+      links: [],
+      nodes: [],
+      nodesText: '',
+      message: '仅支持 http(s) 订阅地址',
+      error: 'bad protocol'
+    };
+  }
+
+  let body: string;
+  try {
+    body = await httpGetText(url, opts?.timeoutMs ?? 25000);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      ok: false,
+      url,
+      links: [],
+      nodes: [],
+      nodesText: '',
+      message: `拉取订阅失败: ${msg}`,
+      error: msg
+    };
+  }
+
+  const links = expandSubscriptionBody(body);
+  if (links.length === 0) {
+    return {
+      ok: false,
+      url,
+      links: [],
+      nodes: [],
+      nodesText: '',
+      message:
+        '未解析到节点：支持 Base64 分享列表、明文链接、Clash YAML proxies（ss/vmess/vless/trojan/hysteria2/tuic/anytls）；加密订阅或不支持的类型会失败',
+      error: 'no share links'
+    };
+  }
+
+  // 校验：只保留 parse 成功的
+  const good: string[] = [];
+  for (let i = 0; i < links.length; i++) {
+    if (parseSingBoxNodeLine(links[i], i)) good.push(links[i]);
+  }
+  if (good.length === 0) {
+    return {
+      ok: false,
+      url,
+      links,
+      nodes: [],
+      nodesText: '',
+      message: `抽到 ${links.length} 条链接但均无法解析为节点`,
+      error: 'parse fail'
+    };
+  }
+
+  let nodesText = good.join('\n');
+  if (mode === 'append') {
+    const prev = String(opts?.existingText || '')
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const set = new Set(prev.map((l) => l.toLowerCase()));
+    const merged = [...prev];
+    for (const g of good) {
+      if (!set.has(g.toLowerCase())) {
+        set.add(g.toLowerCase());
+        merged.push(g);
+      }
+    }
+    nodesText = merged.join('\n');
+  }
+
+  const nodes = listSingBoxNodeSummaries(nodesText);
+  return {
+    ok: true,
+    url,
+    links: good,
+    nodes,
+    nodesText,
+    message: `已解析 ${good.length} 条节点` + (mode === 'append' ? '（追加去重）' : '（替换列表）')
+  };
+}
+
 
 /** 固定本地端口（不对用户开放） */
 export const SING_BOX_FIXED_PORT = 2080;
@@ -744,7 +1725,7 @@ export async function syncSingBoxFromSettings(
     excludeTags: opts.rotate ? demotedTags : undefined
   });
   if (!node) {
-    lastError = '没有可解析的节点（支持 ss/vmess/vless/trojan/hysteria2/tuic 分享链接）';
+    lastError = '没有可解析的节点（支持 ss/vmess/vless/trojan/hysteria2/tuic/anytls 分享链接，以及 http/https/socks4/socks5 代理）';
     await stopSingBox();
     return getSingBoxStatus(settings);
   }

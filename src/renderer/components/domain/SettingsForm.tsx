@@ -64,6 +64,9 @@ function normalizeSettingsDraft(raw: AppSettings | null | undefined): AppSetting
     cfProxyEnabled: false,
     singBoxEnabled: !!r.singBoxEnabled,
     singBoxNodes: String(r.singBoxNodes ?? DEFAULT_SETTINGS.singBoxNodes),
+    singBoxSubscriptionUrl: String(
+      r.singBoxSubscriptionUrl ?? DEFAULT_SETTINGS.singBoxSubscriptionUrl ?? ''
+    ),
     singBoxSelected: String(
       r.singBoxSelected || DEFAULT_SETTINGS.singBoxSelected || '__random__'
     ),
@@ -225,6 +228,9 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
   const [sbParsedNodes, setSbParsedNodes] = useState<
     { tag: string; name: string; type: string; server: string; port: number }[]
   >([]);
+  /** 订阅 URL 解析导入（URL 落在 draft.singBoxSubscriptionUrl，随配置保存） */
+  const [sbSubBusy, setSbSubBusy] = useState(false);
+  const [sbSubMsg, setSbSubMsg] = useState<string | null>(null);
 
   useEffect(() => {
     if (data && !draft) {
@@ -340,6 +346,39 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
     setDraft((prev) => (prev ? { ...prev, ...partial } : prev));
 
   /** 仅 Sing-Box / 直连；强制关闭已移除的 CF / 普通代理 */
+  const importSbSubscription = async () => {
+    const url = String(draft?.singBoxSubscriptionUrl || '').trim();
+    if (!url) {
+      setSbSubMsg('请先填写订阅链接');
+      return;
+    }
+    if (typeof window.api?.importSingBoxSubscription !== 'function') {
+      setSbSubMsg('当前环境不支持订阅解析');
+      return;
+    }
+    setSbSubBusy(true);
+    setSbSubMsg(null);
+    try {
+      const r = await window.api.importSingBoxSubscription({
+        url,
+        mode: 'replace',
+        existing: draft?.singBoxNodes || ''
+      });
+      if (!r?.ok) {
+        setSbSubMsg(r?.message || r?.error || '解析失败');
+        return;
+      }
+      // 写入节点列表；URL 已在 draft
+      update('singBoxNodes', r.nodesText || '');
+      setSbSubMsg(r.message || `已导入 ${(r.nodes || []).length} 个节点`);
+      void refreshSbStatus();
+    } catch (err) {
+      setSbSubMsg(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSbSubBusy(false);
+    }
+  };
+
   const setProxyMode = (mode: 'off' | 'singbox') => {
     if (mode === 'singbox') {
       patch({
@@ -363,9 +402,14 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
     setSbBusy(true);
     try {
       const api = window.api;
+      // 启动：带上当前表单节点；若未保存开关也 force 临时启用
       const r =
         action === 'start'
-          ? await api.startSingBox()
+          ? await api.startSingBox({
+              force: true,
+              nodes: draft?.singBoxNodes || '',
+              selected: draft?.singBoxSelected || ''
+            })
           : action === 'stop'
             ? await api.stopSingBox()
             : await api.syncSingBox();
@@ -381,7 +425,8 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
           title: 'sing-box 运行中',
           description:
             (r.localUrl || `http://127.0.0.1:${r.port}`) +
-            (r.selectedName ? ` · ${r.selectedName}` : '')
+            (r.selectedName ? ` · ${r.selectedName}` : '') +
+            ((r as { hint?: string }).hint ? ` · ${(r as { hint?: string }).hint}` : '')
         });
       }
     } catch (err) {
@@ -737,7 +782,7 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
                     Sing-Box 内核
                   </div>
                   <p className="mt-0.5 text-[11px] leading-4 text-muted-foreground">
-                    粘贴 ss/vmess/vless/trojan/hysteria2/tuic 等节点链接
+                    分享链接或 http/https/socks4/socks5 代理；也可订阅解析导入
                   </p>
                 </div>
                 <div className="flex shrink-0 flex-wrap items-center gap-1.5">
@@ -795,15 +840,59 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
               </div>
 
               <Field
+                label="订阅链接"
+                hint="http(s) 订阅：支持 Base64 / 明文分享链接 / Clash YAML"
+              >
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <Input
+                    value={draft.singBoxSubscriptionUrl || ''}
+                    onChange={(e) => update('singBoxSubscriptionUrl', e.target.value)}
+                    placeholder="https://example.com/api/v1/client/subscribe?token=..."
+                    className="font-mono text-[13px]"
+                    spellCheck={false}
+                  />
+                  <div className="flex shrink-0 flex-wrap gap-1.5">
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="h-9"
+                      disabled={
+                        sbSubBusy || !String(draft.singBoxSubscriptionUrl || '').trim()
+                      }
+                      onClick={() => void importSbSubscription()}
+                      title="拉取订阅并替换当前节点列表"
+                    >
+                      {sbSubBusy ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : null}
+                      解析
+                    </Button>
+                  </div>
+                </div>
+                {sbSubMsg && (
+                  <p
+                    className={cn(
+                      'mt-1.5 text-[11px] leading-4',
+                      sbSubMsg.includes('失败') || sbSubMsg.includes('未')
+                        ? 'text-danger'
+                        : 'text-muted-foreground'
+                    )}
+                  >
+                    {sbSubMsg}
+                  </p>
+                )}
+              </Field>
+
+              <Field
                 label="节点列表"
-                hint="每行一个节点链接；解析成功后可选下拉。注册随机 / 失败自动换节点"
+                hint="每行一条：ss/vmess/vless/trojan/hy2/tuic/anytls，或 http(s):// / socks5:// / socks4:// / host:port"
                 error={errors.singBoxNodes}
               >
                 <textarea
                   className={cn(TEXTAREA_CLASS, 'min-h-[120px] font-mono text-[13px]')}
                   value={draft.singBoxNodes || ''}
                   onChange={(e) => update('singBoxNodes', e.target.value)}
-                  placeholder="vless://...  ss://...  vmess://...  #备注可写行尾"
+                  placeholder="vless://...  socks5://127.0.0.1:1080  http://user:pass@host:8080"
                   spellCheck={false}
                 />
               </Field>

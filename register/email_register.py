@@ -713,11 +713,14 @@ def fetch_emails(jwt: str, limit: int = 20, email: str = "") -> List[Dict[str, A
             params["address"] = email
         paths = [("/messages", params)]
     elif provider == "duckmail":
-        headers = {"Authorization": f"Bearer {jwt}", "Accept": "application/json"}
-        # mail.tm GET /messages -> hydra:member
+        # DuckMail ≈ mail.tm：Bearer 账号 token；列表 hydra:member；详情 /messages/{id}
+        headers = {
+            "Authorization": f"Bearer {jwt}",
+            "Accept": "application/json, application/ld+json",
+        }
         paths = [
             ("/messages", {"page": 1}),
-            ("/messages", {"limit": limit}),
+            ("/messages", {}),
         ]
     else:
         headers = {"Authorization": f"Bearer {jwt}", "Accept": "application/json"}
@@ -791,7 +794,10 @@ def fetch_email_detail(jwt: str, msg_id: Any, email: str = "") -> Optional[Dict]
         if email:
             params["address"] = email
     elif provider == "duckmail":
-        headers = {"Authorization": f"Bearer {jwt}", "Accept": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {jwt}",
+            "Accept": "application/json, application/ld+json",
+        }
         paths = [f"/messages/{msg_id}"]
     else:
         headers = {"Authorization": f"Bearer {jwt}", "Accept": "application/json"}
@@ -819,67 +825,111 @@ def fetch_email_detail(jwt: str, msg_id: Any, email: str = "") -> Optional[Dict]
     return None
 
 
+def _message_body_text(msg: Dict[str, Any]) -> str:
+    """从单封邮件 dict 抽出可用于 OTP 匹配的正文（兼容 mail.tm / DuckMail / CF）。"""
+    if not isinstance(msg, dict):
+        return ""
+    parts: List[str] = []
+    for key in ("raw", "text", "html", "body", "bodyText", "bodyHtml", "content"):
+        v = msg.get(key)
+        if v is None or v == "":
+            continue
+        if isinstance(v, list):
+            parts.append("\n".join(str(x) for x in v if x is not None))
+        elif isinstance(v, dict):
+            # 少数实现把 text/html 再包一层
+            for sk in ("text", "html", "body", "value", "content"):
+                if v.get(sk):
+                    parts.append(str(v.get(sk)))
+        else:
+            parts.append(str(v))
+    return "\n".join(p for p in parts if p).strip()
+
+
 def wait_for_verification_code(jwt: str, timeout: int = 120, email: str = "") -> Optional[str]:
-    """轮询等待验证码邮件"""
+    """
+    轮询等待验证码邮件。
+
+    DuckMail / mail.tm：GET /messages 列表通常只有 subject + intro（摘要），
+    完整正文在 GET /messages/{id}。绝不能把 intro 当成全文后永久 seen，否则 OTP 永远提不出来。
+    """
     start = time.time()
-    seen_ids = set()
+    # 已成功拉过详情且仍无码的 id（每轮仍可重试详情，避免首封正文延迟）
+    detail_tried: set = set()
+    last_list_n = 0
 
     try:
         poll_interval = max(0.5, float(_conf.get("mail_poll_interval", 1)))
     except (TypeError, ValueError):
         poll_interval = 1
 
+    provider = _mail_provider()
+    # mail.tm 兼容：列表几乎必有 intro，必须强制拉详情
+    force_detail = provider in ("duckmail", "yyds")
+
     while time.time() - start < timeout:
         messages = fetch_emails(jwt, email=email or "")
+        last_list_n = len(messages) if isinstance(messages, list) else 0
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
             msg_id = msg.get("id")
-            if msg_id is None or msg_id in seen_ids:
+            if msg_id is None:
                 continue
 
-            # 列表接口通常已带正文；不够时再请求详情。
-            # 仅在成功提取验证码后才标记 seen，避免详情失败导致永不重试
-            content = (
-                msg.get("raw")
-                or msg.get("text")
-                or msg.get("html")
-                or msg.get("body")
-                or msg.get("bodyPreview")
-                or msg.get("intro")
-                or ""
-            )
-            if isinstance(content, list):
-                content = "\n".join(str(x) for x in content)
-            if not content:
-                detail = fetch_email_detail(jwt, msg_id, email=email or "")
-                if not detail:
-                    continue
-                content = (
-                    detail.get("raw")
-                    or detail.get("text")
-                    or detail.get("html")
-                    or detail.get("body")
-                    or detail.get("bodyPreview")
-                    or ""
-                )
-                if isinstance(content, list):
-                    content = "\n".join(str(x) for x in content)
+            full = _message_body_text(msg)
+            preview = str(msg.get("bodyPreview") or msg.get("intro") or "").strip()
+            subject = str(msg.get("subject") or "").strip()
 
-            # 把 subject 也并进来，方便 6 位数字模式匹配
-            subject = msg.get("subject") or ""
+            # DuckMail/YYDS 列表常只有 intro，必须拉详情；仅有摘要时不永久 seen
+            need_detail = force_detail or (not full)
+            content = full
+            if need_detail and msg_id not in detail_tried:
+                detail = fetch_email_detail(jwt, msg_id, email=email or "")
+                detail_tried.add(msg_id)
+                if detail:
+                    d_full = _message_body_text(detail)
+                    if d_full:
+                        content = d_full
+                    if not subject:
+                        subject = str(detail.get("subject") or "").strip()
+            elif need_detail and msg_id in detail_tried:
+                # 再试一次详情（邮件可能后到/延迟写库）
+                detail = fetch_email_detail(jwt, msg_id, email=email or "")
+                if detail:
+                    d_full = _message_body_text(detail)
+                    if d_full:
+                        content = d_full
+                    if not subject:
+                        subject = str(detail.get("subject") or "").strip()
+
+            if not content and preview:
+                content = preview
+
             if subject:
                 content = f"Subject: {subject}\n{content}"
 
             code = extract_verification_code(content)
             if code:
-                seen_ids.add(msg_id)
                 print(f"[*] 提取到验证码: {code}")
                 return code
-            # 有正文但提不出码：才标记，避免同信空转
-            if content and str(content).strip():
-                seen_ids.add(msg_id)
+            # 仅当已有实质正文且提不出码时，本轮跳过该 id 的空转
+            # （Duck 详情未到齐时不要永久跳过）
+            if content and str(content).strip() and not need_detail:
+                pass
         time.sleep(poll_interval)
+
+    if last_list_n:
+        print(
+            f"[Warn] 验证码超时：收件箱有 {last_list_n} 封邮件但未能提取 OTP"
+            f"（provider={provider}，已尝试详情 {len(detail_tried)} 封）",
+            flush=True,
+        )
+    else:
+        print(
+            f"[Warn] 验证码超时：收件箱仍为空（provider={provider}，{timeout}s）",
+            flush=True,
+        )
     return None
 
 
