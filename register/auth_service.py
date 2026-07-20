@@ -54,6 +54,15 @@ def _noop(msg: str) -> None:
     return None
 
 
+def _mark_auth_cpa_push_ok(path: str | Path) -> None:
+    try:
+        from account_tags import patch_auth_file_push
+
+        patch_auth_file_push(path, channel="auth_cpa", ok=True)
+    except Exception:
+        pass
+
+
 def _read_cpa_mint_mode() -> str:
     """从环境 / config.json 读 cpa_mint_mode：pkce|device|double。"""
     env = (
@@ -459,6 +468,7 @@ def _write_and_probe_one(
             try:
                 name = upload_cpa_auth_remote(r_url, r_key, payload)
                 log(f"[auth] channel={channel} CPA 远程推送 OK → {name}")
+                _mark_auth_cpa_push_ok(path)
                 remote_result = {"ok": True, "url": r_url, "name": name}
             except Exception as e:
                 log(f"[auth] channel={channel} CPA 远程推送失败: {e}")
@@ -1057,6 +1067,8 @@ def resign_auth_file(
                 out["referrer_warn"] = "missing referrer claim"
             if push_remote:
                 out["remote"] = _try_push_remote(new_payload, log=log)
+                if isinstance(out.get("remote"), dict) and out["remote"].get("ok"):
+                    _mark_auth_cpa_push_ok(p)
             return out
         log(f"[auth] mode=refresh failed, fallback sso if any: {token}")
 

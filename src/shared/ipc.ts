@@ -17,6 +17,9 @@ export interface RegisterJobSummary {
   total: number;
   success: number;
   failed: number;
+  planASuccess: number;
+  planBSuccess: number;
+  planCSuccess: number;
   errorMessage: string | null;
   focused: boolean;
 }

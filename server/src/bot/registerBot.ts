@@ -49,6 +49,9 @@ export interface RegisterJobSummary {
   total: number;
   success: number;
   failed: number;
+  planASuccess: number;
+  planBSuccess: number;
+  planCSuccess: number;
   errorMessage: string | null;
   focused: boolean;
 }
@@ -77,6 +80,15 @@ const HARD_MAX_PARALLEL = 8;
 
 function isActivePhase(phase: RunPhase): boolean {
   return phase === 'starting' || phase === 'running';
+}
+
+type SuccessPlan = 'a' | 'b' | 'c';
+
+function normalizeSuccessPlan(input?: string | null): SuccessPlan {
+  const s = String(input || '').trim().toLowerCase();
+  if (s === 'c' || s === 'plan_c' || s === 'plan-c' || /plan\s*c/.test(s)) return 'c';
+  if (s === 'b' || s === 'plan_b' || s === 'plan-b' || /plan\s*b/.test(s)) return 'b';
+  return 'a';
 }
 
 /**
@@ -209,6 +221,9 @@ export class RegisterBot extends EventEmitter {
         total: j.status.total,
         success: j.status.success,
         failed: j.status.failed,
+        planASuccess: Number(j.status.planASuccess) || 0,
+        planBSuccess: Number(j.status.planBSuccess) || 0,
+        planCSuccess: Number(j.status.planCSuccess) || 0,
         errorMessage: j.status.errorMessage,
         focused: j.runId === focus || (!focus && j === this.resolveFocusJob())
       }))
@@ -395,7 +410,16 @@ export class RegisterBot extends EventEmitter {
             const failed = job?.status.failed ?? 0;
             const total = job?.status.total ?? 0;
             if (total > 0 || success > 0 || failed > 0) {
-              out.push({ type: 'success', runId: rid, success, failed, total });
+              out.push({
+                type: 'success',
+                runId: rid,
+                success,
+                failed,
+                total,
+                planASuccess: Number(job?.status.planASuccess) || 0,
+                planBSuccess: Number(job?.status.planBSuccess) || 0,
+                planCSuccess: Number(job?.status.planCSuccess) || 0
+              });
             }
             finalSnapshotEmitted.add(rid);
           }
@@ -433,6 +457,16 @@ export class RegisterBot extends EventEmitter {
       this.replayBuffer.splice(0, this.replayBuffer.length - RegisterBot.REPLAY_LIMIT);
     }
     this.emit('event', ev);
+  }
+
+  private bumpPlanSuccess(job: Job, plan: SuccessPlan) {
+    if (plan === 'c') {
+      job.status.planCSuccess = (Number(job.status.planCSuccess) || 0) + 1;
+    } else if (plan === 'b') {
+      job.status.planBSuccess = (Number(job.status.planBSuccess) || 0) + 1;
+    } else {
+      job.status.planASuccess = (Number(job.status.planASuccess) || 0) + 1;
+    }
   }
 
   private log(runId: string, text: string, level: LogLevel = 'info') {
@@ -886,11 +920,35 @@ export class RegisterBot extends EventEmitter {
         const password = String(payload.password || '').trim();
         if (email) job.pendingAccount.email = email;
         if (password) job.pendingAccount.password = password;
-        if (Number.isFinite(round) && round > 0) job.countedResultRounds.add(round);
+        const hasRound = Number.isFinite(round) && round > 0;
+        const shouldCountPlan = !hasRound || !job.countedResultRounds.has(round);
+        if (hasRound) job.countedResultRounds.add(round);
         job.status.success = success;
         job.status.failed = failed;
         job.status.total = nextTotal;
-        this.push({ type: 'success', runId, success, failed, total: nextTotal });
+        const pa = Number(payload.planASuccess);
+        const pb = Number(payload.planBSuccess);
+        const pc = Number(payload.planCSuccess);
+        const hasPlanTotals = Number.isFinite(pa) || Number.isFinite(pb) || Number.isFinite(pc);
+        const plan = normalizeSuccessPlan(payload.plan);
+        if (hasPlanTotals) {
+          if (Number.isFinite(pa)) job.status.planASuccess = pa;
+          if (Number.isFinite(pb)) job.status.planBSuccess = pb;
+          if (Number.isFinite(pc)) job.status.planCSuccess = pc;
+        } else if (shouldCountPlan) {
+          this.bumpPlanSuccess(job, plan);
+        }
+        this.push({
+          type: 'success',
+          runId,
+          success,
+          failed,
+          total: nextTotal,
+          plan,
+          planASuccess: Number(job.status.planASuccess) || 0,
+          planBSuccess: Number(job.status.planBSuccess) || 0,
+          planCSuccess: Number(job.status.planCSuccess) || 0
+        });
         this.recordAccount(job, {
           email,
           password,
@@ -991,12 +1049,18 @@ export class RegisterBot extends EventEmitter {
       if (!round || !job.countedResultRounds.has(round)) {
         if (round) job.countedResultRounds.add(round);
         job.status.success++;
+        const plan = normalizeSuccessPlan(msg);
+        this.bumpPlanSuccess(job, plan);
         this.push({
           type: 'success',
           runId,
           success: job.status.success,
           failed: job.status.failed,
-          total
+          total,
+          plan,
+          planASuccess: Number(job.status.planASuccess) || 0,
+          planBSuccess: Number(job.status.planBSuccess) || 0,
+          planCSuccess: Number(job.status.planCSuccess) || 0
         });
         this.recordAccount(job);
       }

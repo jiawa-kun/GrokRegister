@@ -60,6 +60,11 @@ function isActive(phase: string) {
   return phase === 'starting' || phase === 'running';
 }
 
+function finiteNumber(v: unknown): number | undefined {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 function upsertJob(
   jobs: RegisterJobSummary[],
   patch: Partial<RegisterJobSummary> & { runId: string }
@@ -76,6 +81,9 @@ function upsertJob(
       total: patch.total ?? 0,
       success: patch.success ?? 0,
       failed: patch.failed ?? 0,
+      planASuccess: patch.planASuccess ?? 0,
+      planBSuccess: patch.planBSuccess ?? 0,
+      planCSuccess: patch.planCSuccess ?? 0,
       errorMessage: patch.errorMessage ?? null,
       focused: patch.focused ?? false
     };
@@ -164,6 +172,9 @@ export const useRunStore = create<RunState>((set) => ({
             total: event.total,
             success: 0,
             failed: 0,
+            planASuccess: 0,
+            planBSuccess: 0,
+            planCSuccess: 0,
             current: 0,
             focused: true
           });
@@ -215,33 +226,73 @@ export const useRunStore = create<RunState>((set) => ({
           });
           break;
         case 'success':
-          if (isTerminalJob(event.runId)) {
-            // 终态：只允许抬高计数（防乱序），绝不改 phase
-            const j = existingJob(event.runId)!;
-            const success = Math.max(j.success, event.success);
-            const failed = Math.max(j.failed, event.failed);
-            const total = Math.max(j.total, event.total);
-            touchJob({ runId: event.runId, success, failed, total });
-            if (!focus || event.runId === focus || event.runId === status.runId) {
-              status = { ...status, success, failed, total };
+          {
+            const pa = finiteNumber(event.planASuccess);
+            const pb = finiteNumber(event.planBSuccess);
+            const pc = finiteNumber(event.planCSuccess);
+            if (isTerminalJob(event.runId)) {
+              // 终态：只允许抬高计数（防乱序），绝不改 phase
+              const j = existingJob(event.runId)!;
+              const success = Math.max(j.success, event.success);
+              const failed = Math.max(j.failed, event.failed);
+              const total = Math.max(j.total, event.total);
+              const planASuccess =
+                pa !== undefined ? Math.max(Number(j.planASuccess) || 0, pa) : Number(j.planASuccess) || 0;
+              const planBSuccess =
+                pb !== undefined ? Math.max(Number(j.planBSuccess) || 0, pb) : Number(j.planBSuccess) || 0;
+              const planCSuccess =
+                pc !== undefined ? Math.max(Number(j.planCSuccess) || 0, pc) : Number(j.planCSuccess) || 0;
+              touchJob({
+                runId: event.runId,
+                success,
+                failed,
+                total,
+                planASuccess,
+                planBSuccess,
+                planCSuccess
+              });
+              if (!focus || event.runId === focus || event.runId === status.runId) {
+                status = {
+                  ...status,
+                  success,
+                  failed,
+                  total,
+                  planASuccess: Math.max(Number(status.planASuccess) || 0, planASuccess),
+                  planBSuccess: Math.max(Number(status.planBSuccess) || 0, planBSuccess),
+                  planCSuccess: Math.max(Number(status.planCSuccess) || 0, planCSuccess)
+                };
+              }
+              break;
             }
-            break;
-          }
-          if (!focus || event.runId === focus || event.runId === status.runId) {
-            status = {
-              ...status,
+            const currentJob = existingJob(event.runId);
+            const planASuccess =
+              pa ?? currentJob?.planASuccess ?? status.planASuccess ?? 0;
+            const planBSuccess =
+              pb ?? currentJob?.planBSuccess ?? status.planBSuccess ?? 0;
+            const planCSuccess =
+              pc ?? currentJob?.planCSuccess ?? status.planCSuccess ?? 0;
+            if (!focus || event.runId === focus || event.runId === status.runId) {
+              status = {
+                ...status,
+                success: event.success,
+                failed: event.failed,
+                total: event.total,
+                planASuccess,
+                planBSuccess,
+                planCSuccess
+              };
+            }
+            touchJob({
+              runId: event.runId,
               success: event.success,
               failed: event.failed,
-              total: event.total
-            };
+              total: event.total,
+              planASuccess,
+              planBSuccess,
+              planCSuccess
+            });
+            break;
           }
-          touchJob({
-            runId: event.runId,
-            success: event.success,
-            failed: event.failed,
-            total: event.total
-          });
-          break;
         case 'failed':
           if (isTerminalJob(event.runId)) {
             const j = existingJob(event.runId)!;

@@ -28,6 +28,10 @@ export interface RunStatus {
   success: number;
   /** 注册失败数 */
   failed: number;
+  /** 当前任务中 Plan A/B/C 成功次数 */
+  planASuccess: number;
+  planBSuccess: number;
+  planCSuccess: number;
   /** 错误摘要，仅 phase==='error' 时有值 */
   errorMessage: string | null;
 }
@@ -102,6 +106,9 @@ export interface StructuredRunEvent {
   password?: string;
   sso?: string;
   plan?: string;
+  planASuccess?: number;
+  planBSuccess?: number;
+  planCSuccess?: number;
   round?: number;
   message?: string;
   ts?: number;
@@ -123,7 +130,17 @@ export type RunEvent =
   | { type: 'stdout'; runId: string; level: LogLevel; text: string; ts: number }
   | { type: 'stderr'; runId: string; text: string; ts: number }
   | { type: 'progress'; runId: string; current: number; total: number }
-  | { type: 'success'; runId: string; success: number; failed: number; total: number }
+  | {
+      type: 'success';
+      runId: string;
+      success: number;
+      failed: number;
+      total: number;
+      plan?: 'a' | 'b' | 'c';
+      planASuccess?: number;
+      planBSuccess?: number;
+      planCSuccess?: number;
+    }
   | {
       type: 'failed';
       runId: string;
@@ -178,5 +195,8 @@ export const EMPTY_STATUS: RunStatus = {
   total: 0,
   success: 0,
   failed: 0,
+  planASuccess: 0,
+  planBSuccess: 0,
+  planCSuccess: 0,
   errorMessage: null
 };
