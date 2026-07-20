@@ -27,10 +27,12 @@ import { BotFlagBadge } from '@renderer/components/domain/BotFlagBadge';
 import { NsfwBadge } from '@renderer/components/domain/NsfwBadge';
 import {
   DEFAULT_PAGE_SIZE,
+  isPageSize,
   loadStoredPageSize,
   type PageSize
 } from '@renderer/components/ui/PaginationBar';
 import { useAccountsStore } from '@renderer/store/accountsStore';
+import { getQuery, getQueryInt, oneOf, patchQuery } from '@renderer/lib/urlQuery';
 import { useSettingsStore } from '@renderer/store/settingsStore';
 import { useRunStore } from '@renderer/store/runStore';
 import { useToastStore } from '@renderer/store/toastStore';
@@ -60,6 +62,8 @@ type AliveFilter = 'all' | 'unchecked' | 'alive' | 'dead';
 type SsoFilter = 'all' | 'has_sso' | 'no_sso';
 
 function loadAuthFilter(): AuthFilter {
+  const fromUrl = oneOf(getQuery('auth'), ['all', 'unconverted', 'converted'] as const, '' as AuthFilter | '');
+  if (fromUrl) return fromUrl;
   try {
     const v = localStorage.getItem(AUTH_FILTER_KEY);
     if (v === 'unconverted' || v === 'converted' || v === 'all') return v;
@@ -70,6 +74,12 @@ function loadAuthFilter(): AuthFilter {
 }
 
 function loadAliveFilter(): AliveFilter {
+  const fromUrl = oneOf(
+    getQuery('alive'),
+    ['all', 'unchecked', 'alive', 'dead'] as const,
+    '' as AliveFilter | ''
+  );
+  if (fromUrl) return fromUrl;
   try {
     const v = localStorage.getItem(ALIVE_FILTER_KEY);
     if (v === 'unchecked' || v === 'alive' || v === 'dead' || v === 'all') return v;
@@ -80,6 +90,8 @@ function loadAliveFilter(): AliveFilter {
 }
 
 function loadSsoFilter(): SsoFilter {
+  const fromUrl = oneOf(getQuery('sso'), ['all', 'has_sso', 'no_sso'] as const, '' as SsoFilter | '');
+  if (fromUrl) return fromUrl;
   try {
     const v = localStorage.getItem(SSO_FILTER_KEY);
     if (v === 'has_sso' || v === 'no_sso' || v === 'all') return v;
@@ -143,10 +155,12 @@ export function PoolPage() {
   const push = useToastStore((s) => s.push);
   const settings = useSettingsStore((s) => s.data);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState<PageSize>(() =>
-    loadStoredPageSize(PAGE_SIZE_KEY, DEFAULT_PAGE_SIZE)
-  );
+  const [page, setPage] = useState(() => getQueryInt('page', 1));
+  const [pageSize, setPageSize] = useState<PageSize>(() => {
+    const fromUrl = Number(getQuery('ps'));
+    if (isPageSize(fromUrl)) return fromUrl;
+    return loadStoredPageSize(PAGE_SIZE_KEY, DEFAULT_PAGE_SIZE);
+  });
   const [verifying, setVerifying] = useState(false);
   const [pushingG2a, setPushingG2a] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -200,7 +214,23 @@ export function PoolPage() {
   const [authFilter, setAuthFilter] = useState<AuthFilter>(() => loadAuthFilter());
   const [aliveFilter, setAliveFilter] = useState<AliveFilter>(() => loadAliveFilter());
   const [ssoFilter, setSsoFilter] = useState<SsoFilter>(() => loadSsoFilter());
-  const [searchQuery, setSearchQuery] = useState('');
+  const [searchQuery, setSearchQuery] = useState(() => getQuery('q'));
+
+  // 筛选/页码同步到 URL（刷新可恢复）；切到号池时清 Auth 专用 key
+  useEffect(() => {
+    patchQuery({
+      tab: 'pool',
+      page: page > 1 ? page : null,
+      ps: pageSize !== DEFAULT_PAGE_SIZE ? pageSize : null,
+      q: searchQuery.trim() || null,
+      sso: ssoFilter === 'all' ? null : ssoFilter,
+      alive: aliveFilter === 'all' ? null : aliveFilter,
+      auth: authFilter === 'all' ? null : authFilter,
+      meta: null,
+      status: null,
+      push: null
+    });
+  }, [page, pageSize, searchQuery, ssoFilter, aliveFilter, authFilter]);
 
   const reloadAuthEmails = async () => {
     try {

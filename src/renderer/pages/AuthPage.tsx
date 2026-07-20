@@ -22,6 +22,7 @@ import { FilterBar, FilterSegmentGroup } from '@renderer/components/ui/FilterSeg
 import { Switch } from '@renderer/components/ui/Switch';
 import {
   DEFAULT_PAGE_SIZE,
+  isPageSize,
   loadStoredPageSize,
   PaginationBar,
   type PageSize
@@ -35,6 +36,7 @@ import type { CpaAuthItem } from '@shared/ipc';
 import type { ReloginStage } from '@shared/runEvents';
 import { cn } from '@renderer/lib/cn';
 import { setWebApiAbortSignal } from '@renderer/lib/webApi';
+import { getQuery, getQueryInt, oneOf, patchQuery } from '@renderer/lib/urlQuery';
 import {
   loadEmailPrivacyMask,
   maskEmail,
@@ -135,6 +137,12 @@ type PushFilter =
   | 's2a_fail';
 
 function loadMetaFilter(): MetaFilter {
+  const fromUrl = oneOf(
+    getQuery('meta'),
+    ['all', 'no_sso', 'no_email', 'need_fill'] as const,
+    '' as MetaFilter | ''
+  );
+  if (fromUrl) return fromUrl;
   try {
     const v = localStorage.getItem(META_FILTER_KEY);
     if (v === 'no_sso' || v === 'no_email' || v === 'need_fill' || v === 'all') return v;
@@ -145,6 +153,12 @@ function loadMetaFilter(): MetaFilter {
 }
 
 function loadStatusFilter(): StatusFilter {
+  const fromUrl = oneOf(
+    getQuery('status'),
+    ['all', 'unprobed', '200', '401', '403', 'other_err'] as const,
+    '' as StatusFilter | ''
+  );
+  if (fromUrl) return fromUrl;
   try {
     const v = localStorage.getItem(STATUS_FILTER_KEY);
     if (
@@ -164,6 +178,12 @@ function loadStatusFilter(): StatusFilter {
 }
 
 function loadPushFilter(): PushFilter {
+  const fromUrl = oneOf(
+    getQuery('push'),
+    ['all', 'cpa_none', 'cpa_ok', 'cpa_fail', 's2a_none', 's2a_ok', 's2a_fail'] as const,
+    '' as PushFilter | ''
+  );
+  if (fromUrl) return fromUrl;
   try {
     const v = localStorage.getItem(PUSH_FILTER_KEY);
     if (
@@ -338,11 +358,30 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   const [metaFilter, setMetaFilter] = useState<MetaFilter>(() => loadMetaFilter());
   const [statusFilter, setStatusFilter] = useState<StatusFilter>(() => loadStatusFilter());
   const [pushFilter, setPushFilter] = useState<PushFilter>(() => loadPushFilter());
-  const [searchQuery, setSearchQuery] = useState('');
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState<PageSize>(() =>
-    loadStoredPageSize(PAGE_SIZE_KEY, DEFAULT_PAGE_SIZE)
-  );
+  const [searchQuery, setSearchQuery] = useState(() => getQuery('q'));
+  const [page, setPage] = useState(() => getQueryInt('page', 1));
+  const [pageSize, setPageSize] = useState<PageSize>(() => {
+    const fromUrl = Number(getQuery('ps'));
+    if (isPageSize(fromUrl)) return fromUrl;
+    return loadStoredPageSize(PAGE_SIZE_KEY, DEFAULT_PAGE_SIZE);
+  });
+
+  // 筛选/页码同步到 URL
+  useEffect(() => {
+    patchQuery({
+      tab: 'auth',
+      page: page > 1 ? page : null,
+      ps: pageSize !== DEFAULT_PAGE_SIZE ? pageSize : null,
+      q: searchQuery.trim() || null,
+      meta: metaFilter === 'all' ? null : metaFilter,
+      status: statusFilter === 'all' ? null : statusFilter,
+      push: pushFilter === 'all' ? null : pushFilter,
+      // 清掉号池专用 key，避免串页
+      sso: null,
+      alive: null,
+      auth: null
+    });
+  }, [page, pageSize, searchQuery, metaFilter, statusFilter, pushFilter]);
   const [listTotal, setListTotal] = useState(0);
   const [listTotalPages, setListTotalPages] = useState(1);
   const [facets, setFacets] = useState<{

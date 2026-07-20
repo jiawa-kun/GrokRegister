@@ -23,6 +23,7 @@ import { Button } from '@renderer/components/ui/Button';
 import { Input } from '@renderer/components/ui/Input';
 import { PasswordInput } from '@renderer/components/ui/PasswordInput';
 import { cn } from '@renderer/lib/cn';
+import { getQuery, oneOf, patchQuery } from '@renderer/lib/urlQuery';
 import { useRunStore } from '@renderer/store/runStore';
 import { useSettingsStore } from '@renderer/store/settingsStore';
 import { useAccountsStore } from '@renderer/store/accountsStore';
@@ -37,6 +38,7 @@ import type {
 } from '@shared/ipc';
 
 type Tab = 'register' | 'pool' | 'auth' | 'settings';
+const TAB_IDS = ['register', 'pool', 'auth', 'settings'] as const;
 
 const tabs: {
   id: Tab;
@@ -56,9 +58,45 @@ const emptyAuth: AuthState = {
 };
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>('register');
+  const [tab, setTab] = useState<Tab>(() =>
+    oneOf(getQuery('tab'), TAB_IDS, 'register')
+  );
   /** 仅手机端侧栏抽屉；lg+ 忽略 */
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+
+  // 顶层 tab 写入 URL；离开号池/Auth 时清掉对应筛选 key
+  useEffect(() => {
+    if (tab === 'pool') {
+      patchQuery({
+        tab: 'pool',
+        meta: null,
+        status: null,
+        push: null
+      });
+      return;
+    }
+    if (tab === 'auth') {
+      patchQuery({
+        tab: 'auth',
+        sso: null,
+        alive: null,
+        auth: null
+      });
+      return;
+    }
+    patchQuery({
+      tab: tab === 'register' ? null : tab,
+      page: null,
+      ps: null,
+      q: null,
+      sso: null,
+      alive: null,
+      auth: null,
+      meta: null,
+      status: null,
+      push: null
+    });
+  }, [tab]);
   const [auth, setAuth] = useState<AuthState>(emptyAuth);
   const [authLoading, setAuthLoading] = useState(true);
   const pushToast = useToastStore((s) => s.push);
