@@ -1764,20 +1764,55 @@ export async function pushSub2apiAuthRemoteBatch(input: {
           });
           continue;
         }
-        const url = `${base}/api/v1/admin/accounts`;
-        // 优先直连，失败再走代理（内网 sub2api 避免被 Sing-Box 劫持）
+        // 有则更新、无则新增（按 name/email 查找）
         const proxy = resolveHttpProxy(settings);
-        const res = await requestWithProxyFallback(url, {
-          method: 'POST',
-          headers: {
-            ...sub2apiAdminAuthHeaders(token),
-            'Content-Type': 'application/json'
-          },
-          body,
-          proxy,
-          timeoutMs: 30000
-        });
         const email = String(data.email || body.name || '');
+        const nameKey = String(body.name || email || '').trim();
+        let pushMode: string = 'uploaded';
+        let res: { status: number; data?: unknown };
+        const existingId = nameKey
+          ? await findSub2apiAccountIdByName(base, token, nameKey, proxy)
+          : null;
+        if (existingId) {
+          const putUrl = `${base}/api/v1/admin/accounts/${encodeURIComponent(existingId)}`;
+          res = await requestWithProxyFallback(putUrl, {
+            method: 'PUT',
+            headers: {
+              ...sub2apiAdminAuthHeaders(token),
+              'Content-Type': 'application/json'
+            },
+            body,
+            proxy,
+            timeoutMs: 30000
+          });
+          // 部分版本只支持 PATCH
+          if (res.status === 404 || res.status === 405) {
+            res = await requestWithProxyFallback(putUrl, {
+              method: 'PATCH',
+              headers: {
+                ...sub2apiAdminAuthHeaders(token),
+                'Content-Type': 'application/json'
+              },
+              body,
+              proxy,
+              timeoutMs: 30000
+            });
+          }
+          pushMode = 'reuploaded';
+        } else {
+          const url = `${base}/api/v1/admin/accounts`;
+          res = await requestWithProxyFallback(url, {
+            method: 'POST',
+            headers: {
+              ...sub2apiAdminAuthHeaders(token),
+              'Content-Type': 'application/json'
+            },
+            body,
+            proxy,
+            timeoutMs: 30000
+          });
+          pushMode = 'uploaded';
+        }
         const respBody =
           typeof res.data === 'string'
             ? res.data
@@ -1839,7 +1874,7 @@ export async function pushSub2apiAuthRemoteBatch(input: {
             ok: true,
             remoteOk: true,
             remoteName: String(body.name || ''),
-            mode: force ? 'reuploaded' : 'uploaded'
+            mode: pushMode
           });
         }
       } catch (err) {
@@ -1883,6 +1918,56 @@ export async function pushSub2apiAuthRemoteBatch(input: {
     modeCounts,
     results
   };
+}
+
+/** 按 name 查找 sub2api 远端账号 id（用于有则更新） */
+async function findSub2apiAccountIdByName(
+  base: string,
+  token: string,
+  name: string,
+  proxy: string | undefined
+): Promise<string | null> {
+  const n = String(name || '').trim();
+  if (!n) return null;
+  try {
+    const url = `${base}/api/v1/admin/accounts?page=1&page_size=50&search=${encodeURIComponent(n)}`;
+    const res = await requestWithProxyFallback(url, {
+      method: 'GET',
+      headers: sub2apiAdminAuthHeaders(token),
+      proxy,
+      timeoutMs: 15000
+    });
+    if (res.status < 200 || res.status >= 300) return null;
+    const data = res.data as {
+      code?: unknown;
+      data?: unknown;
+      items?: unknown;
+    } | null;
+    if (data && typeof data === 'object' && data.code != null && Number(data.code) !== 0) {
+      return null;
+    }
+    let items: unknown[] = [];
+    const inner = data && typeof data === 'object' ? data.data : null;
+    if (Array.isArray(inner)) items = inner;
+    else if (inner && typeof inner === 'object') {
+      const o = inner as Record<string, unknown>;
+      items = (o.items || o.list || o.accounts || []) as unknown[];
+    } else if (data && typeof data === 'object' && Array.isArray(data.items)) {
+      items = data.items;
+    }
+    const nLc = n.toLowerCase();
+    for (const it of items) {
+      if (!it || typeof it !== 'object') continue;
+      const row = it as Record<string, unknown>;
+      const nm = String(row.name || '').trim();
+      if (nm.toLowerCase() !== nLc) continue;
+      const id = row.id ?? row.account_id ?? row.accountId;
+      if (id != null && String(id).trim()) return String(id).trim();
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 /**

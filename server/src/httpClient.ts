@@ -12,7 +12,7 @@ export interface ProxiedResponse {
 }
 
 export interface ProxiedOptions {
-  method?: 'GET' | 'POST';
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   headers?: Record<string, string>;
   body?: unknown;
   proxy?: string;

@@ -269,9 +269,45 @@ class Grok2APIClient:
             raise Grok2APIError("grok2api import returned no completion event")
         return result
 
-    def import_web_sso_and_convert(self, sso_cookie: str, email: str = "") -> dict[str, Any]:
-        token = self._login()
-        account_name = (email or "").strip() or f"Grok Web {secrets.token_hex(4)}"
+    def _lookup_web_account(self, token: str, account_name: str) -> dict | None:
+        lookup = self.session.get(
+            f"{self.base_url}/api/admin/v1/accounts",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"provider": "grok_web", "search": account_name, "page": 1, "pageSize": 20},
+            timeout=self.timeout,
+        )
+        if lookup.status_code != 200:
+            return None
+        payload = lookup.json().get("data", {})
+        items = payload.get("items") or payload.get("data") or []
+        return next((item for item in items if item.get("name") == account_name), None)
+
+    def _update_web_sso(self, token: str, account_id: str, sso_cookie: str, account_name: str) -> dict:
+        """有则更新：优先 PUT 账号；失败则再走 web import 覆盖。"""
+        headers = {"Authorization": f"Bearer {token}"}
+        body = {
+            "name": account_name,
+            "sso_token": sso_cookie.strip(),
+            "ssoToken": sso_cookie.strip(),
+            "tier": "auto",
+        }
+        for method in ("put", "patch"):
+            try:
+                fn = getattr(self.session, method)
+                result = fn(
+                    f"{self.base_url}/api/admin/v1/accounts/{account_id}",
+                    headers=headers,
+                    json=body,
+                    timeout=self.timeout,
+                )
+                if result.status_code in (200, 201, 204):
+                    try:
+                        return result.json() if result.content else {"id": account_id}
+                    except Exception:
+                        return {"id": account_id, "updated": True}
+            except Exception:
+                continue
+        # 回退：同名再 import（部分 grok2api 会覆盖）
         document = json.dumps(
             {
                 "provider": "grok_web",
@@ -292,49 +328,78 @@ class Grok2APIClient:
             timeout=max(self.timeout, 120),
         )
         if response.status_code != 200:
-            raise Grok2APIError(f"grok2api web import failed: HTTP {response.status_code}")
-        imported = None
-        for block in response.text.replace("\r\n", "\n").split("\n\n"):
-            event = ""
-            data = ""
-            for line in block.splitlines():
-                if line.startswith("event:"):
-                    event = line[6:].strip()
-                elif line.startswith("data:"):
-                    data += line[5:].strip()
-            if not data:
-                continue
-            payload = json.loads(data)
-            if event == "error":
-                raise Grok2APIError(
-                    payload.get("message")
-                    or payload.get("code")
-                    or "grok2api web import failed"
-                )
-            if event == "complete":
-                imported = payload
-        if imported is None:
-            raise Grok2APIError("grok2api web import returned no completion event")
+            raise Grok2APIError(
+                f"grok2api update/reimport failed: HTTP {response.status_code}"
+            )
+        return {"reimport": True, "id": account_id}
 
-        lookup = self.session.get(
-            f"{self.base_url}/api/admin/v1/accounts",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"provider": "grok_web", "search": account_name, "page": 1, "pageSize": 20},
-            timeout=self.timeout,
-        )
-        if lookup.status_code != 200:
-            raise Grok2APIError(f"grok2api account lookup failed: HTTP {lookup.status_code}")
-        payload = lookup.json().get("data", {})
-        items = payload.get("items") or payload.get("data") or []
-        account = next((item for item in items if item.get("name") == account_name), None)
-        if not account or not account.get("id"):
-            raise Grok2APIError(f"grok2api could not locate imported Web account {account_name}")
+    def import_web_sso_and_convert(self, sso_cookie: str, email: str = "") -> dict[str, Any]:
+        """有则更新 SSO、无则 import+convert。"""
+        token = self._login()
+        account_name = (email or "").strip() or f"Grok Web {secrets.token_hex(4)}"
+        existing = self._lookup_web_account(token, account_name)
+        mode = "created"
+        imported: Any = None
+        if existing and existing.get("id"):
+            mode = "updated"
+            imported = self._update_web_sso(
+                token, str(existing["id"]), sso_cookie, account_name
+            )
+            account = existing
+        else:
+            document = json.dumps(
+                {
+                    "provider": "grok_web",
+                    "accounts": [
+                        {
+                            "name": account_name,
+                            "sso_token": sso_cookie.strip(),
+                            "tier": "auto",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ).encode()
+            response = self.session.post(
+                f"{self.base_url}/api/admin/v1/accounts/web/import",
+                headers={"Authorization": f"Bearer {token}", "Accept": "text/event-stream"},
+                files={"file": ("registered-web-account.json", document, "application/json")},
+                timeout=max(self.timeout, 120),
+            )
+            if response.status_code != 200:
+                raise Grok2APIError(f"grok2api web import failed: HTTP {response.status_code}")
+            for block in response.text.replace("\r\n", "\n").split("\n\n"):
+                event = ""
+                data = ""
+                for line in block.splitlines():
+                    if line.startswith("event:"):
+                        event = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data += line[5:].strip()
+                if not data:
+                    continue
+                payload = json.loads(data)
+                if event == "error":
+                    raise Grok2APIError(
+                        payload.get("message")
+                        or payload.get("code")
+                        or "grok2api web import failed"
+                    )
+                if event == "complete":
+                    imported = payload
+            if imported is None:
+                raise Grok2APIError("grok2api web import returned no completion event")
+            account = self._lookup_web_account(token, account_name)
+            if not account or not account.get("id"):
+                raise Grok2APIError(
+                    f"grok2api could not locate imported Web account {account_name}"
+                )
 
         converted = self._run_sse_task(
             "/api/admin/v1/accounts/web/convert-to-build",
             json_body={"ids": [str(account["id"])]},
         )
-        return {"import": imported, "conversion": converted}
+        return {"import": imported, "conversion": converted, "mode": mode, "id": str(account["id"])}
 
     def upsert_web_egress_context(self, user_agent: str, cloudflare_cookies: str) -> dict:
         if not user_agent or not cloudflare_cookies:

@@ -195,6 +195,58 @@ def cpa_path_to_create_body(cpa_path: str | Path) -> dict[str, Any]:
     return body
 
 
+def _envelope_ok(status: int, resp: Any) -> tuple[bool, str]:
+    if not (200 <= status < 300):
+        if isinstance(resp, dict):
+            return False, str(resp.get("error") or resp.get("message") or resp)[:400]
+        return False, str(resp)[:400] or f"HTTP {status}"
+    if isinstance(resp, dict) and "code" in resp and resp.get("code") not in (0, "0", None):
+        err = str(resp.get("message") or resp.get("error") or resp)[:400]
+        return False, f"code={resp.get('code')}: {err}"
+    return True, ""
+
+
+def _find_account_id_by_name(
+    base: str,
+    token: str,
+    name: str,
+    *,
+    timeout: float = 30.0,
+) -> str | None:
+    """GET list + search，按 name 精确匹配返回远端 id。"""
+    n = str(name or "").strip()
+    if not n:
+        return None
+    from urllib.parse import quote
+
+    q = quote(n)
+    url = f"{base}/api/v1/admin/accounts?page=1&page_size=50&search={q}"
+    status, resp = _http_json("GET", url, token=token, timeout=timeout)
+    ok, _ = _envelope_ok(status, resp)
+    if not ok:
+        return None
+    data = resp.get("data") if isinstance(resp, dict) else None
+    items: list[Any] = []
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        items = data.get("items") or data.get("list") or data.get("accounts") or []
+    elif isinstance(resp, dict):
+        items = resp.get("items") or resp.get("list") or []
+    if not isinstance(items, list):
+        return None
+    n_lc = n.lower()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        nm = str(it.get("name") or "").strip()
+        if nm.lower() == n_lc:
+            aid = it.get("id") or it.get("account_id") or it.get("accountId")
+            if aid is not None and str(aid).strip():
+                return str(aid).strip()
+    return None
+
+
 def push_account_body(
     body: dict[str, Any],
     *,
@@ -202,30 +254,59 @@ def push_account_body(
     token: str,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
+    """有则更新、无则新增（按 name 查找）。"""
     base = _normalize_sub2api_base_url(base_url or "")
     if not base:
         return {"ok": False, "error": "missing sub2api_remote_url"}
     if not (token or "").strip():
         return {"ok": False, "error": "missing sub2api_admin_token"}
-    url = f"{base}/api/v1/admin/accounts"
-    status, resp = _http_json("POST", url, token=token.strip(), body=body, timeout=timeout)
-    if 200 <= status < 300:
-        # 官方信封 {code:0, data}；code!=0 视为失败
-        if isinstance(resp, dict) and "code" in resp and resp.get("code") not in (0, "0", None):
-            err = str(resp.get("message") or resp.get("error") or resp)[:400]
+    tok = token.strip()
+    name = str(body.get("name") or "").strip()
+    existing_id = _find_account_id_by_name(base, tok, name, timeout=timeout) if name else None
+    if existing_id:
+        url = f"{base}/api/v1/admin/accounts/{existing_id}"
+        # 更新：优先 PUT，失败再 PATCH
+        status, resp = _http_json("PUT", url, token=tok, body=body, timeout=timeout)
+        ok, err = _envelope_ok(status, resp)
+        if not ok and status in (404, 405):
+            status, resp = _http_json("PATCH", url, token=tok, body=body, timeout=timeout)
+            ok, err = _envelope_ok(status, resp)
+        if ok:
             return {
-                "ok": False,
+                "ok": True,
                 "status": status,
-                "error": f"code={resp.get('code')}: {err}",
+                "data": resp,
                 "url": url,
+                "mode": "updated",
+                "id": existing_id,
             }
-        return {"ok": True, "status": status, "data": resp, "url": url}
-    err = ""
-    if isinstance(resp, dict):
-        err = str(resp.get("error") or resp.get("message") or resp)[:400]
-    else:
-        err = str(resp)[:400]
-    return {"ok": False, "status": status, "error": err or f"HTTP {status}", "url": url}
+        return {
+            "ok": False,
+            "status": status,
+            "error": err or f"HTTP {status}",
+            "url": url,
+            "mode": "update_failed",
+            "id": existing_id,
+        }
+
+    url = f"{base}/api/v1/admin/accounts"
+    status, resp = _http_json("POST", url, token=tok, body=body, timeout=timeout)
+    ok, err = _envelope_ok(status, resp)
+    if ok:
+        return {
+            "ok": True,
+            "status": status,
+            "data": resp,
+            "url": url,
+            "mode": "created",
+        }
+    return {
+        "ok": False,
+        "status": status,
+        "error": err or f"HTTP {status}",
+        "url": url,
+        "mode": "create_failed",
+    }
 
 
 def push_cpa_file(
