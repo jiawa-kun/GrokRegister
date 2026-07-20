@@ -20,7 +20,11 @@ import { useSettingsStore } from '@renderer/store/settingsStore';
 import { useToastStore } from '@renderer/store/toastStore';
 import { cn } from '@renderer/lib/cn';
 import type { AppSettings, CpaMintMode } from '@shared/settings';
-import { FAIL_STAGE_LABELS, type FailStageId } from '@shared/failStages';
+import {
+  FAIL_STAGE_LABELS,
+  suggestForFailStages,
+  type FailStageId
+} from '@shared/failStages';
 
 export function RegisterPage({ onOpenSettings }: { onOpenSettings(): void }) {
   const status = useRunStore((s) => s.status);
@@ -574,6 +578,10 @@ function FailStageBoardCard() {
   const top = stages.slice(0, 6);
   const maxCount = Math.max(1, ...top.map((s) => s.count));
   const byJob = board?.byJob || [];
+  const tips = suggestForFailStages(stages, {
+    totalFailed: totalFail,
+    failRate: typeof failRate === 'number' ? failRate : undefined
+  });
 
   const stageLabel = (id: string) =>
     FAIL_STAGE_LABELS[id as FailStageId] || id;
@@ -641,6 +649,21 @@ function FailStageBoardCard() {
           ))}
         </div>
       )}
+
+      {tips.length > 0 && totalFail > 0 ? (
+        <div className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-2">
+          <div className="text-[10px] font-semibold text-amber-700 dark:text-amber-400">
+            建议
+          </div>
+          <ul className="mt-1 space-y-0.5">
+            {tips.map((t, i) => (
+              <li key={i} className="text-[10px] leading-snug text-muted-foreground">
+                · {t}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
 
       {byJob.length > 1 ? (
         <div className="mt-2 space-y-1">
