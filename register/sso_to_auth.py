@@ -1865,6 +1865,31 @@ def cpa_auth_filename(record: dict, *, channel: str = "") -> str:
     return f"{fname}.json"
 
 
+def _notify_auth_index_invalidate() -> None:
+    """通知 Node 失效号池 Auth「已转」筛选索引（best-effort，失败忽略）。"""
+    try:
+        import urllib.request
+
+        base = (
+            os.environ.get("GRA_API_BASE")
+            or os.environ.get("GRA_SERVER_URL")
+            or "http://127.0.0.1:6657"
+        ).rstrip("/")
+        url = f"{base}/api/internal/auth-index/invalidate"
+        req = urllib.request.Request(url, data=b"{}", method="POST")
+        req.add_header("Content-Type", "application/json")
+        key = (
+            os.environ.get("GRA_INTERNAL_KEY")
+            or os.environ.get("GRA_INTERNAL_TOKEN")
+            or ""
+        ).strip()
+        if key:
+            req.add_header("X-GRA-Internal", key)
+        urllib.request.urlopen(req, timeout=2)
+    except Exception:
+        pass
+
+
 def write_cpa_auth(auth_dir: Path, record: dict, *, channel: str = "") -> Path:
     """写出 CPA 可热加载的 xai-<email>[-channel].json（原子替换）。
 
@@ -1885,6 +1910,7 @@ def write_cpa_auth(auth_dir: Path, record: dict, *, channel: str = "") -> Path:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+    _notify_auth_index_invalidate()
     return path
 
 def upload_cpa_auth_remote(

@@ -173,9 +173,12 @@ function isInternalProxyCallbackPath(req: Request): boolean {
     p === '/api/proxy/demote' ||
     p === '/api/singbox/rotate' ||
     p === '/singbox/rotate' ||
+    p === '/internal/auth-index/invalidate' ||
+    p === '/api/internal/auth-index/invalidate' ||
     p.endsWith('/proxy/register-success') ||
     p.endsWith('/proxy/demote') ||
-    p.endsWith('/singbox/rotate')
+    p.endsWith('/singbox/rotate') ||
+    p.endsWith('/internal/auth-index/invalidate')
   );
 }
 
@@ -555,6 +558,18 @@ app.get('/api/run/fail-stages', asyncHandler(async (req: Request, res: Response)
     String(req.query.all || '') === '1' || String(req.query.all || '').toLowerCase() === 'true';
   res.json(registerBot.getFailStageBoard({ runId: runId || undefined, all }));
 }));
+
+/**
+ * 内部：Python 写完 CPA auth 后通知失效号池 Auth 筛选索引。
+ * 鉴权：登录 cookie / X-GRA-Internal / loopback。
+ */
+app.post(
+  '/api/internal/auth-index/invalidate',
+  asyncHandler(async (_req, res) => {
+    invalidateAuthIndexCache();
+    res.json({ ok: true });
+  })
+);
 
 app.get('/api/accounts', asyncHandler(async (req, res) => {
   const q = typeof req.query.q === 'string' ? req.query.q : '';
@@ -1946,7 +1961,28 @@ async function checkDiskSpace(): Promise<SystemHealthCheck> {
     const totalGb = totalBytes / (1024 * 1024 * 1024);
     const usedPct =
       totalBytes > 0 ? Math.round(((totalBytes - freeBytes) / totalBytes) * 100) : 0;
-    const detail = `${targetDir} · 剩余 ${freeGb.toFixed(1)}G / 共 ${totalGb.toFixed(1)}G · 已用 ${usedPct}%`;
+    let shmNote = '';
+    try {
+      const shm = await fsp.statfs('/dev/shm');
+      const sb = Number(shm.bsize || 0);
+      const sa = Number(shm.bavail || 0);
+      if (sb > 0) {
+        const shmFreeMb = (sa * sb) / (1024 * 1024);
+        shmNote = ` · shm剩余 ${shmFreeMb.toFixed(0)}MB`;
+        if (shmFreeMb < 64) {
+          return {
+            id: 'disk',
+            label: '磁盘空间',
+            level: 'warn',
+            message: `/dev/shm 偏紧（${shmFreeMb.toFixed(0)}MB）`,
+            detail: `${targetDir} · 剩余 ${freeGb.toFixed(1)}G${shmNote}`
+          };
+        }
+      }
+    } catch {
+      /* no /dev/shm */
+    }
+    const detail = `${targetDir} · 剩余 ${freeGb.toFixed(1)}G / 共 ${totalGb.toFixed(1)}G · 已用 ${usedPct}%${shmNote}`;
     if (freeGb < 1) {
       return {
         id: 'disk',
