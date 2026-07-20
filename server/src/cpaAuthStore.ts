@@ -1979,6 +1979,181 @@ async function findSub2apiAccountIdByName(
   return null;
 }
 
+function collectSub2apiGroupNames(payload: unknown): string[] {
+  const names = new Set<string>();
+  const add = (v: unknown) => {
+    if (v == null) return;
+    if (typeof v === 'string') {
+      const s = v.trim();
+      if (s) names.add(s);
+      return;
+    }
+    if (typeof v === 'number' || typeof v === 'boolean') {
+      const s = String(v).trim();
+      if (s) names.add(s);
+      return;
+    }
+    if (typeof v === 'object') {
+      const o = v as Record<string, unknown>;
+      for (const k of ['name', 'group', 'group_name', 'groupName', 'title', 'label']) {
+        if (typeof o[k] === 'string' && String(o[k]).trim()) {
+          names.add(String(o[k]).trim());
+          return;
+        }
+      }
+    }
+  };
+  const walk = (node: unknown, depth = 0) => {
+    if (node == null || depth > 5) return;
+    if (Array.isArray(node)) {
+      for (const it of node) walk(it, depth + 1);
+      return;
+    }
+    if (typeof node !== 'object') return;
+    const o = node as Record<string, unknown>;
+    // 直接分组对象
+    if (
+      typeof o.name === 'string' ||
+      typeof o.group === 'string' ||
+      typeof o.group_name === 'string' ||
+      typeof o.groupName === 'string'
+    ) {
+      add(o);
+    }
+    // 账号上的 group 字段
+    if (o.group != null) add(o.group);
+    if (o.group_name != null) add(o.group_name);
+    if (o.groupName != null) add(o.groupName);
+    for (const k of ['items', 'list', 'groups', 'data', 'accounts', 'rows', 'results']) {
+      if (o[k] != null) walk(o[k], depth + 1);
+    }
+  };
+  walk(payload);
+  return Array.from(names).sort((a, b) => a.localeCompare(b, 'zh-CN'));
+}
+
+/**
+ * 拉取 sub2api 分组列表（多路径探测 + 从账号列表提取 group）。
+ */
+export async function listSub2apiGroups(input?: {
+  url?: string;
+  token?: string;
+}): Promise<{
+  ok: boolean;
+  message: string;
+  groups: string[];
+  source?: string;
+  remoteUrl?: string;
+}> {
+  const settings = await loadSettings();
+  const base = normalizeSub2apiBaseUrl(
+    String(
+      input?.url ?? (settings as { sub2apiRemoteUrl?: string }).sub2apiRemoteUrl ?? ''
+    )
+  );
+  const token = normalizeSub2apiAdminSecret(
+    String(
+      (isSecretPlaceholder(input?.token) ? undefined : input?.token) ??
+        (settings as { sub2apiAdminToken?: string }).sub2apiAdminToken ??
+        ''
+    )
+  );
+  if (!base) return { ok: false, message: '请先填写 sub2api 地址', groups: [] };
+  if (!token) return { ok: false, message: '请先填写 sub2api Admin Token', groups: [] };
+
+  const proxy = resolveHttpProxy(settings);
+  const headers = sub2apiAdminAuthHeaders(token);
+  const tryGet = async (path: string) => {
+    const url = `${base}${path.startsWith('/') ? path : `/${path}`}`;
+    try {
+      const res = await requestWithProxyFallback(url, {
+        method: 'GET',
+        headers,
+        proxy,
+        timeoutMs: 15000
+      });
+      return { url, res };
+    } catch (e) {
+      return {
+        url,
+        res: {
+          status: 0,
+          data: String(e instanceof Error ? e.message : e)
+        }
+      };
+    }
+  };
+
+  // 1) 常见分组 API
+  const groupPaths = [
+    '/api/v1/admin/groups',
+    '/api/v1/admin/account-groups',
+    '/api/v1/admin/group',
+    '/api/v1/groups',
+    '/api/admin/groups',
+    '/api/v1/admin/accounts/groups'
+  ];
+  for (const p of groupPaths) {
+    const { res } = await tryGet(p);
+    if (res.status < 200 || res.status >= 300) continue;
+    const env =
+      res.data && typeof res.data === 'object'
+        ? (res.data as { code?: unknown })
+        : null;
+    if (env && env.code != null && Number(env.code) !== 0) continue;
+    const groups = collectSub2apiGroupNames(res.data);
+    if (groups.length > 0) {
+      return {
+        ok: true,
+        message: `已获取 ${groups.length} 个分组`,
+        groups,
+        source: p,
+        remoteUrl: base
+      };
+    }
+  }
+
+  // 2) 从账号列表提取 group（兼容无独立 groups API 的版本）
+  const accountPaths = [
+    '/api/v1/admin/accounts?page=1&page_size=200',
+    '/api/v1/admin/accounts?page=1&pageSize=200'
+  ];
+  for (const p of accountPaths) {
+    const { res } = await tryGet(p);
+    if (res.status < 200 || res.status >= 300) continue;
+    const env =
+      res.data && typeof res.data === 'object'
+        ? (res.data as { code?: unknown })
+        : null;
+    if (env && env.code != null && Number(env.code) !== 0) continue;
+    const groups = collectSub2apiGroupNames(res.data);
+    if (groups.length > 0) {
+      return {
+        ok: true,
+        message: `已从账号列表提取 ${groups.length} 个分组`,
+        groups,
+        source: p,
+        remoteUrl: base
+      };
+    }
+    // 账号接口通了但没有 group 字段
+    return {
+      ok: true,
+      message: '远端未返回分组字段（可手动输入分组名）',
+      groups: [],
+      source: p,
+      remoteUrl: base
+    };
+  }
+
+  return {
+    ok: false,
+    message: '无法获取分组：请检查地址/Token，或手动填写分组名',
+    groups: [],
+    remoteUrl: base
+  };
+}
+
 /**
  * 检测远程 sub2api Admin API 连通性（不上传账号）。
  * GET {base}/api/v1/admin/accounts?page=1&page_size=1

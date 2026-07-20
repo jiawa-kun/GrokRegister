@@ -667,6 +667,17 @@ export interface RendererApi {
   testSub2apiRemote(input?: { url?: string; token?: string }): Promise<
     TestResult & { status?: number; remoteUrl?: string }
   >;
+  /** 拉取 sub2api 分组列表（推送下拉） */
+  listSub2apiGroups?(input?: {
+    url?: string;
+    token?: string;
+  }): Promise<{
+    ok: boolean;
+    message: string;
+    groups: string[];
+    source?: string;
+    remoteUrl?: string;
+  }>;
   /** 远程 grok2api 管理登录连通性（不上传账号） */
   testGrok2apiRemote(input?: {
     url?: string;

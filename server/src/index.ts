@@ -95,7 +95,8 @@ import {
   resignCpaAuth,
   resignCpaAuthBatch,
   testCpaRemoteConnectivity,
-  testSub2apiRemoteConnectivity
+  testSub2apiRemoteConnectivity,
+  listSub2apiGroups
 } from './cpaAuthStore.js';
 import { pushSsoToGrok2apiBatch } from './ssoGrok2apiPush.js';
 
@@ -1527,6 +1528,21 @@ app.post('/api/test/sub2api-remote', asyncHandler(async (req, res) => {
     return res.json(result);
   } catch (e: any) {
     return res.json({ ok: false, message: `检测异常: ${e?.message || e}` });
+  }
+}));
+
+/** 拉取 sub2api 分组列表（下拉用） */
+app.post('/api/test/sub2api-groups', asyncHandler(async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as { url?: string; token?: string };
+    const result = await listSub2apiGroups(body);
+    return res.json(result);
+  } catch (e: any) {
+    return res.json({
+      ok: false,
+      message: `获取分组异常: ${e?.message || e}`,
+      groups: []
+    });
   }
 }));
 

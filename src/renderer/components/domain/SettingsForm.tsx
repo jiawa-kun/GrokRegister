@@ -189,6 +189,9 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
   const [cpaConnOpen, setCpaConnOpen] = useState(false);
   const [g2ConnOpen, setG2ConnOpen] = useState(false);
   const [s2ConnOpen, setS2ConnOpen] = useState(false);
+  const [s2Groups, setS2Groups] = useState<string[]>([]);
+  const [s2GroupsLoading, setS2GroupsLoading] = useState(false);
+  const [s2GroupsMsg, setS2GroupsMsg] = useState('');
   /** 外置 Turnstile Solver：默认折叠 */
   const [solverOpen, setSolverOpen] = useState(false);
   /** 深链展开：mail | proxy | register | auth | push */
@@ -1830,14 +1833,97 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
                       </Field>
                       <Field
                         label="推送分组"
-                        hint="推送到 sub2api 时指定账号分组（与管理端分组名一致）；留空则用远端默认分组"
+                        hint="从 sub2api 拉取分组，或手动输入分组名；留空用远端默认"
                       >
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                          <select
+                            className="h-10 min-w-0 flex-1 rounded-xl border border-border bg-background px-3 text-[13px] outline-none focus:border-primary"
+                            value={
+                              s2Groups.includes(String(draft.sub2apiGroup || ''))
+                                ? String(draft.sub2apiGroup || '')
+                                : draft.sub2apiGroup
+                                  ? '__custom__'
+                                  : ''
+                            }
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              if (v === '__custom__') return;
+                              update('sub2apiGroup', v);
+                            }}
+                            disabled={s2GroupsLoading}
+                          >
+                            <option value="">（默认分组 / 不指定）</option>
+                            {s2Groups.map((g) => (
+                              <option key={g} value={g}>
+                                {g}
+                              </option>
+                            ))}
+                            {draft.sub2apiGroup &&
+                            !s2Groups.includes(String(draft.sub2apiGroup)) ? (
+                              <option value="__custom__">
+                                自定义：{draft.sub2apiGroup}
+                              </option>
+                            ) : null}
+                          </select>
+                          <button
+                            type="button"
+                            className="h-10 shrink-0 rounded-xl border border-border px-3 text-[12px] font-medium hover:bg-muted disabled:opacity-50"
+                            disabled={
+                              s2GroupsLoading ||
+                              !String(draft.sub2apiRemoteUrl || '').trim() ||
+                              !String(draft.sub2apiAdminToken || '').trim()
+                            }
+                            onClick={() => {
+                              setS2GroupsLoading(true);
+                              setS2GroupsMsg('');
+                              void (async () => {
+                                try {
+                                  const api = window.api as {
+                                    listSub2apiGroups?: (input?: {
+                                      url?: string;
+                                      token?: string;
+                                    }) => Promise<{
+                                      ok: boolean;
+                                      message: string;
+                                      groups: string[];
+                                    }>;
+                                  };
+                                  if (!api.listSub2apiGroups) {
+                                    setS2GroupsMsg('请热更后再试');
+                                    return;
+                                  }
+                                  const r = await api.listSub2apiGroups({
+                                    url: draft.sub2apiRemoteUrl,
+                                    token: savedSecret(draft.sub2apiAdminToken)
+                                  });
+                                  setS2Groups(r.groups || []);
+                                  setS2GroupsMsg(r.message || '');
+                                  // 若当前值不在列表且列表非空，保留手写值
+                                } catch (err) {
+                                  setS2GroupsMsg(
+                                    err instanceof Error ? err.message : String(err)
+                                  );
+                                } finally {
+                                  setS2GroupsLoading(false);
+                                }
+                              })();
+                            }}
+                          >
+                            {s2GroupsLoading ? '拉取中…' : '刷新分组'}
+                          </button>
+                        </div>
                         <Input
+                          className="mt-2"
                           value={draft.sub2apiGroup || ''}
                           onChange={(e) => update('sub2apiGroup', e.target.value)}
-                          placeholder="例如：default / grok-pool"
+                          placeholder="也可手动输入分组名"
                           autoComplete="off"
                         />
+                        {s2GroupsMsg ? (
+                          <div className="mt-1 text-[11px] text-muted-foreground">
+                            {s2GroupsMsg}
+                          </div>
+                        ) : null}
                       </Field>
                       <div className="flex flex-wrap items-center gap-3">
                         <ConnectionTestButton

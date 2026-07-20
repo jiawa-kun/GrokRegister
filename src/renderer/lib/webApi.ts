@@ -313,6 +313,17 @@ const webApi: RendererApi = {
       url: input?.url,
       token: input?.token
     }),
+  listSub2apiGroups: (input) =>
+    http<{
+      ok: boolean;
+      message: string;
+      groups: string[];
+      source?: string;
+      remoteUrl?: string;
+    }>('POST', '/api/test/sub2api-groups', {
+      url: input?.url,
+      token: input?.token
+    }),
   testGrok2apiRemote: (input) =>
     http<TestResult & { status?: number; remoteUrl?: string; latencyMs?: number }>(
       'POST',
