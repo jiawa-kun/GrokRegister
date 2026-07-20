@@ -691,25 +691,12 @@ def _browser_consent_locked(
     except Exception:
         pass
     log(f"  🔑 browser consent chrome headless={use_headless} DISPLAY={os.environ.get('DISPLAY', '')!r}")
-    # 显式独占端口；绝不 auto_port（可能选中注册机已占用口并附着）
-    if consent_port > 0:
-        try:
-            co.set_local_port(int(consent_port))
-        except Exception as e:
-            log(f"  ⚠ browser consent set_local_port({consent_port}): {e}")
-            try:
-                co.auto_port()
-            except Exception:
-                pass
-    else:
-        try:
-            co.auto_port()
-        except Exception:
-            pass
+    # 先清 ini 默认 9222；真正端口必须在 set_user_data_path 之后再绑
+    # （set_user_data_path 会关闭 auto_port，否则会回落 9222 附着注册机）
     try:
-        co.set_user_data_path(consent_profile)
-    except Exception as e:
-        log(f"  ⚠ browser consent user_data: {e}")
+        co.auto_port()
+    except Exception:
+        pass
     for arg in (
         "--no-sandbox",
         "--disable-dev-shm-usage",
@@ -747,11 +734,26 @@ def _browser_consent_locked(
             co.set_argument("--disable-gpu")
         except Exception:
             pass
-    if consent_port > 0:
+    # 关键顺序：user_data 之后再独占端口
+    try:
+        from chrome_isolate import isolate_chromium_options
+
+        consent_port = isolate_chromium_options(
+            co, user_data_path=consent_profile, port=consent_port or None
+        )
+        log(f"  🔑 browser consent isolate debug_port={consent_port or 'auto'} profile={consent_profile}")
+    except Exception as e:
+        log(f"  ⚠ browser consent isolate: {e}")
         try:
-            co.set_argument(f"--remote-debugging-port={int(consent_port)}")
-        except Exception:
-            pass
+            co.set_user_data_path(consent_profile)
+        except Exception as e2:
+            log(f"  ⚠ browser consent user_data: {e2}")
+        if consent_port > 0:
+            try:
+                co.set_local_port(int(consent_port))
+                co.set_argument(f"--remote-debugging-port={int(consent_port)}")
+            except Exception:
+                pass
     # 代理：禁止裸 set_proxy(user:pass)——Drission 会静默直连 → auth.x.ai 必被 CF 硬拦
     proxy_s = str(proxy or "").strip()
     proxy_mode = "none"

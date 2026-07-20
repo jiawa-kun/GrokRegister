@@ -63,6 +63,19 @@ def password_login_sso(
         except Exception as e:
             log(f"[password_login] set_proxy failed: {e}")
 
+    # 并行：独占 debug 端口，禁止默认 9222 附着注册机
+    import tempfile
+    import shutil
+
+    login_profile = tempfile.mkdtemp(prefix="gra-password-login-")
+    try:
+        from chrome_isolate import isolate_chromium_options
+
+        port = isolate_chromium_options(co, user_data_path=login_profile)
+        log(f"[password_login] isolate debug_port={port or 'auto'} profile={login_profile}")
+    except Exception as e:
+        log(f"[password_login] isolate port failed: {e}")
+
     browser = None
     page = None
     try:
@@ -290,6 +303,10 @@ if (t) t.click();
         try:
             if browser is not None:
                 browser.quit()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(login_profile, ignore_errors=True)
         except Exception:
             pass
 

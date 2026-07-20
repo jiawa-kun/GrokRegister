@@ -259,6 +259,20 @@ def mint_with_password_browser(
         except Exception as e:
             log(f"[browser-mint] set_proxy failed: {e}")
 
+    # 并行：禁止默认 9222，避免附着注册机主 Chromium
+    import tempfile
+    import shutil
+
+    mint_profile = tempfile.mkdtemp(prefix="gra-browser-mint-")
+    mint_port = 0
+    try:
+        from chrome_isolate import isolate_chromium_options
+
+        mint_port = isolate_chromium_options(co, user_data_path=mint_profile)
+        log(f"[browser-mint] isolate debug_port={mint_port or 'auto'} profile={mint_profile}")
+    except Exception as e:
+        log(f"[browser-mint] isolate port failed: {e}")
+
     browser = None
     try:
         browser = Chromium(co)
@@ -402,3 +416,7 @@ if (b) b.click();
                 browser.quit()
             except Exception:
                 pass
+        try:
+            shutil.rmtree(mint_profile, ignore_errors=True)
+        except Exception:
+            pass
