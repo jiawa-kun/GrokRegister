@@ -117,11 +117,24 @@ function runGraStoreCli(
   }
 }
 
+/** dump_tags / JSON 读结果短缓存，避免每次分页 spawn Python */
+let tagsCache: { at: number; data: AccountTagsFile } | null = null;
+const TAGS_CACHE_TTL_MS = 15_000;
+
+export function invalidateAccountTagsCache(): void {
+  tagsCache = null;
+}
+
 export function loadAccountTags(): AccountTagsFile {
+  const now = Date.now();
+  if (tagsCache && now - tagsCache.at < TAGS_CACHE_TTL_MS) {
+    return tagsCache.data;
+  }
+
   const viaCli = runGraStoreCli('dump_tags');
   if (viaCli?.ok && viaCli.data && typeof viaCli.data === 'object') {
     const raw = viaCli.data as Partial<AccountTagsFile>;
-    return {
+    const data: AccountTagsFile = {
       by_email: (
         raw.by_email && typeof raw.by_email === 'object' ? raw.by_email : {}
       ) as Record<string, AccountTagEntry>,
@@ -129,6 +142,8 @@ export function loadAccountTags(): AccountTagsFile {
         raw.by_sso_hash && typeof raw.by_sso_hash === 'object' ? raw.by_sso_hash : {}
       ) as Record<string, AccountTagEntry>
     };
+    tagsCache = { at: now, data };
+    return data;
   }
 
   // 回退：低优先级路径先读，高优先级后覆盖
@@ -151,6 +166,7 @@ export function loadAccountTags(): AccountTagsFile {
       /* try next */
     }
   }
+  tagsCache = { at: now, data: merged };
   return merged;
 }
 
@@ -361,7 +377,10 @@ export function setPushTag(opts: {
     sso: String(opts.sso || ''),
     error: String(opts.error || '')
   });
-  if (viaCli?.ok) return true;
+  if (viaCli?.ok) {
+    invalidateAccountTagsCache();
+    return true;
+  }
 
   // 回退 JSON（仅当 Python CLI 不可用）
   const path = primaryAccountTagsPath();
@@ -402,6 +421,7 @@ export function setPushTag(opts: {
     const tmp = `${path}.tmp`;
     writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
     renameSync(tmp, path);
+    invalidateAccountTagsCache();
     return true;
   } catch (e) {
     console.warn('[accountTags] setPushTag failed', e);

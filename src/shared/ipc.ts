@@ -476,6 +476,24 @@ export interface RendererApi {
 
   // CPA auth（与登录 /api/auth 区分）
   listCpaAuth(): Promise<CpaAuthListResult>;
+  /**
+   * 号池徽章用轻量 Auth 索引（无 token）。
+   * 替代 Pool 页 listCpaAuth 全量拉取。
+   */
+  getAuthBadgeIndex?(): Promise<{
+    emails: string[];
+    ssoHashes: string[];
+    emailChannels: Record<string, ('A' | 'B')[]>;
+    hashChannels: Record<string, ('A' | 'B')[]>;
+    emailBotFlags: Record<
+      string,
+      { botFlagSource: number | string | null; isBotFlag1: boolean }
+    >;
+    hashBotFlags: Record<
+      string,
+      { botFlagSource: number | string | null; isBotFlag1: boolean }
+    >;
+  }>;
   /** Auth 列表服务端分页/筛选 */
   listCpaAuthPage?(query?: {
     page?: number;

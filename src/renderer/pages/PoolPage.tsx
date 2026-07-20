@@ -196,7 +196,7 @@ export function PoolPage() {
     () => new Map()
   );
   /**
-   * 邮箱 / ssoHash → Auth 侧 bot_flag（listCpaAuth 已解析）。
+   * 邮箱 / ssoHash → Auth 侧 bot_flag（badge-index 轻量解析）。
    * SSO JWT 无 claim 时回退展示，与 Auth 页一致。
    */
   const [authEmailBotFlags, setAuthEmailBotFlags] = useState<
@@ -234,7 +234,70 @@ export function PoolPage() {
 
   const reloadAuthEmails = async () => {
     try {
-      const r = await window.api.listCpaAuth();
+      const api = window.api as {
+        getAuthBadgeIndex?: () => Promise<{
+          emails: string[];
+          ssoHashes: string[];
+          emailChannels: Record<string, ('A' | 'B')[]>;
+          hashChannels: Record<string, ('A' | 'B')[]>;
+          emailBotFlags: Record<
+            string,
+            { botFlagSource: number | string | null; isBotFlag1: boolean }
+          >;
+          hashBotFlags: Record<
+            string,
+            { botFlagSource: number | string | null; isBotFlag1: boolean }
+          >;
+        }>;
+        listCpaAuth: () => Promise<{
+          items: Array<{
+            email?: string;
+            ssoHash?: string | null;
+            mintChannel?: 'A' | 'B' | null;
+            botFlagSource?: number | string | null;
+            isBotFlag1?: boolean;
+          }>;
+        }>;
+      };
+
+      // 优先轻量索引；旧后端无接口时回退全量 listCpaAuth
+      if (api.getAuthBadgeIndex) {
+        const r = await api.getAuthBadgeIndex();
+        const nextEmails = new Set((r.emails || []).map((e) => normEmail(e)).filter(Boolean));
+        const nextHashes = new Set(
+          (r.ssoHashes || []).map((h) => String(h || '').trim().toLowerCase()).filter(Boolean)
+        );
+        const nextEmailCh = new Map<string, Set<'A' | 'B'>>();
+        const nextHashCh = new Map<string, Set<'A' | 'B'>>();
+        for (const [k, arr] of Object.entries(r.emailChannels || {})) {
+          const key = normEmail(k);
+          if (!key) continue;
+          nextEmailCh.set(key, new Set((arr || []).filter((c) => c === 'A' || c === 'B')));
+        }
+        for (const [k, arr] of Object.entries(r.hashChannels || {})) {
+          const key = String(k || '').trim().toLowerCase();
+          if (!key) continue;
+          nextHashCh.set(key, new Set((arr || []).filter((c) => c === 'A' || c === 'B')));
+        }
+        const nextEmailFlags = new Map(
+          Object.entries(r.emailBotFlags || {}).map(([k, v]) => [normEmail(k) || k, v])
+        );
+        const nextHashFlags = new Map(
+          Object.entries(r.hashBotFlags || {}).map(([k, v]) => [
+            String(k || '').trim().toLowerCase(),
+            v
+          ])
+        );
+        setAuthEmails(nextEmails);
+        setAuthSsoHashes(nextHashes);
+        setAuthEmailChannels(nextEmailCh);
+        setAuthHashChannels(nextHashCh);
+        setAuthEmailBotFlags(nextEmailFlags);
+        setAuthHashBotFlags(nextHashFlags);
+        return;
+      }
+
+      const r = await api.listCpaAuth();
       const nextEmails = new Set<string>();
       const nextHashes = new Set<string>();
       const nextEmailCh = new Map<string, Set<'A' | 'B'>>();
@@ -269,14 +332,12 @@ export function PoolPage() {
         is1: boolean | undefined
       ) => {
         if (!key) return;
-        // 缺失不写入；0 是合法 None
         if (flag === undefined || flag === null || flag === '') return;
         const next = {
           botFlagSource: flag,
           isBotFlag1: is1 === true || flag === 1 || flag === '1'
         };
         const prev = map.get(key);
-        // 已有 Bot(1) 则保留；否则用新值（多 auth 时优先标 1）
         if (prev?.isBotFlag1) return;
         if (next.isBotFlag1 || !prev) map.set(key, next);
       };

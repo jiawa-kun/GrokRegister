@@ -230,6 +230,7 @@ const webApi: RendererApi = {
     http('POST', '/api/accounts/push-grok2api', input),
 
   listCpaAuth: () => http('GET', '/api/cpa-auth'),
+  getAuthBadgeIndex: () => http('GET', '/api/cpa-auth/badge-index'),
   listCpaAuthPage: (query) => {
     const qs = new URLSearchParams();
     qs.set('paged', '1');

@@ -102,6 +102,39 @@ function decryptRecordForRuntime(record: AccountRecord): AccountRecord {
   };
 }
 
+/** accounts.json 内存缓存（mtime+size）；写路径刷新，外部改盘下次读失效 */
+let accountsCache: {
+  mtimeMs: number;
+  size: number;
+  records: AccountRecord[];
+} | null = null;
+
+function invalidateAccountsCache(): void {
+  accountsCache = null;
+}
+
+async function accountsFileStat(): Promise<{ mtimeMs: number; size: number } | null> {
+  try {
+    const st = await fsp.stat(accountsPath());
+    return { mtimeMs: Number(st.mtimeMs) || 0, size: Number(st.size) || 0 };
+  } catch {
+    return null;
+  }
+}
+
+function setAccountsCache(records: AccountRecord[], st?: { mtimeMs: number; size: number } | null): void {
+  if (!st) {
+    accountsCache = null;
+    return;
+  }
+  accountsCache = {
+    mtimeMs: st.mtimeMs,
+    size: st.size,
+    // 浅拷贝数组与条目，避免调用方 mutate 污染缓存
+    records: records.map((r) => ({ ...r, ssoCheck: r.ssoCheck ? { ...r.ssoCheck } : r.ssoCheck }))
+  };
+}
+
 async function writeAll(all: AccountRecord[]): Promise<void> {
   const dir = accountsDir();
   await ensureDir(dir);
@@ -114,6 +147,15 @@ async function writeAll(all: AccountRecord[]): Promise<void> {
     'utf-8'
   );
   await fsp.rename(tmp, path);
+  try {
+    const st = await fsp.stat(path);
+    setAccountsCache(all, {
+      mtimeMs: Number(st.mtimeMs) || 0,
+      size: Number(st.size) || 0
+    });
+  } catch {
+    invalidateAccountsCache();
+  }
 }
 
 async function readJsonAccounts(path: string): Promise<AccountRecord[]> {
@@ -313,6 +355,20 @@ async function migrateLegacyIfNeeded(current: AccountRecord[]): Promise<AccountR
 
 async function readAll(): Promise<AccountRecord[]> {
   await ensureDir(accountsDir());
+  const st = await accountsFileStat();
+  if (
+    accountsCache &&
+    st &&
+    accountsCache.mtimeMs === st.mtimeMs &&
+    accountsCache.size === st.size
+  ) {
+    // 返回数组浅拷贝，允许调用方 push/filter 而不直接改缓存数组
+    return accountsCache.records.map((r) => ({
+      ...r,
+      ssoCheck: r.ssoCheck ? { ...r.ssoCheck } : r.ssoCheck
+    }));
+  }
+
   let all = await readJsonAccounts(accountsPath());
   all = await migrateLegacyIfNeeded(all);
 
@@ -324,7 +380,9 @@ async function readAll(): Promise<AccountRecord[]> {
     console.log(`[accountStore] imported ${gained} accounts from ${ssoDir()}`);
     return merged;
   }
-  return all;
+  const stAfter = st || (await accountsFileStat());
+  setAccountsCache(merged, stAfter);
+  return merged;
 }
 
 /**
@@ -461,10 +519,32 @@ export type AccountListFacets = {
   authUnconverted: number;
 };
 
+type AuthBadgeFlag = {
+  botFlagSource: number | string | null;
+  isBotFlag1: boolean;
+};
+
 type AuthIndex = {
   emails: Set<string>;
   ssoHashes: Set<string>;
+  /** email → mint 通道 */
+  emailChannels: Map<string, Set<'A' | 'B'>>;
+  /** ssoHash → mint 通道 */
+  hashChannels: Map<string, Set<'A' | 'B'>>;
+  emailBotFlags: Map<string, AuthBadgeFlag>;
+  hashBotFlags: Map<string, AuthBadgeFlag>;
 };
+
+function emptyAuthIndex(): AuthIndex {
+  return {
+    emails: new Set(),
+    ssoHashes: new Set(),
+    emailChannels: new Map(),
+    hashChannels: new Map(),
+    emailBotFlags: new Map(),
+    hashBotFlags: new Map()
+  };
+}
 
 let authIndexCache: { at: number; mtimeMs: number; index: AuthIndex } | null = null;
 const AUTH_INDEX_TTL_MS = 30_000;
@@ -472,6 +552,50 @@ const AUTH_INDEX_TTL_MS = 30_000;
 /** Auth 目录变更后调用，避免号池「已转」筛选用旧索引 */
 export function invalidateAuthIndexCache(): void {
   authIndexCache = null;
+}
+
+function addAuthChannel(
+  map: Map<string, Set<'A' | 'B'>>,
+  key: string,
+  ch: 'A' | 'B' | null
+): void {
+  if (!key || !ch) return;
+  let set = map.get(key);
+  if (!set) {
+    set = new Set();
+    map.set(key, set);
+  }
+  set.add(ch);
+}
+
+function preferAuthBotFlag(
+  map: Map<string, AuthBadgeFlag>,
+  key: string,
+  flag: AuthBadgeFlag | null
+): void {
+  if (!key || !flag) return;
+  if (flag.botFlagSource == null || flag.botFlagSource === '') return;
+  const prev = map.get(key);
+  if (prev?.isBotFlag1) return;
+  if (flag.isBotFlag1 || !prev) map.set(key, flag);
+}
+
+function resolveMintChannelFromNameData(
+  filename: string,
+  data: Record<string, unknown>
+): 'A' | 'B' | null {
+  const raw = String(
+    data.mint_channel || data.mintChannel || data.mint_mode || data.mintMode || ''
+  )
+    .trim()
+    .toLowerCase();
+  if (raw === 'pkce' || raw === 'a' || raw === 'auth_code') return 'A';
+  if (raw === 'device' || raw === 'b' || raw === 'device_flow') return 'B';
+  const base = filename.replace(/\.json$/i, '').toLowerCase();
+  if (base.endsWith('-pkce') || base.endsWith('_pkce') || base.endsWith('-a')) return 'A';
+  if (base.endsWith('-device') || base.endsWith('_device') || base.endsWith('-b')) return 'B';
+  if (/^xai-/i.test(filename)) return 'A';
+  return null;
 }
 
 async function authDirMtimeMs(): Promise<number> {
@@ -486,22 +610,22 @@ async function authDirMtimeMs(): Promise<number> {
 }
 
 /**
- * 轻量扫描 auth 目录（仅 email + ssoHash），避免 listCpaAuth 全量解析拖慢号池分页。
- * 规则与 listCpaAuth 尽量对齐：文件名 xai-<email>、JSON 内 email/sso。
+ * 轻量扫描 auth 目录（email / ssoHash / 通道 / bot_flag），
+ * 避免 listCpaAuth 全量解析拖慢号池分页与徽章。
  */
 async function scanAuthIndexLight(dir: string): Promise<AuthIndex> {
-  const emails = new Set<string>();
-  const ssoHashes = new Set<string>();
+  const index = emptyAuthIndex();
   let names: string[] = [];
   try {
     names = await fsp.readdir(dir);
   } catch {
-    return { emails, ssoHashes };
+    return index;
   }
   // 并发限制，避免一次打开成百上千文件打满句柄
   const jsonNames = names.filter((n) => n.endsWith('.json'));
   const concurrency = 24;
   let cursor = 0;
+  const { readBotFlagFromAuthRecord } = await import('./jwtBotFlag.js');
   async function worker() {
     while (cursor < jsonNames.length) {
       const i = cursor++;
@@ -513,8 +637,10 @@ async function scanAuthIndexLight(dir: string): Promise<AuthIndex> {
         // 文件名 email：xai-foo@bar.com.json / xai-foo@bar.com-pkce.json
         const base = name.replace(/\.json$/i, '');
         const m = base.match(/^xai-(.+?)(?:-(pkce|device|a|b))?$/i);
+        let fileEmail = '';
         if (m?.[1] && m[1].includes('@')) {
-          emails.add(m[1].trim().toLowerCase());
+          fileEmail = m[1].trim().toLowerCase();
+          index.emails.add(fileEmail);
         }
         const raw = await fsp.readFile(full, 'utf-8');
         let data: Record<string, unknown> = {};
@@ -526,7 +652,11 @@ async function scanAuthIndexLight(dir: string): Promise<AuthIndex> {
         const em = String(data.email || data.Email || '')
           .trim()
           .toLowerCase();
-        if (em) emails.add(em);
+        if (em) index.emails.add(em);
+        const emailKey = em || fileEmail;
+        const ch = resolveMintChannelFromNameData(name, data);
+        if (emailKey) addAuthChannel(index.emailChannels, emailKey, ch);
+
         let sso = '';
         if (typeof data.sso === 'string') sso = data.sso;
         else if (data.extra && typeof data.extra === 'object') {
@@ -537,16 +667,22 @@ async function scanAuthIndexLight(dir: string): Promise<AuthIndex> {
           .trim()
           .replace(/^sso=/i, '')
           .trim();
+        let hash = '';
         if (sso.length >= 8) {
-          ssoHashes.add(createHash('sha256').update(sso, 'utf8').digest('hex'));
+          hash = createHash('sha256').update(sso, 'utf8').digest('hex');
+          index.ssoHashes.add(hash);
+          addAuthChannel(index.hashChannels, hash, ch);
         }
+        const bot = readBotFlagFromAuthRecord(data);
+        preferAuthBotFlag(index.emailBotFlags, emailKey, bot);
+        preferAuthBotFlag(index.hashBotFlags, hash, bot);
       } catch {
         /* skip file */
       }
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, jsonNames.length || 1) }, () => worker()));
-  return { emails, ssoHashes };
+  return index;
 }
 
 async function loadAuthIndex(): Promise<AuthIndex> {
@@ -561,7 +697,7 @@ async function loadAuthIndex(): Promise<AuthIndex> {
     return authIndexCache.index;
   }
   const dir = join(dataDir(), 'auth');
-  let index: AuthIndex = { emails: new Set(), ssoHashes: new Set() };
+  let index = emptyAuthIndex();
   try {
     // 优先轻量扫描；失败再回退 listCpaAuth（兼容旧逻辑）
     index = await scanAuthIndexLight(dir);
@@ -578,6 +714,19 @@ async function loadAuthIndex(): Promise<AuthIndex> {
           .trim()
           .toLowerCase();
         if (h) index.ssoHashes.add(h);
+        const ch =
+          it.mintChannel === 'B' ? 'B' : it.mintChannel === 'A' ? 'A' : null;
+        if (e) addAuthChannel(index.emailChannels, e, ch);
+        if (h) addAuthChannel(index.hashChannels, h, ch);
+        const flag: AuthBadgeFlag = {
+          botFlagSource:
+            it.botFlagSource !== undefined && it.botFlagSource !== null && it.botFlagSource !== ''
+              ? it.botFlagSource
+              : null,
+          isBotFlag1: Boolean(it.isBotFlag1)
+        };
+        preferAuthBotFlag(index.emailBotFlags, e, flag);
+        preferAuthBotFlag(index.hashBotFlags, h, flag);
       }
     } catch {
       /* auth 目录不可用时视为无已转 */
@@ -585,6 +734,40 @@ async function loadAuthIndex(): Promise<AuthIndex> {
   }
   authIndexCache = { at: now, mtimeMs, index };
   return index;
+}
+
+/** 号池徽章用轻量 Auth 索引（无 token / 无全量文件列表） */
+export type AuthBadgeIndex = {
+  emails: string[];
+  ssoHashes: string[];
+  emailChannels: Record<string, ('A' | 'B')[]>;
+  hashChannels: Record<string, ('A' | 'B')[]>;
+  emailBotFlags: Record<string, AuthBadgeFlag>;
+  hashBotFlags: Record<string, AuthBadgeFlag>;
+};
+
+export async function getAuthBadgeIndex(): Promise<AuthBadgeIndex> {
+  const index = await loadAuthIndex();
+  const emailChannels: Record<string, ('A' | 'B')[]> = {};
+  for (const [k, set] of index.emailChannels) {
+    emailChannels[k] = Array.from(set);
+  }
+  const hashChannels: Record<string, ('A' | 'B')[]> = {};
+  for (const [k, set] of index.hashChannels) {
+    hashChannels[k] = Array.from(set);
+  }
+  const emailBotFlags: Record<string, AuthBadgeFlag> = {};
+  for (const [k, v] of index.emailBotFlags) emailBotFlags[k] = v;
+  const hashBotFlags: Record<string, AuthBadgeFlag> = {};
+  for (const [k, v] of index.hashBotFlags) hashBotFlags[k] = v;
+  return {
+    emails: Array.from(index.emails),
+    ssoHashes: Array.from(index.ssoHashes),
+    emailChannels,
+    hashChannels,
+    emailBotFlags,
+    hashBotFlags
+  };
 }
 
 function isAuthConvertedAccount(

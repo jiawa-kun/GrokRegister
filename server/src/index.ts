@@ -42,6 +42,7 @@ import {
   listAccounts,
   queryAccounts,
   matchAccounts,
+  getAuthBadgeIndex,
   migrateAccountSecretStorage,
   resyncAccountsFromDisk,
   invalidateAuthIndexCache
@@ -688,6 +689,19 @@ app.post('/api/accounts/push-grok2api', asyncHandler(async (req: Request, res: R
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
+  }
+}));
+
+/**
+ * 号池徽章用轻量 Auth 索引（email/ssoHash/通道/bot_flag）。
+ * 不返回 token / 不全量解析 access_token，避免 Pool 页拖垮 Auth 目录。
+ */
+app.get('/api/cpa-auth/badge-index', asyncHandler(async (_req, res) => {
+  try {
+    res.json(await getAuthBadgeIndex());
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: message });
   }
 }));
 
