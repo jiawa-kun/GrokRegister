@@ -799,18 +799,18 @@ function buildCpaAuthFacets(all: CpaAuthItem[]): CpaAuthListFacets {
   };
 }
 
-/** 列表出口瘦身：去掉绝对 path、截断长 error（内部 list 缓存仍保留完整字段） */
+/** 列表出口瘦身：UI 用状态枚举；省略 path/ssoHash/长 At 明细 */
 function toCpaAuthListRow(i: CpaAuthItem): CpaAuthItem {
   const trimErr = (v?: string | null) => {
     const s = String(v || '').trim();
     if (!s) return null;
-    return s.length > 160 ? `${s.slice(0, 160)}…` : s;
+    return s.length > 120 ? `${s.slice(0, 120)}…` : s;
   };
   return {
     filename: i.filename,
-    path: '', // 操作一律用 filename；不暴露容器绝对路径
+    path: '',
     email: i.email,
-    sub: i.sub,
+    sub: i.sub || '',
     expired: i.expired,
     disabled: i.disabled,
     hasRefresh: i.hasRefresh,
@@ -821,30 +821,30 @@ function toCpaAuthListRow(i: CpaAuthItem): CpaAuthItem {
     authType: i.authType,
     botFlagSource: i.botFlagSource,
     isBotFlag1: i.isBotFlag1,
-    // 列表仍给 hash 供筛选/诊断；无 sso 原文
-    ssoHash: i.ssoHash,
+    // 列表不返回 ssoHash（交叉用 badge-index）；省带宽
+    ssoHash: null,
     hasSso: i.hasSso,
     mintChannel: i.mintChannel,
     probeAction: i.probeAction,
     probeHttp: i.probeHttp,
-    probeAt: i.probeAt,
+    probeAt: null,
     poolHasPassword: i.poolHasPassword,
     nsfwEnabled: i.nsfwEnabled,
     nsfwAttempted: i.nsfwAttempted,
-    nsfwAt: i.nsfwAt,
+    nsfwAt: null,
     nsfwError: trimErr(i.nsfwError),
     nsfwStatus: i.nsfwStatus,
     zdrClosed: i.zdrClosed,
     zdrAttempted: i.zdrAttempted,
-    zdrAt: i.zdrAt,
+    zdrAt: null,
     zdrError: trimErr(i.zdrError),
     zdrStatus: i.zdrStatus,
     ssoG2Status: i.ssoG2Status,
     authCpaStatus: i.authCpaStatus,
     authSub2apiStatus: i.authSub2apiStatus,
-    ssoG2At: i.ssoG2At,
-    authCpaAt: i.authCpaAt,
-    authSub2apiAt: i.authSub2apiAt,
+    ssoG2At: null,
+    authCpaAt: null,
+    authSub2apiAt: null,
     ssoG2Error: trimErr(i.ssoG2Error),
     authCpaError: trimErr(i.authCpaError),
     authSub2apiError: trimErr(i.authSub2apiError)

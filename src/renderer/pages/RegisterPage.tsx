@@ -503,6 +503,43 @@ function InfoBox({ label, value }: { label: string; value: string }) {
   );
 }
 
+/** 一键把并行上限设为 1 并保存 */
+function QuickParallel1Button() {
+  const data = useSettingsStore((s) => s.data);
+  const reload = useSettingsStore((s) => s.reload);
+  const push = useToastStore((s) => s.push);
+  const [busy, setBusy] = useState(false);
+  if ((data?.maxParallelWorkers ?? 3) <= 1) return null;
+  return (
+    <button
+      type="button"
+      disabled={busy || !data}
+      className="rounded-full border border-amber-600/40 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 hover:bg-amber-500/20 disabled:opacity-50 dark:text-amber-300"
+      onClick={() => {
+        if (!data) return;
+        setBusy(true);
+        void (async () => {
+          try {
+            await window.api.saveSettings({ ...data, maxParallelWorkers: 1 });
+            await reload();
+            push({ tone: 'ok', title: '已将并行上限设为 1' });
+          } catch (err) {
+            push({
+              tone: 'danger',
+              title: '保存失败',
+              description: err instanceof Error ? err.message : String(err)
+            });
+          } finally {
+            setBusy(false);
+          }
+        })();
+      }}
+    >
+      {busy ? '…' : '并行=1'}
+    </button>
+  );
+}
+
 /** 注册失败分阶段看板（启发式 + 成功率） */
 function FailStageBoardCard({
   onOpenSettings
@@ -675,15 +712,20 @@ function FailStageBoardCard({
                 className="flex items-start justify-between gap-2 text-[10px] leading-snug text-muted-foreground"
               >
                 <span className="min-w-0 flex-1">· {t.text}</span>
-                {t.settingsSection ? (
-                  <button
-                    type="button"
-                    className="shrink-0 rounded-full border border-amber-600/40 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 hover:bg-amber-500/20 dark:text-amber-300"
-                    onClick={() => onOpenSettings(t.settingsSection)}
-                  >
-                    去配置
-                  </button>
-                ) : null}
+                <span className="flex shrink-0 items-center gap-1">
+                  {t.quickAction === 'parallel_1' ? (
+                    <QuickParallel1Button />
+                  ) : null}
+                  {t.settingsSection ? (
+                    <button
+                      type="button"
+                      className="rounded-full border border-amber-600/40 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 hover:bg-amber-500/20 dark:text-amber-300"
+                      onClick={() => onOpenSettings(t.settingsSection)}
+                    >
+                      去配置
+                    </button>
+                  ) : null}
+                </span>
               </li>
             ))}
           </ul>

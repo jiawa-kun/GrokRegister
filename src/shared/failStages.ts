@@ -147,6 +147,8 @@ export type FailStageSuggestion = {
   text: string;
   stageId?: FailStageId;
   settingsSection?: SettingsSectionId | null;
+  /** 一键改运行参数（如并行降到 1） */
+  quickAction?: 'parallel_1' | null;
 };
 
 export function tipForFailStage(id: string | null | undefined): string {
@@ -169,7 +171,8 @@ export function suggestForFailStages(
     tips.push({
       text: `失败率 ${rate}% 偏高：建议先降并行到 1，确认单路稳定再加`,
       stageId: 'plan',
-      settingsSection: 'register'
+      settingsSection: 'register',
+      quickAction: 'parallel_1'
     });
   }
   const sorted = [...stages].sort((a, b) => (b.count || 0) - (a.count || 0));

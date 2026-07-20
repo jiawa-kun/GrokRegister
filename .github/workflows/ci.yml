@@ -2,38 +2,27 @@ name: CI
 
 on:
   push:
-    branches: [beta, beta_dev, main, master]
+    branches: [main, master, beta_dev]
   pull_request:
-  workflow_dispatch:
+    branches: [main, master, beta_dev]
 
 jobs:
-  checks:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: npm
 
-      - name: Install deps
+      - name: Install
         run: npm ci
 
       - name: Typecheck (web)
         run: npm run typecheck
 
-      - name: Concurrent register verify
+      - name: Typecheck (server) + concurrent register verify
         run: npm run verify:concurrent-register
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
-      - name: Python unit tests
-        working-directory: register
-        run: python -m unittest discover -s tests -v

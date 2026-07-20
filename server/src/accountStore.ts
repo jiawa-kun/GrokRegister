@@ -168,6 +168,40 @@ async function writeJsonBackup(all: AccountRecord[]): Promise<void> {
   await fsp.rename(tmp, path);
 }
 
+/** 增量写：JSON 备份 debounce，避免每次验活/append 全量写盘 */
+let jsonBackupTimer: ReturnType<typeof setTimeout> | null = null;
+let jsonBackupPending: AccountRecord[] | null = null;
+const JSON_BACKUP_DEBOUNCE_MS = 3000;
+
+function scheduleJsonBackup(all: AccountRecord[]): void {
+  // 浅拷贝快照，后续 all 被改也不丢本次状态
+  jsonBackupPending = all.map((r) => ({
+    ...r,
+    ssoCheck: r.ssoCheck ? { ...r.ssoCheck } : r.ssoCheck
+  }));
+  if (jsonBackupTimer) clearTimeout(jsonBackupTimer);
+  jsonBackupTimer = setTimeout(() => {
+    jsonBackupTimer = null;
+    const snap = jsonBackupPending;
+    jsonBackupPending = null;
+    if (!snap) return;
+    void writeJsonBackup(snap).catch((e) =>
+      console.warn('[accountStore] debounced JSON backup failed', e)
+    );
+  }, JSON_BACKUP_DEBOUNCE_MS);
+}
+
+/** 立即刷 JSON（进程退出/全量 replace 前调用） */
+async function flushJsonBackup(all?: AccountRecord[]): Promise<void> {
+  if (jsonBackupTimer) {
+    clearTimeout(jsonBackupTimer);
+    jsonBackupTimer = null;
+  }
+  const snap = all || jsonBackupPending;
+  jsonBackupPending = null;
+  if (snap) await writeJsonBackup(snap);
+}
+
 function bumpCache(all: AccountRecord[]): void {
   sqliteCacheGen += 1;
   invalidateSqliteCountCache();
@@ -182,25 +216,26 @@ function bumpCache(all: AccountRecord[]): void {
 async function writeAll(all: AccountRecord[]): Promise<void> {
   const diskRows = all.map(encryptRecordForDisk);
   try {
-    const ok = sqliteReplaceAccounts(diskRows);
+    const ok = await sqliteReplaceAccounts(diskRows);
     if (!ok) {
       console.warn('[accountStore] SQLite replace_accounts failed; JSON still written');
     }
   } catch (e) {
     console.warn('[accountStore] SQLite write error', e);
   }
-  await writeJsonBackup(all);
+  // 全量路径立即写 JSON（不 debounce）
+  await flushJsonBackup(all);
   bumpCache(all);
 }
 
-/** 增量：upsert 若干行到 SQLite + 更新内存/JSON */
+/** 增量：upsert 若干行到 SQLite + 更新内存；JSON debounce */
 async function commitIncremental(
   all: AccountRecord[],
   changed: AccountRecord[]
 ): Promise<void> {
   if (changed.length > 0) {
     const disk = changed.map(encryptRecordForDisk);
-    const n = sqliteUpsertAccounts(disk);
+    const n = await sqliteUpsertAccounts(disk);
     if (n == null) {
       // 增量失败：回退全量，保证一致
       console.warn('[accountStore] upsert_accounts failed; fallback replace_all');
@@ -208,21 +243,21 @@ async function commitIncremental(
       return;
     }
   }
-  await writeJsonBackup(all);
+  scheduleJsonBackup(all);
   bumpCache(all);
 }
 
 /** 增量：按 id 删除 */
 async function commitDelete(all: AccountRecord[], ids: string[]): Promise<void> {
   if (ids.length > 0) {
-    const n = sqliteDeleteAccounts(ids);
+    const n = await sqliteDeleteAccounts(ids);
     if (n == null) {
       console.warn('[accountStore] delete_accounts failed; fallback replace_all');
       await writeAll(all);
       return;
     }
   }
-  await writeJsonBackup(all);
+  scheduleJsonBackup(all);
   bumpCache(all);
 }
 
@@ -454,9 +489,9 @@ async function readAll(): Promise<AccountRecord[]> {
 
   // 优先 SQLite（规模化主库）
   try {
-    const cnt = sqliteCountAccounts();
+    const cnt = await sqliteCountAccounts();
     if (cnt != null && cnt > 0) {
-      const dumped = sqliteDumpAccounts();
+      const dumped = await sqliteDumpAccounts();
       if (dumped && dumped.length > 0) {
         const runtime = dumped.map(decryptRecordForRuntime);
         const stAfter = st || (await accountsFileStat());
@@ -480,7 +515,7 @@ async function readAll(): Promise<AccountRecord[]> {
 
   // JSON → SQLite 一次性迁移（SQLite 空时）
   try {
-    migrateJsonToSqliteIfNeeded(all.map(encryptRecordForDisk));
+    await migrateJsonToSqliteIfNeeded(all.map(encryptRecordForDisk));
   } catch {
     /* optional */
   }
@@ -958,7 +993,7 @@ export async function getAccountById(id: string): Promise<AccountRecord | null> 
   return withAccountsLock(async () => {
     // 优先 SQLite 单行（避免全量 dump）
     try {
-      const row = sqliteGetAccount(key);
+      const row = await sqliteGetAccount(key);
       if (row) {
         const runtime = decryptRecordForRuntime(row);
         const [withTags] = await attachTagsToRecords([runtime]);
@@ -990,7 +1025,7 @@ export async function getAccountsStorageInfo(): Promise<{
   } catch {
     jsonCount = 0;
   }
-  const sqliteCount = sqliteCountAccounts();
+  const sqliteCount = await sqliteCountAccounts();
   return {
     jsonPath,
     jsonCount,
@@ -1093,7 +1128,7 @@ export async function queryAccounts(opts: AccountListQuery = {}): Promise<Accoun
 
     // SQL 真分页（万级号池不全量进 Node）
     try {
-      const sqlPage = sqliteQueryAccounts({
+      const sqlPage = await sqliteQueryAccounts({
         page: pageReq,
         pageSize,
         q: opts.q,
@@ -1206,7 +1241,7 @@ export async function matchAccounts(opts: AccountMatchQuery = {}): Promise<Accou
     const limit = Math.min(2000, Math.max(1, Math.floor(Number(opts.limit) || 500)));
 
     try {
-      const sqlMatch = sqliteMatchAccounts({
+      const sqlMatch = await sqliteMatchAccounts({
         q: opts.q,
         sso: opts.sso,
         alive: opts.alive,

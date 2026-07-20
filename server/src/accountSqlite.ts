@@ -1,35 +1,186 @@
 /**
- * 号池 SQLite 侧车（经 Python gra_store_cli → gra_store.sqlite accounts 表）。
- * 失败时返回 null，由 accountStore 回退 accounts.json。
+ * 号池 SQLite 侧车（Python gra_store）。
+ * 优先长驻 worker（NDJSON）；失败回退 spawnSync CLI。
  */
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { AccountRecord } from '@shared/runEvents';
 import { resolveRegisterRuntime } from './bot/registerRuntime.js';
 
-function runCli(
-  cmd: string,
-  body?: Record<string, unknown>
-): { ok: boolean; data?: unknown; error?: string } | null {
+type CliResult = { ok: boolean; data?: unknown; error?: string };
+
+function resolvePaths(): { pythonPath: string; registerDir: string; worker: string; cli: string } | null {
+  const rt = resolveRegisterRuntime({});
+  if (!rt?.registerDir || !rt.pythonPath) return null;
+  const worker = join(rt.registerDir, 'gra_store_worker.py');
+  const cli = join(rt.registerDir, 'gra_store_cli.py');
+  if (!existsSync(cli) && !existsSync(worker)) return null;
+  return { pythonPath: rt.pythonPath, registerDir: rt.registerDir, worker, cli };
+}
+
+function envForPython(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    DATA_DIR: String(process.env.DATA_DIR || '/data'),
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUNBUFFERED: '1'
+  };
+}
+
+/** ---------- 长驻 worker ---------- */
+let workerProc: ChildProcessWithoutNullStreams | null = null;
+let workerBuf = '';
+let reqSeq = 1;
+const pending = new Map<
+  number,
+  { resolve: (v: CliResult) => void; timer: ReturnType<typeof setTimeout> }
+>();
+let starting: Promise<boolean> | null = null;
+
+function killWorker(): void {
+  if (workerProc) {
+    try {
+      workerProc.stdin.write(JSON.stringify({ id: 0, cmd: 'quit', body: {} }) + '\n');
+    } catch {
+      /* ignore */
+    }
+    try {
+      workerProc.kill('SIGTERM');
+    } catch {
+      /* ignore */
+    }
+  }
+  workerProc = null;
+  workerBuf = '';
+  for (const [, p] of pending) {
+    clearTimeout(p.timer);
+    p.resolve({ ok: false, error: 'worker killed' });
+  }
+  pending.clear();
+}
+
+function ensureWorker(): Promise<boolean> {
+  if (workerProc && !workerProc.killed) return Promise.resolve(true);
+  if (starting) return starting;
+  starting = new Promise((resolve) => {
+    const paths = resolvePaths();
+    if (!paths || !existsSync(paths.worker)) {
+      starting = null;
+      resolve(false);
+      return;
+    }
+    try {
+      const proc = spawn(paths.pythonPath, [paths.worker], {
+        cwd: paths.registerDir,
+        env: envForPython(),
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      workerProc = proc;
+      workerBuf = '';
+      proc.stdout.setEncoding('utf-8');
+      proc.stdout.on('data', (chunk: string) => {
+        workerBuf += chunk;
+        let idx: number;
+        while ((idx = workerBuf.indexOf('\n')) >= 0) {
+          const line = workerBuf.slice(0, idx).trim();
+          workerBuf = workerBuf.slice(idx + 1);
+          if (!line) continue;
+          try {
+            const msg = JSON.parse(line) as {
+              id?: number;
+              ok?: boolean;
+              data?: unknown;
+              error?: string;
+            };
+            const id = Number(msg.id);
+            const wait = pending.get(id);
+            if (wait) {
+              clearTimeout(wait.timer);
+              pending.delete(id);
+              wait.resolve({
+                ok: Boolean(msg.ok),
+                data: msg.data,
+                error: msg.error
+              });
+            }
+          } catch {
+            /* ignore bad line */
+          }
+        }
+      });
+      proc.stderr.on('data', (c: Buffer | string) => {
+        const t = String(c || '').trim();
+        if (t) console.warn('[accountSqlite:worker]', t.slice(0, 300));
+      });
+      proc.on('exit', () => {
+        killWorker();
+      });
+      proc.on('error', () => {
+        killWorker();
+      });
+      // ping
+      const id = reqSeq++;
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        killWorker();
+        starting = null;
+        resolve(false);
+      }, 8000);
+      pending.set(id, {
+        resolve: (r) => {
+          starting = null;
+          resolve(Boolean(r.ok));
+        },
+        timer
+      });
+      proc.stdin.write(JSON.stringify({ id, cmd: 'ping', body: {} }) + '\n');
+    } catch {
+      starting = null;
+      resolve(false);
+    }
+  });
+  return starting;
+}
+
+function runWorker(cmd: string, body?: Record<string, unknown>): Promise<CliResult | null> {
+  return ensureWorker().then((ok) => {
+    if (!ok || !workerProc) return null;
+    const id = reqSeq++;
+    return new Promise<CliResult | null>((resolve) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        resolve(null);
+      }, 120_000);
+      pending.set(id, {
+        resolve: (r) => resolve(r),
+        timer
+      });
+      try {
+        workerProc!.stdin.write(
+          JSON.stringify({ id, cmd, body: body || {} }) + '\n'
+        );
+      } catch {
+        clearTimeout(timer);
+        pending.delete(id);
+        resolve(null);
+      }
+    });
+  });
+}
+
+function runCliSync(cmd: string, body?: Record<string, unknown>): CliResult | null {
   try {
-    const rt = resolveRegisterRuntime({});
-    if (!rt?.registerDir || !rt.pythonPath) return null;
-    const script = join(rt.registerDir, 'gra_store_cli.py');
-    if (!existsSync(script)) return null;
+    const paths = resolvePaths();
+    if (!paths || !existsSync(paths.cli)) return null;
     const input = body ? JSON.stringify(body) : '';
-    const r = spawnSync(rt.pythonPath, [script, cmd], {
-      cwd: rt.registerDir,
+    const r = spawnSync(paths.pythonPath, [paths.cli, cmd], {
+      cwd: paths.registerDir,
       input,
       encoding: 'utf-8',
-      // 万级号池 dump/replace 可能较慢
       timeout: 120_000,
       maxBuffer: 64 * 1024 * 1024,
-      env: {
-        ...process.env,
-        DATA_DIR: String(process.env.DATA_DIR || '/data'),
-        PYTHONIOENCODING: 'utf-8'
-      }
+      env: envForPython()
     });
     const text = String(r.stdout || '').trim();
     if (!text) {
@@ -37,7 +188,7 @@ function runCli(
       if (err) console.warn('[accountSqlite] empty stdout', cmd, err.slice(0, 200));
       return null;
     }
-    const parsed = JSON.parse(text) as { ok?: boolean; data?: unknown; error?: string };
+    const parsed = JSON.parse(text) as CliResult;
     return {
       ok: Boolean(parsed.ok),
       data: parsed.data,
@@ -48,6 +199,34 @@ function runCli(
     return null;
   }
 }
+
+/** 优先 worker，失败回退 spawnSync */
+async function runCliAsync(
+  cmd: string,
+  body?: Record<string, unknown>
+): Promise<CliResult | null> {
+  try {
+    const viaWorker = await runWorker(cmd, body);
+    if (viaWorker) return viaWorker;
+  } catch {
+    /* fallthrough */
+  }
+  return runCliSync(cmd, body);
+}
+
+/** 热路径：优先长驻 worker，失败回退 spawnSync */
+async function runCli(
+  cmd: string,
+  body?: Record<string, unknown>
+): Promise<CliResult | null> {
+  return runCliAsync(cmd, body);
+}
+
+// 进程启动后预热
+void ensureWorker().catch(() => undefined);
+process.on('exit', () => killWorker());
+process.on('SIGTERM', () => killWorker());
+process.on('SIGINT', () => killWorker());
 
 function isRecord(v: unknown): v is AccountRecord {
   if (!v || typeof v !== 'object') return false;
@@ -61,67 +240,65 @@ function isRecord(v: unknown): v is AccountRecord {
   );
 }
 
-export function sqliteAccountsAvailable(): boolean {
-  const r = runCli('count_accounts');
+export async function sqliteAccountsAvailable(): Promise<boolean> {
+  const r = await runCli('count_accounts');
   return Boolean(r?.ok);
 }
 
-export function sqliteCountAccounts(): number | null {
-  const r = runCli('count_accounts');
+export async function sqliteCountAccounts(): Promise<number | null> {
+  const r = await runCli('count_accounts');
   if (!r?.ok || !r.data || typeof r.data !== 'object') return null;
   const n = Number((r.data as { count?: number }).count);
   return Number.isFinite(n) ? Math.floor(n) : null;
 }
 
-export function sqliteDumpAccounts(): AccountRecord[] | null {
-  const r = runCli('dump_accounts');
+export async function sqliteDumpAccounts(): Promise<AccountRecord[] | null> {
+  const r = await runCli('dump_accounts');
   if (!r?.ok || !Array.isArray(r.data)) return null;
   return (r.data as unknown[]).filter(isRecord);
 }
 
-export function sqliteGetAccount(id: string): AccountRecord | null {
-  const r = runCli('get_account', { id });
+export async function sqliteGetAccount(id: string): Promise<AccountRecord | null> {
+  const r = await runCli('get_account', { id });
   if (!r?.ok) return null;
   if (r.data == null) return null;
   return isRecord(r.data) ? r.data : null;
 }
 
-export function sqliteReplaceAccounts(items: AccountRecord[]): boolean {
-  const r = runCli('replace_accounts', { items });
+export async function sqliteReplaceAccounts(items: AccountRecord[]): Promise<boolean> {
+  const r = await runCli('replace_accounts', { items });
   return Boolean(r?.ok);
 }
 
-export function sqliteUpsertAccount(account: AccountRecord): boolean {
-  const r = runCli('upsert_account', { account });
+export async function sqliteUpsertAccount(account: AccountRecord): Promise<boolean> {
+  const r = await runCli('upsert_account', { account });
   return Boolean(r?.ok);
 }
 
-/** 批量 upsert（一次 spawn + 一次事务） */
-export function sqliteUpsertAccounts(items: AccountRecord[]): number | null {
+export async function sqliteUpsertAccounts(items: AccountRecord[]): Promise<number | null> {
   if (!items.length) return 0;
-  const r = runCli('upsert_accounts', { items });
+  const r = await runCli('upsert_accounts', { items });
   if (!r?.ok || !r.data || typeof r.data !== 'object') return null;
   const n = Number((r.data as { count?: number }).count);
   return Number.isFinite(n) ? Math.floor(n) : null;
 }
 
-export function sqliteDeleteAccounts(ids: string[]): number | null {
-  const r = runCli('delete_accounts', { ids });
+export async function sqliteDeleteAccounts(ids: string[]): Promise<number | null> {
+  const r = await runCli('delete_accounts', { ids });
   if (!r?.ok || !r.data || typeof r.data !== 'object') return null;
   const n = Number((r.data as { deleted?: number }).deleted);
   return Number.isFinite(n) ? Math.floor(n) : null;
 }
 
-/** health 用：短缓存 count，避免 30s 轮询每次 spawn */
 let countCache: { at: number; n: number | null } | null = null;
 const COUNT_CACHE_TTL_MS = 20_000;
 
-export function sqliteCountAccountsCached(): number | null {
+export async function sqliteCountAccountsCached(): Promise<number | null> {
   const now = Date.now();
   if (countCache && now - countCache.at < COUNT_CACHE_TTL_MS) {
     return countCache.n;
   }
-  const n = sqliteCountAccounts();
+  const n = await sqliteCountAccounts();
   countCache = { at: now, n };
   return n;
 }
@@ -130,15 +307,14 @@ export function invalidateSqliteCountCache(): void {
   countCache = null;
 }
 
-/** 启动时：JSON → SQLite 一次性迁移（仅当 SQLite 空且 JSON 有数据） */
-export function migrateJsonToSqliteIfNeeded(
+export async function migrateJsonToSqliteIfNeeded(
   jsonAccounts: AccountRecord[]
-): { migrated: boolean; count: number; error?: string } {
+): Promise<{ migrated: boolean; count: number; error?: string }> {
   if (!jsonAccounts.length) return { migrated: false, count: 0 };
-  const cnt = sqliteCountAccounts();
+  const cnt = await sqliteCountAccounts();
   if (cnt == null) return { migrated: false, count: 0, error: 'sqlite unavailable' };
   if (cnt > 0) return { migrated: false, count: cnt };
-  const ok = sqliteReplaceAccounts(jsonAccounts);
+  const ok = await sqliteReplaceAccounts(jsonAccounts);
   if (!ok) return { migrated: false, count: 0, error: 'replace failed' };
   console.log(`[accountSqlite] migrated ${jsonAccounts.length} accounts from accounts.json → SQLite`);
   return { migrated: true, count: jsonAccounts.length };
@@ -176,8 +352,7 @@ export type SqliteMatchResult = {
   limit: number;
 };
 
-/** SQL 分页筛选（auth 交叉由 Node 传入 emails/hashes） */
-export function sqliteQueryAccounts(opts: {
+export async function sqliteQueryAccounts(opts: {
   page?: number;
   pageSize?: number;
   q?: string;
@@ -186,8 +361,8 @@ export function sqliteQueryAccounts(opts: {
   auth?: string;
   authEmails?: string[];
   authHashes?: string[];
-}): SqliteQueryPage | null {
-  const r = runCli('query_accounts', {
+}): Promise<SqliteQueryPage | null> {
+  const r = await runCli('query_accounts', {
     page: opts.page ?? 1,
     pageSize: opts.pageSize ?? 20,
     q: opts.q || '',
@@ -223,7 +398,7 @@ export function sqliteQueryAccounts(opts: {
   };
 }
 
-export function sqliteMatchAccounts(opts: {
+export async function sqliteMatchAccounts(opts: {
   q?: string;
   sso?: string;
   alive?: string;
@@ -232,8 +407,8 @@ export function sqliteMatchAccounts(opts: {
   requireSso?: boolean;
   authEmails?: string[];
   authHashes?: string[];
-}): SqliteMatchResult | null {
-  const r = runCli('match_accounts', {
+}): Promise<SqliteMatchResult | null> {
+  const r = await runCli('match_accounts', {
     q: opts.q || '',
     sso: opts.sso || 'all',
     alive: opts.alive || 'all',
@@ -267,3 +442,6 @@ export function sqliteMatchAccounts(opts: {
     limit: Number(d.limit) || opts.limit || 500
   };
 }
+
+/** 供将来 async 热路径使用 */
+export { runCliAsync, ensureWorker, killWorker };

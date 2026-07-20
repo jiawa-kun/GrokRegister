@@ -2055,7 +2055,7 @@ async function checkDataDirWritable(): Promise<SystemHealthCheck> {
 async function checkAccountsSqlite(): Promise<SystemHealthCheck> {
   try {
     const { sqliteCountAccountsCached } = await import('./accountSqlite.js');
-    const n = sqliteCountAccountsCached();
+    const n = await sqliteCountAccountsCached();
     if (n == null) {
       return {
         id: 'accounts-sqlite',
@@ -2107,10 +2107,10 @@ async function checkDiskSpace(): Promise<SystemHealthCheck> {
         if (shmFreeMb < 64) {
           return {
             id: 'disk',
-            label: '磁盘空间',
+            label: 'DATA_DIR 磁盘',
             level: 'warn',
             message: `/dev/shm 偏紧（${shmFreeMb.toFixed(0)}MB）`,
-            detail: `${targetDir} · 剩余 ${freeGb.toFixed(1)}G${shmNote}`
+            detail: `DATA_DIR ${targetDir} · 剩余 ${freeGb.toFixed(1)}G${shmNote}`
           };
         }
       }
