@@ -424,7 +424,8 @@ export async function appendAccount(
   });
 }
 
-async function loadAccountsWithTags(): Promise<AccountRecord[]> {
+/** 读号池 + 修复脏行 + 排序；不挂 NSFW/ZDR tags（筛选/match 用） */
+async function loadAccountsBase(): Promise<AccountRecord[]> {
   const raw = await readAll();
   let dirty = false;
   const all = raw.map((a) => {
@@ -445,7 +446,12 @@ async function loadAccountsWithTags(): Promise<AccountRecord[]> {
       /* ignore */
     }
   }
-  let withTags = all;
+  return all.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+/** 仅为给定记录挂 tags（分页当前页 / 全量 list 兼容） */
+async function attachTagsToRecords(records: AccountRecord[]): Promise<AccountRecord[]> {
+  if (!records.length) return records;
   try {
     const {
       loadAccountTags,
@@ -455,7 +461,7 @@ async function loadAccountsWithTags(): Promise<AccountRecord[]> {
       ssoHashHex
     } = await import('./accountTags.js');
     const tags = loadAccountTags();
-    withTags = all.map((a) => {
+    return records.map((a) => {
       const side = nsfwStatusFromTag(
         lookupNsfwTag(tags, {
           email: a.email,
@@ -485,13 +491,22 @@ async function loadAccountsWithTags(): Promise<AccountRecord[]> {
       } as AccountRecord;
     });
   } catch {
-    /* tags optional */
+    return records;
   }
-  return withTags.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+async function loadAccountsWithTags(): Promise<AccountRecord[]> {
+  const all = await loadAccountsBase();
+  return attachTagsToRecords(all);
 }
 
 export async function listAccounts(): Promise<AccountRecord[]> {
   return withAccountsLock(() => loadAccountsWithTags());
+}
+
+/** 无 tags 的号池快照（Auth 密码映射等轻量交叉用） */
+export async function listAccountsLite(): Promise<AccountRecord[]> {
+  return withAccountsLock(() => loadAccountsBase());
 }
 
 export type AccountListQuery = {
@@ -878,7 +893,8 @@ function buildFacets(
 /** 服务端筛选 + 分页（主库仍为 accounts.json；为规模化铺路） */
 export async function queryAccounts(opts: AccountListQuery = {}): Promise<AccountListPage> {
   return withAccountsLock(async () => {
-    const all = await loadAccountsWithTags();
+    // 筛选/facets 不需要 tags；仅当前页挂 NSFW/ZDR
+    const all = await loadAccountsBase();
     const authIndex = await loadAuthIndex();
     let ssoHashOf = (sso: string) =>
       createHash('sha256').update(String(sso || '').trim(), 'utf8').digest('hex');
@@ -898,8 +914,9 @@ export async function queryAccounts(opts: AccountListQuery = {}): Promise<Accoun
     const totalPages = Math.max(1, Math.ceil(total / pageSize) || 1);
     const page = Math.min(totalPages, Math.max(1, Math.floor(Number(opts.page) || 1)));
     const start = (page - 1) * pageSize;
+    const pageItems = filtered.slice(start, start + pageSize);
     return {
-      items: filtered.slice(start, start + pageSize),
+      items: await attachTagsToRecords(pageItems),
       total,
       page,
       pageSize,
@@ -934,11 +951,11 @@ export type AccountMatchResult = {
 
 /**
  * 按筛选返回匹配账号（用于「筛后全部」验活/导出/补签）。
- * 返回精简字段，避免一次拉全量 tags 大对象。
+ * 返回精简字段，不挂 tags。
  */
 export async function matchAccounts(opts: AccountMatchQuery = {}): Promise<AccountMatchResult> {
   return withAccountsLock(async () => {
-    const all = await loadAccountsWithTags();
+    const all = await loadAccountsBase();
     const authIndex = await loadAuthIndex();
     let ssoHashOf = (sso: string) =>
       createHash('sha256').update(String(sso || '').trim(), 'utf8').digest('hex');

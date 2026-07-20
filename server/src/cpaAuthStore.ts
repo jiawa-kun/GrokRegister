@@ -396,12 +396,12 @@ async function readXaiAfter(path: string): Promise<{
   }
 }
 
-/** 号池：email(lower) → 是否有非空密码（重登前置） */
+/** 号池：email(lower) → 是否有非空密码（重登前置）；不走 tags 全量 merge */
 async function buildPoolPasswordMap(): Promise<Map<string, boolean>> {
   const map = new Map<string, boolean>();
   try {
-    const { listAccounts } = await import('./accountStore.js');
-    const accounts = await listAccounts();
+    const { listAccountsLite } = await import('./accountStore.js');
+    const accounts = await listAccountsLite();
     for (const a of accounts) {
       const email = String(a.email || '').trim().toLowerCase();
       if (!email) continue;

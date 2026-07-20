@@ -468,12 +468,21 @@ export function PoolPage() {
     }
   };
 
-  // 筛选/页码变化：拉服务端页（Auth 筛选时全量）
+  // 筛选/页码变化：拉服务端当前页（失败不回退全量）
   useEffect(() => {
     const t = window.setTimeout(() => {
-      void fetchList().then(() => reloadAuthEmails()).finally(() => {
-        setLastRefresh(new Date().toISOString());
-      });
+      void fetchList()
+        .then(() => {
+          setPoolLoadError(null);
+          return reloadAuthEmails();
+        })
+        .catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          setPoolLoadError(msg);
+        })
+        .finally(() => {
+          setLastRefresh(new Date().toISOString());
+        });
     }, searchQuery.trim() ? 280 : 0);
     return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps

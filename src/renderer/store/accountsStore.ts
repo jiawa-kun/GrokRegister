@@ -280,13 +280,9 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       });
     } catch (err) {
       console.error('[accountsStore] reloadPage failed', err);
-      // 分页失败时回退全量，避免号池空白
-      try {
-        await get().reload();
-      } catch (err2) {
-        console.error('[accountsStore] reload fallback failed', err2);
-        set({ loading: false });
-      }
+      // 禁止回退 listAccounts 全量（失败时雪崩）；保留旧数据并结束 loading
+      set({ loading: false });
+      throw err;
     }
   },
 
