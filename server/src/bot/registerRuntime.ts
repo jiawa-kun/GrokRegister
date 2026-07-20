@@ -335,6 +335,11 @@ export function writeConfigForPython(
   else delete config.sub2api_remote_url;
   if (sub2Token) config.sub2api_admin_token = sub2Token;
   else delete config.sub2api_admin_token;
+  const sub2Group = allowSub2
+    ? String((settings as { sub2apiGroup?: string }).sub2apiGroup || '').trim()
+    : '';
+  if (sub2Group) config.sub2api_group = sub2Group;
+  else delete config.sub2api_group;
   {
     const re = Number(
       (settings as { browserRecycleEvery?: number }).browserRecycleEvery ?? 5

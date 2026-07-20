@@ -112,15 +112,18 @@ def cpa_xai_to_sub2api_account(
     cpa: dict[str, Any],
     *,
     source: str = "cpa_xai",
+    group: str = "",
 ) -> dict[str, Any]:
     """CPA/xai auth → sub2api DataAccount（可直接 ImportData）。
 
     必填（与 validateDataAccount 一致）：
       name, platform=grok, type=oauth, credentials(非空且含 token)
     credentials 仅含官方 BuildAccountCredentials 键。
+    group: 可选，写入账号分组（CreateAccountRequest.group / group_name）。
     """
     email = str(cpa.get("email") or "").strip()
     name = email or str(cpa.get("name") or cpa.get("sub") or "grok-oauth")
+    group_name = str(group or cpa.get("group") or cpa.get("group_name") or "").strip()
     access, refresh = _cpa_tokens(cpa)
     if not access:
         raise ValueError("missing access_token")
@@ -206,6 +209,11 @@ def cpa_xai_to_sub2api_account(
         "concurrency": int(cpa.get("concurrency") or 1),
         "priority": int(cpa.get("priority") or 0),
     }
+    if group_name:
+        # 兼容不同 sub2api 版本字段名
+        account["group"] = group_name
+        account["group_name"] = group_name
+        account["extra"]["group"] = group_name
 
     # mint 探针写入的可用模型列表（CPA auth 上的 model_ids）→ 给 sub2api 调度/展示
     model_ids = cpa.get("model_ids") or cpa.get("models") or cpa.get("available_models")

@@ -170,13 +170,25 @@ def _http_json(
         return 0, str(e)
 
 
-def cpa_path_to_create_body(cpa_path: str | Path) -> dict[str, Any]:
+def cpa_path_to_create_body(
+    cpa_path: str | Path,
+    *,
+    group: str = "",
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """CPA xai file → CreateAccountRequest body for sub2api."""
     from cpa_to_sub2api import cpa_xai_to_sub2api_account
 
     path = Path(cpa_path).expanduser().resolve()
     cpa = json.loads(path.read_text(encoding="utf-8-sig"))
-    acc = cpa_xai_to_sub2api_account(cpa, source="cpa_xai")
+    cfg = config if config is not None else _load_conf()
+    group_name = str(
+        group
+        or cfg.get("sub2api_group")
+        or cfg.get("sub2apiGroup")
+        or ""
+    ).strip()
+    acc = cpa_xai_to_sub2api_account(cpa, source="cpa_xai", group=group_name)
     # CreateAccountRequest 不含文档头；DataAccount 字段可直接用
     body: dict[str, Any] = {
         "name": acc["name"],
@@ -192,6 +204,9 @@ def cpa_path_to_create_body(cpa_path: str | Path) -> dict[str, Any]:
         body["expires_at"] = acc["expires_at"]
     if acc.get("auto_pause_on_expired") is not None:
         body["auto_pause_on_expired"] = acc["auto_pause_on_expired"]
+    if group_name:
+        body["group"] = group_name
+        body["group_name"] = group_name
     return body
 
 
@@ -330,7 +345,7 @@ def push_cpa_file(
     if token:
         tok = token.strip()
     try:
-        body = cpa_path_to_create_body(cpa_path)
+        body = cpa_path_to_create_body(cpa_path, config=cfg)
     except Exception as e:
         return {"ok": False, "error": f"convert fail: {e}", "path": str(cpa_path)}
     email = str(body.get("name") or "").strip()

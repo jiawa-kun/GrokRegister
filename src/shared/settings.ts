@@ -215,6 +215,12 @@ export interface AppSettings {
    * 写入 Python：sub2api_admin_token
    */
   sub2apiAdminToken: string;
+  /**
+   * 推送到 sub2api 时指定账号分组（name）。
+   * 空 = 不传 group，由 sub2api 默认分组。
+   * 写入 Python：sub2api_group
+   */
+  sub2apiGroup: string;
   /** 每成功 N 次重启浏览器（0=仅失败/首轮）；默认 5 */
   browserRecycleEvery: number;
   /** 收码失败换邮箱最大次数（1～10，默认 3） */
@@ -399,6 +405,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoPushAuthToSub2api: false,
   sub2apiRemoteUrl: '',
   sub2apiAdminToken: '',
+  sub2apiGroup: '',
   browserRecycleEvery: 5,
   maxMailRetry: 3,
   authDir: '',

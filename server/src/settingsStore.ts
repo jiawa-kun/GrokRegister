@@ -403,6 +403,10 @@ function merge(partial: unknown): AppSettings {
       typeof (p as AppSettings).sub2apiAdminToken === 'string'
         ? (p as AppSettings).sub2apiAdminToken
         : DEFAULT_SETTINGS.sub2apiAdminToken,
+    sub2apiGroup:
+      typeof (p as AppSettings).sub2apiGroup === 'string'
+        ? String((p as AppSettings).sub2apiGroup || '').trim()
+        : DEFAULT_SETTINGS.sub2apiGroup,
     cpaRemoteUrl:
       typeof (p as AppSettings).cpaRemoteUrl === 'string'
         ? (p as AppSettings).cpaRemoteUrl

@@ -1828,6 +1828,17 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
                           autoComplete="off"
                         />
                       </Field>
+                      <Field
+                        label="推送分组"
+                        hint="推送到 sub2api 时指定账号分组（与管理端分组名一致）；留空则用远端默认分组"
+                      >
+                        <Input
+                          value={draft.sub2apiGroup || ''}
+                          onChange={(e) => update('sub2apiGroup', e.target.value)}
+                          placeholder="例如：default / grok-pool"
+                          autoComplete="off"
+                        />
+                      </Field>
                       <div className="flex flex-wrap items-center gap-3">
                         <ConnectionTestButton
                           label="检测远程连通性"

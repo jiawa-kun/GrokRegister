@@ -1680,6 +1680,9 @@ export async function pushSub2apiAuthRemoteBatch(input: {
       credentials.models = modelIds;
       credentials.available_models = modelIds;
     }
+    const group = String(
+      (settings as { sub2apiGroup?: string }).sub2apiGroup || ''
+    ).trim();
     const body: Record<string, unknown> = {
       name,
       platform: 'grok',
@@ -1694,9 +1697,15 @@ export async function pushSub2apiAuthRemoteBatch(input: {
         email,
         mint_channel: data.mint_channel,
         has_grok_45: data.has_grok_45,
-        ...(modelIds.length > 0 ? { model_ids: modelIds } : {})
+        ...(modelIds.length > 0 ? { model_ids: modelIds } : {}),
+        ...(group ? { group } : {})
       }
     };
+    // 指定 sub2api 分组（兼容 group / group_name）
+    if (group) {
+      body.group = group;
+      body.group_name = group;
+    }
     return body;
   }
 
