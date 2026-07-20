@@ -489,10 +489,10 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
           }) => Promise<{
             dir: string;
             items: CpaAuthItem[];
-            total?: number;
-            page?: number;
-            pageSize?: number;
-            totalPages?: number;
+            total: number;
+            page: number;
+            pageSize: number;
+            totalPages: number;
             facets?: {
               all: number;
               noSso: number;
@@ -505,68 +505,37 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
               otherErr: number;
             };
           }>;
-          listCpaAuth: () => Promise<{ dir: string; items: CpaAuthItem[] }>;
         };
 
-        // 仅拉当前页 + facets（批量操作走 matchCpaAuth，不再每次全量）
-        if (api.listCpaAuthPage) {
-          const r = await api.listCpaAuthPage({
-            page,
-            pageSize,
-            q: searchQuery.trim() || undefined,
-            meta: metaFilter === 'all' ? undefined : metaFilter,
-            status: statusFilter === 'all' ? undefined : statusFilter,
-            push: pushFilter === 'all' ? undefined : pushFilter
-          });
-          setDir(r.dir);
-          setItems(r.items || []);
-          setAllItems([]); // 批量改走 match，清空全量缓存
-          setListTotal(r.total ?? r.items?.length ?? 0);
-          setListTotalPages(r.totalPages ?? 1);
-          if (r.facets) setFacets(r.facets);
-          setLoadError(null);
-          setProbeMap((prev) => {
-            const next = { ...prev };
-            for (const it of r.items || []) {
-              const act = String(it.probeAction || '').trim();
-              if (!act) continue;
-              const http = Number(it.probeHttp || 0) || undefined;
-              next[it.filename] = { action: act, http };
-            }
-            return next;
-          });
-          // 仅清理「本页也不存在」的选中；跨页选中保留
-          const pageNames = new Set((r.items || []).map((i) => i.filename));
-          setSelected((prev) => {
-            // 不因翻页清空跨页选中；这里只在文件被删时清理
-            if (prev.size === 0) return prev;
-            return prev;
-          });
-          void pageNames;
-        } else {
-          // 旧后端：全量兼容
-          const full = await api.listCpaAuth();
-          setDir(full.dir);
-          setAllItems(full.items || []);
-          setItems(full.items || []);
-          setListTotal(full.items?.length || 0);
-          setListTotalPages(1);
-          setProbeMap((prev) => {
-            const next = { ...prev };
-            for (const it of full.items || []) {
-              const act = String(it.probeAction || '').trim();
-              if (!act) continue;
-              const http = Number(it.probeHttp || 0) || undefined;
-              next[it.filename] = { action: act, http };
-            }
-            return next;
-          });
-          setSelected((prev) => {
-            const names = new Set((full.items || []).map((i) => i.filename));
-            return new Set([...prev].filter((n) => names.has(n)));
-          });
+        // 仅拉当前页 + facets（批量操作走 matchCpaAuth；禁止 listCpaAuth 全量）
+        if (!api.listCpaAuthPage) {
+          throw new Error('listCpaAuthPage unavailable; please hot-deploy server');
         }
+        const r = await api.listCpaAuthPage({
+          page,
+          pageSize,
+          q: searchQuery.trim() || undefined,
+          meta: metaFilter === 'all' ? undefined : metaFilter,
+          status: statusFilter === 'all' ? undefined : statusFilter,
+          push: pushFilter === 'all' ? undefined : pushFilter
+        });
+        setDir(r.dir);
+        setItems(r.items || []);
+        setAllItems([]); // 批量改走 match，清空全量缓存
+        setListTotal(r.total ?? r.items?.length ?? 0);
+        setListTotalPages(r.totalPages ?? 1);
+        if (r.facets) setFacets(r.facets);
         setLoadError(null);
+        setProbeMap((prev) => {
+          const next = { ...prev };
+          for (const it of r.items || []) {
+            const act = String(it.probeAction || '').trim();
+            if (!act) continue;
+            const http = Number(it.probeHttp || 0) || undefined;
+            next[it.filename] = { action: act, http };
+          }
+          return next;
+        });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setLoadError(msg);

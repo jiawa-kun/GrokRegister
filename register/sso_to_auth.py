@@ -1842,6 +1842,15 @@ def token_to_cpa_record(
         sso_val = sso_val[4:].strip()
     if sso_val:
         entry["sso"] = sso_val
+        # 预计算 hash：Node 冷扫 / badge-index 可跳过对长 JWT 再 sha256
+        try:
+            from account_tags import sso_hash as _sso_hash
+
+            h = _sso_hash(sso_val)
+            if h:
+                entry["sso_hash"] = h
+        except Exception:
+            pass
     # 侧车 bot_flag_source：列表优先读字段（0=None 合法）。
     # JWT 无 claim 时默认写 0，避免 Auth 列表永远显示 —
     flag = extract_bot_flag_source(access, sso_val, id_token.strip() if id_token else "")
@@ -1896,6 +1905,7 @@ def write_cpa_auth(auth_dir: Path, record: dict, *, channel: str = "") -> Path:
     """写出 CPA 可热加载的 xai-<email>[-channel].json（原子替换）。
 
     重 mint 覆盖同名文件时保留已有 nsfw_*（避免 UI 标签丢失）。
+    落盘前补齐 sso_hash / bot_flag_source，加速 Node 列表冷扫。
     """
     auth_dir.mkdir(parents=True, exist_ok=True)
     path = auth_dir / cpa_auth_filename(record, channel=channel)
@@ -1909,6 +1919,27 @@ def write_cpa_auth(auth_dir: Path, record: dict, *, channel: str = "") -> Path:
                 out = preserve_nsfw_fields(out, old_doc)
         except Exception:
             pass
+    if isinstance(out, dict):
+        sso_val = str(out.get("sso") or "").strip()
+        if sso_val.lower().startswith("sso="):
+            sso_val = sso_val[4:].strip()
+            out["sso"] = sso_val
+        if sso_val and not out.get("sso_hash"):
+            try:
+                from account_tags import sso_hash as _sso_hash
+
+                h = _sso_hash(sso_val)
+                if h:
+                    out["sso_hash"] = h
+            except Exception:
+                pass
+        if "bot_flag_source" not in out and (sso_val or out.get("access_token") or out.get("key")):
+            flag = extract_bot_flag_source(
+                str(out.get("access_token") or out.get("key") or ""),
+                sso_val,
+                str(out.get("id_token") or ""),
+            )
+            out["bot_flag_source"] = flag if flag is not None else 0
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)

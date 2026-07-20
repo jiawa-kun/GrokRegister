@@ -260,100 +260,37 @@ export function PoolPage() {
         }>;
       };
 
-      // 优先轻量索引；旧后端无接口时回退全量 listCpaAuth
-      if (api.getAuthBadgeIndex) {
-        const r = await api.getAuthBadgeIndex();
-        const nextEmails = new Set((r.emails || []).map((e) => normEmail(e)).filter(Boolean));
-        const nextHashes = new Set(
-          (r.ssoHashes || []).map((h) => String(h || '').trim().toLowerCase()).filter(Boolean)
-        );
-        const nextEmailCh = new Map<string, Set<'A' | 'B'>>();
-        const nextHashCh = new Map<string, Set<'A' | 'B'>>();
-        for (const [k, arr] of Object.entries(r.emailChannels || {})) {
-          const key = normEmail(k);
-          if (!key) continue;
-          nextEmailCh.set(key, new Set((arr || []).filter((c) => c === 'A' || c === 'B')));
-        }
-        for (const [k, arr] of Object.entries(r.hashChannels || {})) {
-          const key = String(k || '').trim().toLowerCase();
-          if (!key) continue;
-          nextHashCh.set(key, new Set((arr || []).filter((c) => c === 'A' || c === 'B')));
-        }
-        const nextEmailFlags = new Map(
-          Object.entries(r.emailBotFlags || {}).map(([k, v]) => [normEmail(k) || k, v])
-        );
-        const nextHashFlags = new Map(
-          Object.entries(r.hashBotFlags || {}).map(([k, v]) => [
-            String(k || '').trim().toLowerCase(),
-            v
-          ])
-        );
-        setAuthEmails(nextEmails);
-        setAuthSsoHashes(nextHashes);
-        setAuthEmailChannels(nextEmailCh);
-        setAuthHashChannels(nextHashCh);
-        setAuthEmailBotFlags(nextEmailFlags);
-        setAuthHashBotFlags(nextHashFlags);
+      // 仅用轻量索引；禁止回退 listCpaAuth 全量（会拖垮 Auth 目录）
+      if (!api.getAuthBadgeIndex) {
+        console.warn('[PoolPage] getAuthBadgeIndex unavailable; skip auth badges');
         return;
       }
-
-      const r = await api.listCpaAuth();
-      const nextEmails = new Set<string>();
-      const nextHashes = new Set<string>();
+      const r = await api.getAuthBadgeIndex();
+      const nextEmails = new Set((r.emails || []).map((e) => normEmail(e)).filter(Boolean));
+      const nextHashes = new Set(
+        (r.ssoHashes || []).map((h) => String(h || '').trim().toLowerCase()).filter(Boolean)
+      );
       const nextEmailCh = new Map<string, Set<'A' | 'B'>>();
       const nextHashCh = new Map<string, Set<'A' | 'B'>>();
-      const nextEmailFlags = new Map<
-        string,
-        { botFlagSource: number | string | null; isBotFlag1: boolean }
-      >();
-      const nextHashFlags = new Map<
-        string,
-        { botFlagSource: number | string | null; isBotFlag1: boolean }
-      >();
-
-      const addCh = (
-        map: Map<string, Set<'A' | 'B'>>,
-        key: string,
-        ch: 'A' | 'B' | null | undefined
-      ) => {
-        if (!key) return;
-        let set = map.get(key);
-        if (!set) {
-          set = new Set();
-          map.set(key, set);
-        }
-        set.add(ch === 'B' ? 'B' : 'A');
-      };
-
-      const preferFlag = (
-        map: Map<string, { botFlagSource: number | string | null; isBotFlag1: boolean }>,
-        key: string,
-        flag: number | string | null | undefined,
-        is1: boolean | undefined
-      ) => {
-        if (!key) return;
-        if (flag === undefined || flag === null || flag === '') return;
-        const next = {
-          botFlagSource: flag,
-          isBotFlag1: is1 === true || flag === 1 || flag === '1'
-        };
-        const prev = map.get(key);
-        if (prev?.isBotFlag1) return;
-        if (next.isBotFlag1 || !prev) map.set(key, next);
-      };
-
-      for (const it of r.items || []) {
-        const e = normEmail(it.email);
-        if (e) nextEmails.add(e);
-        const h = String(it.ssoHash || '').trim().toLowerCase();
-        if (h) nextHashes.add(h);
-        const ch =
-          it.mintChannel === 'B' ? 'B' : it.mintChannel === 'A' ? 'A' : null;
-        if (e) addCh(nextEmailCh, e, ch);
-        if (h) addCh(nextHashCh, h, ch);
-        if (e) preferFlag(nextEmailFlags, e, it.botFlagSource, it.isBotFlag1);
-        if (h) preferFlag(nextHashFlags, h, it.botFlagSource, it.isBotFlag1);
+      for (const [k, arr] of Object.entries(r.emailChannels || {})) {
+        const key = normEmail(k);
+        if (!key) continue;
+        nextEmailCh.set(key, new Set((arr || []).filter((c) => c === 'A' || c === 'B')));
       }
+      for (const [k, arr] of Object.entries(r.hashChannels || {})) {
+        const key = String(k || '').trim().toLowerCase();
+        if (!key) continue;
+        nextHashCh.set(key, new Set((arr || []).filter((c) => c === 'A' || c === 'B')));
+      }
+      const nextEmailFlags = new Map(
+        Object.entries(r.emailBotFlags || {}).map(([k, v]) => [normEmail(k) || k, v])
+      );
+      const nextHashFlags = new Map(
+        Object.entries(r.hashBotFlags || {}).map(([k, v]) => [
+          String(k || '').trim().toLowerCase(),
+          v
+        ])
+      );
       setAuthEmails(nextEmails);
       setAuthSsoHashes(nextHashes);
       setAuthEmailChannels(nextEmailCh);

@@ -799,6 +799,58 @@ function buildCpaAuthFacets(all: CpaAuthItem[]): CpaAuthListFacets {
   };
 }
 
+/** 列表出口瘦身：去掉绝对 path、截断长 error（内部 list 缓存仍保留完整字段） */
+function toCpaAuthListRow(i: CpaAuthItem): CpaAuthItem {
+  const trimErr = (v?: string | null) => {
+    const s = String(v || '').trim();
+    if (!s) return null;
+    return s.length > 160 ? `${s.slice(0, 160)}…` : s;
+  };
+  return {
+    filename: i.filename,
+    path: '', // 操作一律用 filename；不暴露容器绝对路径
+    email: i.email,
+    sub: i.sub,
+    expired: i.expired,
+    disabled: i.disabled,
+    hasRefresh: i.hasRefresh,
+    mtime: i.mtime,
+    xaiFilename: i.xaiFilename,
+    xaiType: i.xaiType,
+    xai: i.xai,
+    authType: i.authType,
+    botFlagSource: i.botFlagSource,
+    isBotFlag1: i.isBotFlag1,
+    // 列表仍给 hash 供筛选/诊断；无 sso 原文
+    ssoHash: i.ssoHash,
+    hasSso: i.hasSso,
+    mintChannel: i.mintChannel,
+    probeAction: i.probeAction,
+    probeHttp: i.probeHttp,
+    probeAt: i.probeAt,
+    poolHasPassword: i.poolHasPassword,
+    nsfwEnabled: i.nsfwEnabled,
+    nsfwAttempted: i.nsfwAttempted,
+    nsfwAt: i.nsfwAt,
+    nsfwError: trimErr(i.nsfwError),
+    nsfwStatus: i.nsfwStatus,
+    zdrClosed: i.zdrClosed,
+    zdrAttempted: i.zdrAttempted,
+    zdrAt: i.zdrAt,
+    zdrError: trimErr(i.zdrError),
+    zdrStatus: i.zdrStatus,
+    ssoG2Status: i.ssoG2Status,
+    authCpaStatus: i.authCpaStatus,
+    authSub2apiStatus: i.authSub2apiStatus,
+    ssoG2At: i.ssoG2At,
+    authCpaAt: i.authCpaAt,
+    authSub2apiAt: i.authSub2apiAt,
+    ssoG2Error: trimErr(i.ssoG2Error),
+    authCpaError: trimErr(i.authCpaError),
+    authSub2apiError: trimErr(i.authSub2apiError)
+  };
+}
+
 /** 服务端筛选 + 分页（底层 list 带 mtime 缓存） */
 export async function queryCpaAuth(opts: CpaAuthListQuery = {}): Promise<CpaAuthListPage> {
   const { dir, items: all } = await listCpaAuth();
@@ -811,7 +863,7 @@ export async function queryCpaAuth(opts: CpaAuthListQuery = {}): Promise<CpaAuth
   const start = (page - 1) * pageSize;
   return {
     dir,
-    items: filtered.slice(start, start + pageSize),
+    items: filtered.slice(start, start + pageSize).map(toCpaAuthListRow),
     total,
     page,
     pageSize,
@@ -1033,6 +1085,19 @@ export async function backfillCpaAuthSsoFromPool(input?: {
       }
 
       data.sso = hit.sso;
+      const h = hashSsoToken(hit.sso);
+      if (h) data.sso_hash = h;
+      // 回填时补侧车 bot_flag，避免列表再 decode JWT
+      try {
+        const bot = readBotFlagFromAuthRecord(data);
+        if (bot.botFlagSource != null && bot.botFlagSource !== '') {
+          data.bot_flag_source = bot.botFlagSource;
+        } else if (hit.sso) {
+          data.bot_flag_source = 0;
+        }
+      } catch {
+        if (hit.sso) data.bot_flag_source = 0;
+      }
       const tmp = `${full}.tmp`;
       await fsp.writeFile(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
       await fsp.rename(tmp, full);

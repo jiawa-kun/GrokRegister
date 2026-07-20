@@ -109,8 +109,17 @@ let accountsCache: {
   records: AccountRecord[];
 } | null = null;
 
+/** facets 缓存：号池 mtime + auth 索引 mtime 未变则复用 */
+let facetsCache: {
+  accountsMtimeMs: number;
+  accountsSize: number;
+  authMtimeMs: number;
+  facets: AccountListFacets;
+} | null = null;
+
 function invalidateAccountsCache(): void {
   accountsCache = null;
+  facetsCache = null;
 }
 
 async function accountsFileStat(): Promise<{ mtimeMs: number; size: number } | null> {
@@ -567,6 +576,7 @@ const AUTH_INDEX_TTL_MS = 30_000;
 /** Auth 目录变更后调用，避免号池「已转」筛选用旧索引 */
 export function invalidateAuthIndexCache(): void {
   authIndexCache = null;
+  facetsCache = null;
 }
 
 function addAuthChannel(
@@ -921,7 +931,28 @@ export async function queryAccounts(opts: AccountListQuery = {}): Promise<Accoun
     } catch {
       /* fallback sha256 above */
     }
-    const facets = buildFacets(all, authIndex, ssoHashOf);
+    const accSt = await accountsFileStat();
+    const authMt = await authDirMtimeMs();
+    let facets: AccountListFacets;
+    if (
+      facetsCache &&
+      accSt &&
+      facetsCache.accountsMtimeMs === accSt.mtimeMs &&
+      facetsCache.accountsSize === accSt.size &&
+      facetsCache.authMtimeMs === authMt
+    ) {
+      facets = facetsCache.facets;
+    } else {
+      facets = buildFacets(all, authIndex, ssoHashOf);
+      if (accSt) {
+        facetsCache = {
+          accountsMtimeMs: accSt.mtimeMs,
+          accountsSize: accSt.size,
+          authMtimeMs: authMt,
+          facets
+        };
+      }
+    }
     const filtered = all.filter((a) =>
       matchAccountQuery(a, opts, { authIndex, ssoHashOf })
     );
