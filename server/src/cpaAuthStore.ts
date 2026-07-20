@@ -1588,6 +1588,29 @@ export async function pushSub2apiAuthRemoteBatch(input: {
     );
   }
 
+  const proxyForGroup = resolveHttpProxy(settings);
+  const groupName = String(
+    (settings as { sub2apiGroup?: string }).sub2apiGroup || ''
+  ).trim();
+  let resolvedGroupIds: Array<number | string> = [];
+  if (groupName) {
+    const resolved = await resolveSub2apiGroupIds(
+      base,
+      token,
+      groupName,
+      proxyForGroup
+    );
+    resolvedGroupIds = resolved.ids;
+    if (resolvedGroupIds.length === 0) {
+      throw new Error(
+        `sub2api 分组「${groupName}」未找到对应 id。请在设置中点「刷新分组」后重选，或确认远端存在该分组`
+      );
+    }
+    console.log(
+      `[cpa-auth] push-sub2api group=${groupName} -> group_ids=${JSON.stringify(resolvedGroupIds)}`
+    );
+  }
+
   const dir = resolveAuthDir(settings.authDir);
   const names = Array.isArray(input.filenames) ? input.filenames : [];
   const paths = Array.isArray(input.paths) ? input.paths : [];
@@ -1638,7 +1661,10 @@ export async function pushSub2apiAuthRemoteBatch(input: {
     return s;
   }
 
-  function cpaToSub2CreateBody(data: Record<string, unknown>): Record<string, unknown> {
+  function cpaToSub2CreateBody(
+    data: Record<string, unknown>,
+    groupIds?: Array<number | string>
+  ): Record<string, unknown> {
     const email = String(data.email || '').trim();
     const name = email || String(data.name || data.sub || 'grok-oauth');
     const access = String(data.access_token || '').trim();
@@ -1680,7 +1706,7 @@ export async function pushSub2apiAuthRemoteBatch(input: {
       credentials.models = modelIds;
       credentials.available_models = modelIds;
     }
-    const group = String(
+    const groupName = String(
       (settings as { sub2apiGroup?: string }).sub2apiGroup || ''
     ).trim();
     const body: Record<string, unknown> = {
@@ -1698,13 +1724,13 @@ export async function pushSub2apiAuthRemoteBatch(input: {
         mint_channel: data.mint_channel,
         has_grok_45: data.has_grok_45,
         ...(modelIds.length > 0 ? { model_ids: modelIds } : {}),
-        ...(group ? { group } : {})
+        ...(groupName ? { group: groupName } : {})
       }
     };
-    // 指定 sub2api 分组（兼容 group / group_name）
-    if (group) {
-      body.group = group;
-      body.group_name = group;
+    // sub2api 认 group_ids（数字），不是字符串 group 名
+    if (groupIds && groupIds.length > 0) {
+      body.group_ids = groupIds;
+      body.groupIds = groupIds;
     }
     return body;
   }
@@ -1759,7 +1785,7 @@ export async function pushSub2apiAuthRemoteBatch(input: {
         }
         let body: Record<string, unknown>;
         try {
-          body = cpaToSub2CreateBody(data);
+          body = cpaToSub2CreateBody(data, resolvedGroupIds);
         } catch (convErr) {
           const msg = convErr instanceof Error ? convErr.message : String(convErr);
           results.push({
@@ -1979,57 +2005,95 @@ async function findSub2apiAccountIdByName(
   return null;
 }
 
-function collectSub2apiGroupNames(payload: unknown): string[] {
-  const names = new Set<string>();
-  const add = (v: unknown) => {
-    if (v == null) return;
-    if (typeof v === 'string') {
-      const s = v.trim();
-      if (s) names.add(s);
-      return;
+export type Sub2apiGroupItem = { id: number | string; name: string };
+
+function collectSub2apiGroups(payload: unknown): Sub2apiGroupItem[] {
+  const byName = new Map<string, Sub2apiGroupItem>();
+  const add = (nameRaw: unknown, idRaw?: unknown) => {
+    const name = String(nameRaw || '').trim();
+    if (!name) return;
+    let id: number | string | null = null;
+    if (typeof idRaw === 'number' && Number.isFinite(idRaw)) id = idRaw;
+    else if (idRaw != null && String(idRaw).trim()) {
+      const n = Number(idRaw);
+      id = Number.isFinite(n) && String(n) === String(idRaw).trim() ? n : String(idRaw).trim();
     }
-    if (typeof v === 'number' || typeof v === 'boolean') {
-      const s = String(v).trim();
-      if (s) names.add(s);
-      return;
-    }
-    if (typeof v === 'object') {
-      const o = v as Record<string, unknown>;
-      for (const k of ['name', 'group', 'group_name', 'groupName', 'title', 'label']) {
-        if (typeof o[k] === 'string' && String(o[k]).trim()) {
-          names.add(String(o[k]).trim());
-          return;
-        }
-      }
+    const prev = byName.get(name);
+    if (!prev || (prev.id === name && id != null)) {
+      byName.set(name, { id: id != null ? id : name, name });
     }
   };
   const walk = (node: unknown, depth = 0) => {
-    if (node == null || depth > 5) return;
+    if (node == null || depth > 6) return;
     if (Array.isArray(node)) {
       for (const it of node) walk(it, depth + 1);
       return;
     }
     if (typeof node !== 'object') return;
     const o = node as Record<string, unknown>;
-    // 直接分组对象
-    if (
-      typeof o.name === 'string' ||
-      typeof o.group === 'string' ||
-      typeof o.group_name === 'string' ||
-      typeof o.groupName === 'string'
-    ) {
-      add(o);
+    // 标准 groups item: { id, name }
+    if (typeof o.name === 'string' && o.name.trim() && (o.id != null || o.group_id != null)) {
+      add(o.name, o.id ?? o.group_id ?? o.groupId);
     }
-    // 账号上的 group 字段
-    if (o.group != null) add(o.group);
-    if (o.group_name != null) add(o.group_name);
-    if (o.groupName != null) add(o.groupName);
+    // 账号上的 groups: [{id,name}, ...]
+    if (Array.isArray(o.groups)) {
+      for (const g of o.groups) {
+        if (g && typeof g === 'object') {
+          const gg = g as Record<string, unknown>;
+          add(gg.name, gg.id);
+        } else {
+          add(g);
+        }
+      }
+    }
+    if (Array.isArray(o.account_groups)) walk(o.account_groups, depth + 1);
+    if (Array.isArray(o.group_ids) && typeof o.group === 'string') {
+      add(o.group, o.group_ids[0]);
+    }
     for (const k of ['items', 'list', 'groups', 'data', 'accounts', 'rows', 'results']) {
       if (o[k] != null) walk(o[k], depth + 1);
     }
   };
   walk(payload);
-  return Array.from(names).sort((a, b) => a.localeCompare(b, 'zh-CN'));
+  return Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+}
+
+/** 按分组名解析 group_id（sub2api 创建账号认 group_ids，不认字符串 group） */
+async function resolveSub2apiGroupIds(
+  base: string,
+  token: string,
+  groupName: string,
+  proxy: string | undefined
+): Promise<{ ids: Array<number | string>; matched?: Sub2apiGroupItem }> {
+  const name = String(groupName || '').trim();
+  if (!name) return { ids: [] };
+  // 纯数字：直接当 id
+  if (/^\d+$/.test(name)) return { ids: [Number(name)] };
+
+  const tryPaths = [
+    '/api/v1/admin/groups?page=1&page_size=200',
+    '/api/v1/admin/groups',
+    '/api/v1/admin/account-groups'
+  ];
+  for (const p of tryPaths) {
+    try {
+      const res = await requestWithProxyFallback(`${base}${p}`, {
+        method: 'GET',
+        headers: sub2apiAdminAuthHeaders(token),
+        proxy,
+        timeoutMs: 15000
+      });
+      if (res.status < 200 || res.status >= 300) continue;
+      const groups = collectSub2apiGroups(res.data);
+      const hit = groups.find((g) => g.name.toLowerCase() === name.toLowerCase());
+      if (hit) return { ids: [hit.id], matched: hit };
+    } catch {
+      /* try next */
+    }
+  }
+  // 找不到 id 时仍返回空，避免把错误 group 字符串当成功
+  console.warn(`[sub2api] group name not found: ${name}`);
+  return { ids: [] };
 }
 
 /**
@@ -2042,6 +2106,8 @@ export async function listSub2apiGroups(input?: {
   ok: boolean;
   message: string;
   groups: string[];
+  /** 含 id，推送时映射 group_ids */
+  items?: Sub2apiGroupItem[];
   source?: string;
   remoteUrl?: string;
 }> {
@@ -2084,8 +2150,9 @@ export async function listSub2apiGroups(input?: {
     }
   };
 
-  // 1) 常见分组 API
+  // 1) 官方分组 API（含 id）
   const groupPaths = [
+    '/api/v1/admin/groups?page=1&page_size=200',
     '/api/v1/admin/groups',
     '/api/v1/admin/account-groups',
     '/api/v1/admin/group',
@@ -2101,19 +2168,20 @@ export async function listSub2apiGroups(input?: {
         ? (res.data as { code?: unknown })
         : null;
     if (env && env.code != null && Number(env.code) !== 0) continue;
-    const groups = collectSub2apiGroupNames(res.data);
-    if (groups.length > 0) {
+    const items = collectSub2apiGroups(res.data);
+    if (items.length > 0) {
       return {
         ok: true,
-        message: `已获取 ${groups.length} 个分组`,
-        groups,
+        message: `已获取 ${items.length} 个分组`,
+        groups: items.map((x) => x.name),
+        items,
         source: p,
         remoteUrl: base
       };
     }
   }
 
-  // 2) 从账号列表提取 group（兼容无独立 groups API 的版本）
+  // 2) 从账号列表提取 groups
   const accountPaths = [
     '/api/v1/admin/accounts?page=1&page_size=200',
     '/api/v1/admin/accounts?page=1&pageSize=200'
@@ -2126,21 +2194,22 @@ export async function listSub2apiGroups(input?: {
         ? (res.data as { code?: unknown })
         : null;
     if (env && env.code != null && Number(env.code) !== 0) continue;
-    const groups = collectSub2apiGroupNames(res.data);
-    if (groups.length > 0) {
+    const items = collectSub2apiGroups(res.data);
+    if (items.length > 0) {
       return {
         ok: true,
-        message: `已从账号列表提取 ${groups.length} 个分组`,
-        groups,
+        message: `已从账号列表提取 ${items.length} 个分组`,
+        groups: items.map((x) => x.name),
+        items,
         source: p,
         remoteUrl: base
       };
     }
-    // 账号接口通了但没有 group 字段
     return {
       ok: true,
       message: '远端未返回分组字段（可手动输入分组名）',
       groups: [],
+      items: [],
       source: p,
       remoteUrl: base
     };
@@ -2150,6 +2219,7 @@ export async function listSub2apiGroups(input?: {
     ok: false,
     message: '无法获取分组：请检查地址/Token，或手动填写分组名',
     groups: [],
+    items: [],
     remoteUrl: base
   };
 }

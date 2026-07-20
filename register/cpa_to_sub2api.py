@@ -113,17 +113,23 @@ def cpa_xai_to_sub2api_account(
     *,
     source: str = "cpa_xai",
     group: str = "",
+    group_ids: list[Any] | None = None,
 ) -> dict[str, Any]:
     """CPA/xai auth → sub2api DataAccount（可直接 ImportData）。
 
     必填（与 validateDataAccount 一致）：
       name, platform=grok, type=oauth, credentials(非空且含 token)
     credentials 仅含官方 BuildAccountCredentials 键。
-    group: 可选，写入账号分组（CreateAccountRequest.group / group_name）。
+    group_ids: 可选，sub2api 认数字分组 id 列表（非字符串 group 名）。
     """
     email = str(cpa.get("email") or "").strip()
     name = email or str(cpa.get("name") or cpa.get("sub") or "grok-oauth")
     group_name = str(group or cpa.get("group") or cpa.get("group_name") or "").strip()
+    gids: list[Any] = []
+    if isinstance(group_ids, list):
+        gids = [x for x in group_ids if x is not None and str(x).strip() != ""]
+    elif isinstance(cpa.get("group_ids"), list):
+        gids = [x for x in cpa.get("group_ids") or [] if x is not None and str(x).strip() != ""]
     access, refresh = _cpa_tokens(cpa)
     if not access:
         raise ValueError("missing access_token")
@@ -209,10 +215,11 @@ def cpa_xai_to_sub2api_account(
         "concurrency": int(cpa.get("concurrency") or 1),
         "priority": int(cpa.get("priority") or 0),
     }
+    if gids:
+        # sub2api CreateAccount 使用 group_ids（数字 id）
+        account["group_ids"] = gids
+        account["groupIds"] = gids
     if group_name:
-        # 兼容不同 sub2api 版本字段名
-        account["group"] = group_name
-        account["group_name"] = group_name
         account["extra"]["group"] = group_name
 
     # mint 探针写入的可用模型列表（CPA auth 上的 model_ids）→ 给 sub2api 调度/展示

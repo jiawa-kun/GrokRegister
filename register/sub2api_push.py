@@ -170,11 +170,54 @@ def _http_json(
         return 0, str(e)
 
 
+def _resolve_group_ids(
+    base_url: str,
+    token: str,
+    group_name: str,
+    *,
+    timeout: float = 15.0,
+) -> list[Any]:
+    """按分组名查 /api/v1/admin/groups 得到 id 列表。"""
+    name = str(group_name or "").strip()
+    if not name:
+        return []
+    if name.isdigit():
+        return [int(name)]
+    base = _normalize_sub2api_base_url(base_url or "")
+    if not base or not token:
+        return []
+    status, resp = _http_json(
+        "GET",
+        f"{base}/api/v1/admin/groups?page=1&page_size=200",
+        token=token,
+        timeout=timeout,
+    )
+    if not (200 <= status < 300) or not isinstance(resp, dict):
+        return []
+    data = resp.get("data")
+    items = []
+    if isinstance(data, dict):
+        items = data.get("items") or data.get("list") or []
+    elif isinstance(data, list):
+        items = data
+    if not isinstance(items, list):
+        return []
+    nlc = name.lower()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if str(it.get("name") or "").strip().lower() == nlc and it.get("id") is not None:
+            return [it.get("id")]
+    return []
+
+
 def cpa_path_to_create_body(
     cpa_path: str | Path,
     *,
     group: str = "",
     config: dict[str, Any] | None = None,
+    base_url: str = "",
+    token: str = "",
 ) -> dict[str, Any]:
     """CPA xai file → CreateAccountRequest body for sub2api."""
     from cpa_to_sub2api import cpa_xai_to_sub2api_account
@@ -188,7 +231,15 @@ def cpa_path_to_create_body(
         or cfg.get("sub2apiGroup")
         or ""
     ).strip()
-    acc = cpa_xai_to_sub2api_account(cpa, source="cpa_xai", group=group_name)
+    url, tok = read_sub2api_remote_config(cfg)
+    if base_url:
+        url = base_url
+    if token:
+        tok = token
+    gids = _resolve_group_ids(url, tok, group_name) if group_name else []
+    acc = cpa_xai_to_sub2api_account(
+        cpa, source="cpa_xai", group=group_name, group_ids=gids
+    )
     # CreateAccountRequest 不含文档头；DataAccount 字段可直接用
     body: dict[str, Any] = {
         "name": acc["name"],
@@ -204,9 +255,9 @@ def cpa_path_to_create_body(
         body["expires_at"] = acc["expires_at"]
     if acc.get("auto_pause_on_expired") is not None:
         body["auto_pause_on_expired"] = acc["auto_pause_on_expired"]
-    if group_name:
-        body["group"] = group_name
-        body["group_name"] = group_name
+    if gids:
+        body["group_ids"] = gids
+        body["groupIds"] = gids
     return body
 
 
@@ -345,9 +396,20 @@ def push_cpa_file(
     if token:
         tok = token.strip()
     try:
-        body = cpa_path_to_create_body(cpa_path, config=cfg)
+        body = cpa_path_to_create_body(
+            cpa_path, config=cfg, base_url=url, token=tok
+        )
     except Exception as e:
         return {"ok": False, "error": f"convert fail: {e}", "path": str(cpa_path)}
+    # 配置了分组名但解析不到 id：直接失败，避免静默进默认组
+    gname = str(cfg.get("sub2api_group") or cfg.get("sub2apiGroup") or "").strip()
+    if gname and not body.get("group_ids"):
+        return {
+            "ok": False,
+            "error": f"sub2api group not found: {gname}",
+            "path": str(cpa_path),
+            "name": str(body.get("name") or ""),
+        }
     email = str(body.get("name") or "").strip()
     if not force:
         try:
