@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useState } from 'react';
 import {
+  Activity,
   ArrowUpCircle,
   Database,
   Github,
@@ -30,6 +31,8 @@ import type {
   AuthBootstrapInfo,
   AuthState,
   ChangeCredentialsInput,
+  SystemHealth,
+  SystemHealthLevel,
   UpdateInfo
 } from '@shared/ipc';
 
@@ -69,6 +72,8 @@ export default function App() {
   const [localBuildId, setLocalBuildId] = useState<string | null>(null);
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const [updateLoading, setUpdateLoading] = useState(false);
+  const [healthLevel, setHealthLevel] = useState<SystemHealthLevel | null>(null);
+  const [healthSummary, setHealthSummary] = useState<string>('');
 
   const loadUpdate = async () => {
     setUpdateLoading(true);
@@ -81,6 +86,27 @@ export default function App() {
       setUpdateLoading(false);
     }
   };
+
+  const loadHealthChip = async () => {
+    try {
+      const h: SystemHealth = await window.api.getSystemHealth();
+      const errN = h.summary?.error || 0;
+      const warnN = h.summary?.warn || 0;
+      const level: SystemHealthLevel = errN > 0 ? 'error' : warnN > 0 ? 'warn' : 'ok';
+      setHealthLevel(level);
+      setHealthSummary(`OK ${h.summary.ok} · 警告 ${warnN} · 错误 ${errN}`);
+    } catch {
+      setHealthLevel(null);
+      setHealthSummary('');
+    }
+  };
+
+  useEffect(() => {
+    if (!auth.authenticated) return;
+    void loadHealthChip();
+    const id = window.setInterval(() => void loadHealthChip(), 30000);
+    return () => window.clearInterval(id);
+  }, [auth.authenticated]);
 
   useEffect(() => {
     let active = true;
@@ -307,6 +333,41 @@ export default function App() {
               loading={updateLoading}
               onCheck={() => void loadUpdate()}
             />
+            <button
+              type="button"
+              onClick={() => {
+                setTab('settings');
+                setMobileNavOpen(false);
+                void loadHealthChip();
+              }}
+              className={cn(
+                'flex w-full items-center gap-2 rounded-xl border px-2.5 py-2 text-left transition-colors',
+                healthLevel === 'error'
+                  ? 'border-destructive/40 bg-destructive/10 hover:bg-destructive/15'
+                  : healthLevel === 'warn'
+                    ? 'border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/15'
+                    : 'border-border/60 bg-muted/50 hover:bg-muted'
+              )}
+              title={healthSummary || '系统健康 · 点击打开配置页详情'}
+            >
+              <Activity
+                className={cn(
+                  'h-3.5 w-3.5 shrink-0',
+                  healthLevel === 'error'
+                    ? 'text-destructive'
+                    : healthLevel === 'warn'
+                      ? 'text-amber-600 dark:text-amber-400'
+                      : 'text-emerald-600 dark:text-emerald-400'
+                )}
+                aria-hidden
+              />
+              <div className="min-w-0 flex-1">
+                <p className="text-[11px] font-semibold leading-none tracking-tight">系统健康</p>
+                <p className="mt-0.5 truncate text-[10px] text-muted-foreground">
+                  {healthSummary || '检测中…'}
+                </p>
+              </div>
+            </button>
             <div className="flex items-center gap-2">
               <div className="min-w-0 flex-1">
                 <ThemeToggle />

@@ -466,17 +466,34 @@ type AuthIndex = {
   ssoHashes: Set<string>;
 };
 
-let authIndexCache: { at: number; index: AuthIndex } | null = null;
-const AUTH_INDEX_TTL_MS = 15_000;
+let authIndexCache: { at: number; mtimeMs: number; index: AuthIndex } | null = null;
+const AUTH_INDEX_TTL_MS = 30_000;
 
 /** Auth 目录变更后调用，避免号池「已转」筛选用旧索引 */
 export function invalidateAuthIndexCache(): void {
   authIndexCache = null;
 }
 
+async function authDirMtimeMs(): Promise<number> {
+  // 与 cpaAuthStore.resolveAuthDir 一致：固定 DATA_DIR/auth
+  const dir = join(dataDir(), 'auth');
+  try {
+    const st = await fsp.stat(dir);
+    return Number(st.mtimeMs) || 0;
+  } catch {
+    return 0;
+  }
+}
+
 async function loadAuthIndex(): Promise<AuthIndex> {
   const now = Date.now();
-  if (authIndexCache && now - authIndexCache.at < AUTH_INDEX_TTL_MS) {
+  const mtimeMs = await authDirMtimeMs();
+  // TTL 内且目录 mtime 未变才命中缓存（覆盖 Python 自动 mint 写文件的路径）
+  if (
+    authIndexCache &&
+    now - authIndexCache.at < AUTH_INDEX_TTL_MS &&
+    authIndexCache.mtimeMs === mtimeMs
+  ) {
     return authIndexCache.index;
   }
   const emails = new Set<string>();
@@ -498,7 +515,7 @@ async function loadAuthIndex(): Promise<AuthIndex> {
     /* auth 目录不可用时视为无已转 */
   }
   const index = { emails, ssoHashes };
-  authIndexCache = { at: now, index };
+  authIndexCache = { at: now, mtimeMs, index };
   return index;
 }
 
