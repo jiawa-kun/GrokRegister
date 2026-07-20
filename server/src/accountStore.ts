@@ -469,6 +469,11 @@ type AuthIndex = {
 let authIndexCache: { at: number; index: AuthIndex } | null = null;
 const AUTH_INDEX_TTL_MS = 15_000;
 
+/** Auth 目录变更后调用，避免号池「已转」筛选用旧索引 */
+export function invalidateAuthIndexCache(): void {
+  authIndexCache = null;
+}
+
 async function loadAuthIndex(): Promise<AuthIndex> {
   const now = Date.now();
   if (authIndexCache && now - authIndexCache.at < AUTH_INDEX_TTL_MS) {

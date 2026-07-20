@@ -328,9 +328,6 @@ export function PoolPage() {
     }
   };
 
-  /** Auth 筛选已走服务端（email/ssoHash）；始终分页 */
-  const needsFullList = false;
-
   const fetchList = async (opts?: { page?: number; pageSize?: PageSize }) => {
     const p = opts?.page ?? page;
     const ps = opts?.pageSize ?? pageSize;
@@ -719,8 +716,8 @@ export function PoolPage() {
       return { targets: list, scope: 'page', total: list.length, truncated: false };
     }
 
-    // 筛后全部：服务端 match（Auth 筛选时仍走本地全量 filteredAccounts）
-    if (serverPaged && !needsFullList) {
+    // 筛后全部：服务端 match
+    if (serverPaged) {
       const api = window.api as {
         matchAccounts?: (q?: {
           q?: string;

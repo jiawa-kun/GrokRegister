@@ -43,7 +43,8 @@ import {
   queryAccounts,
   matchAccounts,
   migrateAccountSecretStorage,
-  resyncAccountsFromDisk
+  resyncAccountsFromDisk,
+  invalidateAuthIndexCache
 } from './accountStore.js';
 import { checkForUpdate, currentVersion, currentBuildId } from './updateCheck.js';
 import { fetchEmails, extractVerificationCode, fetchLatestCodeByAddress } from './api/emailApi.js';
@@ -691,7 +692,9 @@ app.post('/api/cpa-auth/resign', asyncHandler(async (req: Request, res: Response
       pushRemote?: boolean;
       baseUrlTarget?: string;
     };
-    res.json(await resignCpaAuth(body));
+    const result = await resignCpaAuth(body);
+    invalidateAuthIndexCache();
+    res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
@@ -708,7 +711,9 @@ app.post('/api/cpa-auth/resign-batch', asyncHandler(async (req: Request, res: Re
       pushRemote?: boolean;
       baseUrlTarget?: string;
     };
-    res.json(await resignCpaAuthBatch(body));
+    const result = await resignCpaAuthBatch(body);
+    invalidateAuthIndexCache();
+    res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
@@ -754,14 +759,14 @@ app.post('/api/cpa-auth/mint', asyncHandler(async (req: Request, res: Response) 
       skipBotFlag1?: boolean;
       precheck?: boolean;
     };
-    res.json(
-      await mintCpaAuthFromSso({
-        items: body.items || [],
-        concurrency: body.concurrency,
-        skipBotFlag1: body.skipBotFlag1,
-        precheck: body.precheck
-      })
-    );
+    const result = await mintCpaAuthFromSso({
+      items: body.items || [],
+      concurrency: body.concurrency,
+      skipBotFlag1: body.skipBotFlag1,
+      precheck: body.precheck
+    });
+    invalidateAuthIndexCache();
+    res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
@@ -777,7 +782,10 @@ app.post('/api/cpa-auth/probe-batch', asyncHandler(async (req: Request, res: Res
       concurrency?: number;
       deleteOnDead?: boolean;
     };
-    res.json(await probeCpaAuthBatch(body));
+    const result = await probeCpaAuthBatch(body);
+    // 可能删死号 auth 文件
+    invalidateAuthIndexCache();
+    res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
@@ -794,7 +802,9 @@ app.post('/api/cpa-auth/relogin', asyncHandler(async (req: Request, res: Respons
       filename?: string;
       path?: string;
     };
-    res.json(await reloginCpaAuth(body));
+    const result = await reloginCpaAuth(body);
+    invalidateAuthIndexCache();
+    res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
@@ -805,7 +815,9 @@ app.post('/api/cpa-auth/relogin', asyncHandler(async (req: Request, res: Respons
 app.post('/api/cpa-auth/delete', asyncHandler(async (req: Request, res: Response) => {
   try {
     const body = (req.body ?? {}) as { filenames?: string[]; paths?: string[] };
-    res.json(await deleteCpaAuthBatch(body));
+    const result = await deleteCpaAuthBatch(body);
+    invalidateAuthIndexCache();
+    res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
@@ -826,6 +838,7 @@ app.post('/api/cpa-auth/export', asyncHandler(async (req: Request, res: Response
 /** 从号池按 email 给 auth 回填顶层 sso（旧文件无 sso 时用于 hash 匹配） */
 app.post('/api/cpa-auth/backfill-sso', asyncHandler(async (req: Request, res: Response) => {
   try {
+    invalidateAuthIndexCache();
     const body = (req.body ?? {}) as {
       filenames?: string[];
       force?: boolean;
