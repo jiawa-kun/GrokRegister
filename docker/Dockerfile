@@ -14,6 +14,9 @@ FROM node:20-bookworm-slim AS node-runtime
 
 FROM python:3.13-slim-bookworm AS runtime
 
+ARG APT_MIRROR=
+ARG APT_SECURITY_MIRROR=
+
 ENV NODE_ENV=production \
     PORT=6657 \
     BIND_HOST=0.0.0.0 \
@@ -31,8 +34,18 @@ WORKDIR /app
 
 # chromium + xvfb：无 GUI 下用“有头 Chrome + 虚拟显示”过 Turnstile
 # 附带字体/GL 相关库，减少 canvas/WebGL 指纹残缺
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
+RUN if [ -n "$APT_MIRROR" ] || [ -n "$APT_SECURITY_MIRROR" ]; then \
+      sources="/etc/apt/sources.list.d/debian.sources"; \
+      [ -f "$sources" ] || sources="/etc/apt/sources.list"; \
+      if [ -n "$APT_SECURITY_MIRROR" ]; then \
+        sed -i "s|http://deb.debian.org/debian-security|$APT_SECURITY_MIRROR|g; s|https://deb.debian.org/debian-security|$APT_SECURITY_MIRROR|g" "$sources"; \
+      fi; \
+      if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|http://deb.debian.org/debian|$APT_MIRROR|g; s|https://deb.debian.org/debian|$APT_MIRROR|g" "$sources"; \
+      fi; \
+    fi \
+ && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
+ && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
       chromium \
       xvfb \
       ca-certificates \
@@ -63,8 +76,8 @@ COPY register /opt/register-seed
 # cfwp / sing-box 可执行权限
 RUN python -m pip install --upgrade pip \
  && python -m pip install -r /app/register/requirements.txt \
- && apt-get update \
- && apt-get install -y --no-install-recommends rsync \
+ && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
+ && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y --no-install-recommends rsync \
  && rm -rf /var/lib/apt/lists/*
 # chmod 单独处理：二进制可能按架构缺失，不得吞掉上面 pip/apt 失败
 RUN chmod +x /app/register/bin/cfwp/linux-amd64 /app/register/bin/cfwp/linux-arm64 2>/dev/null || true \

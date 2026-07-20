@@ -6,6 +6,9 @@ param(
     [string]$ImageName = "grok-register-agent:local",
     [string]$IdentityFile,
     [string]$WebPort = "6657",
+    [string]$AptMirror = "https://mirrors.aliyun.com/debian",
+    [string]$AptSecurityMirror = "https://mirrors.aliyun.com/debian-security",
+    [switch]$OfficialApt,
     [switch]$NoCache,
     [switch]$SkipPrune,
     [switch]$Logs,
@@ -103,6 +106,14 @@ $buildArgs = @(
     "-t", $ImageName,
     "--build-arg", "REGISTER_BUILD=$buildId"
 )
+if (-not $OfficialApt) {
+    if ($AptMirror) {
+        $buildArgs += @("--build-arg", "APT_MIRROR=$AptMirror")
+    }
+    if ($AptSecurityMirror) {
+        $buildArgs += @("--build-arg", "APT_SECURITY_MIRROR=$AptSecurityMirror")
+    }
+}
 if ($NoCache) {
     $buildArgs += "--no-cache"
 }
@@ -136,7 +147,11 @@ try {
         }
     }
 
-    Write-Step "local build image $ImageName (REGISTER_BUILD=$buildId)"
+    if ($OfficialApt) {
+        Write-Step "local build image $ImageName (REGISTER_BUILD=$buildId, official Debian apt)"
+    } else {
+        Write-Step "local build image $ImageName (REGISTER_BUILD=$buildId, apt mirror=$AptMirror)"
+    }
     Invoke-Checked "docker" $buildArgs
 
     Write-Step "export image to tar"
@@ -217,6 +232,7 @@ echo "DEPLOY_OK build=$buildId"
     Write-Host "URL: http://23.106.46.133:$WebPort"
     Write-Host "Logs: .\scripts\deploy-server.ps1 -Logs"
     Write-Host "Skip remote dangling-image prune next time: .\scripts\deploy-server.ps1 -SkipPrune"
+    Write-Host "Use official Debian apt next time: .\scripts\deploy-server.ps1 -OfficialApt"
 }
 finally {
     if (Test-Path -LiteralPath $imageTar) {
