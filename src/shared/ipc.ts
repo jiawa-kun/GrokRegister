@@ -331,6 +331,29 @@ export interface RendererApi {
   // accounts
   /** 全量号池（兼容旧调用） */
   listAccounts(): Promise<AccountRecord[]>;
+  /**
+   * 按筛选返回匹配账号（筛后全部验活/导出/补签）。
+   * 精简字段，默认最多 500，硬顶 2000。
+   */
+  matchAccounts?(query?: {
+    q?: string;
+    sso?: string;
+    alive?: string;
+    limit?: number;
+    requireSso?: boolean;
+  }): Promise<{
+    items: {
+      id: string;
+      email: string;
+      password: string;
+      sso: string;
+      createdAt: string;
+    }[];
+    total: number;
+    returned: number;
+    truncated: boolean;
+    limit: number;
+  }>;
   /** 服务端分页/筛选号池 */
   listAccountsPage?(query?: {
     page?: number;

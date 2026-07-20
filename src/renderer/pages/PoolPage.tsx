@@ -644,7 +644,10 @@ export function PoolPage() {
   };
 
   /** 合并导出：email | password | sso（无 SSO 时第三段为空） */
-  const exportAccounts = (records: AccountRecord[]) => {
+  const exportAccounts = (
+    records: { email?: string; password?: string; sso?: string }[],
+    note?: string
+  ) => {
     if (records.length === 0) {
       push({ tone: 'warn', title: '没有可导出的账号' });
       return;
@@ -657,38 +660,194 @@ export function PoolPage() {
     push({
       tone: 'ok',
       title: '已导出账号',
-      description: `${records.length} 条（含 SSO ${withSso}）`
+      description: `${records.length} 条（含 SSO ${withSso}）${note ? ` · ${note}` : ''}`
     });
+  };
+
+  const exportByScope = async (scope: 'page' | 'filter' = 'filter') => {
+    try {
+      if (selected.size > 0) {
+        exportAccounts(
+          accounts.filter((a) => selected.has(a.id)),
+          '已选'
+        );
+        return;
+      }
+      const r = await resolveActionTargets({
+        scope,
+        requireSso: false,
+        limit: 2000
+      });
+      if (r.truncated) {
+        push({
+          tone: 'warn',
+          title: `匹配 ${r.total} 条，本次导出前 ${r.targets.length}`,
+          description: '导出上限 2000'
+        });
+      }
+      exportAccounts(
+        r.targets,
+        r.scope === 'filter' ? '筛后全部' : r.scope === 'page' ? '本页' : undefined
+      );
+    } catch (err) {
+      push({
+        tone: 'danger',
+        title: '导出失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
+    }
   };
 
   const applyResults = (results: SsoCheckResult[]) => {
     applySsoResults(results);
   };
 
-  /** 操作池：有勾选用勾选；否则分页=本页、全量=筛选结果 */
-  const actionPool = () => {
-    if (selected.size > 0) {
-      // 分页模式下跨页勾选只覆盖已加载页；优先本页匹配
-      return accounts.filter((a) => selected.has(a.id));
-    }
-    return serverPaged ? accounts : filteredAccounts;
+  type ActionTarget = {
+    id: string;
+    email: string;
+    password: string;
+    sso: string;
+    createdAt?: string;
   };
 
-  const verifyBatch = async () => {
-    const pool = actionPool();
-    const targets = pool.filter((a) => a.sso);
-    if (targets.length === 0) {
-      push({ tone: 'warn', title: '没有可验活的账号' });
-      return;
+  /** 当前筛选参数（与服务端 match/paged 一致；Auth 筛选不在服务端） */
+  const filterQuery = () => ({
+    q: searchQuery.trim() || undefined,
+    sso: ssoFilter === 'all' ? undefined : ssoFilter,
+    alive: aliveFilter === 'all' ? undefined : aliveFilter
+  });
+
+  /**
+   * 解析操作目标：
+   * - 有勾选：本页已选
+   * - 分页且无勾选：scope=page 用本页；scope=filter 用服务端 match 全量筛选
+   * - 全量模式：用 filteredAccounts
+   */
+  const resolveActionTargets = async (opts?: {
+    scope?: 'page' | 'filter';
+    requireSso?: boolean;
+    limit?: number;
+  }): Promise<{
+    targets: ActionTarget[];
+    scope: 'selected' | 'page' | 'filter' | 'local';
+    total: number;
+    truncated: boolean;
+  }> => {
+    const requireSso = opts?.requireSso === true;
+    const limit = opts?.limit ?? 500;
+    if (selected.size > 0) {
+      const list = accounts
+        .filter((a) => selected.has(a.id))
+        .filter((a) => (requireSso ? Boolean(String(a.sso || '').trim()) : true))
+        .map((a) => ({
+          id: a.id,
+          email: a.email || '',
+          password: a.password || '',
+          sso: a.sso || '',
+          createdAt: a.createdAt
+        }));
+      return { targets: list, scope: 'selected', total: list.length, truncated: false };
     }
-    const missingEmailBefore = targets.filter((a) => !String(a.email || '').trim()).length;
+
+    const wantFilter = opts?.scope === 'filter' || (opts?.scope !== 'page' && serverPaged);
+    // 显式 page：只本页
+    if (opts?.scope === 'page' || (!wantFilter && serverPaged)) {
+      const list = accounts
+        .filter((a) => (requireSso ? Boolean(String(a.sso || '').trim()) : true))
+        .map((a) => ({
+          id: a.id,
+          email: a.email || '',
+          password: a.password || '',
+          sso: a.sso || '',
+          createdAt: a.createdAt
+        }));
+      return { targets: list, scope: 'page', total: list.length, truncated: false };
+    }
+
+    // 筛后全部：服务端 match（Auth 筛选时仍走本地全量 filteredAccounts）
+    if (serverPaged && !needsFullList) {
+      const api = window.api as {
+        matchAccounts?: (q?: {
+          q?: string;
+          sso?: string;
+          alive?: string;
+          limit?: number;
+          requireSso?: boolean;
+        }) => Promise<{
+          items: ActionTarget[];
+          total: number;
+          returned: number;
+          truncated: boolean;
+          limit: number;
+        }>;
+      };
+      if (!api.matchAccounts) {
+        const list = accounts
+          .filter((a) => (requireSso ? Boolean(a.sso) : true))
+          .map((a) => ({
+            id: a.id,
+            email: a.email || '',
+            password: a.password || '',
+            sso: a.sso || '',
+            createdAt: a.createdAt
+          }));
+        return { targets: list, scope: 'page', total: list.length, truncated: false };
+      }
+      const r = await api.matchAccounts({
+        ...filterQuery(),
+        limit,
+        requireSso
+      });
+      return {
+        targets: r.items || [],
+        scope: 'filter',
+        total: r.total,
+        truncated: r.truncated
+      };
+    }
+
+    const list = filteredAccounts
+      .filter((a) => (requireSso ? Boolean(String(a.sso || '').trim()) : true))
+      .slice(0, limit)
+      .map((a) => ({
+        id: a.id,
+        email: a.email || '',
+        password: a.password || '',
+        sso: a.sso || '',
+        createdAt: a.createdAt
+      }));
+    return {
+      targets: list,
+      scope: 'local',
+      total: filteredAccounts.length,
+      truncated: filteredAccounts.length > list.length
+    };
+  };
+
+  const verifyBatch = async (scope: 'page' | 'filter' = 'filter') => {
     setVerifying(true);
     try {
+      const { targets, truncated, total, scope: used } = await resolveActionTargets({
+        scope: selected.size > 0 ? 'page' : scope,
+        requireSso: true,
+        limit: 500
+      });
+      if (targets.length === 0) {
+        push({ tone: 'warn', title: '没有可验活的账号' });
+        return;
+      }
+      if (truncated) {
+        push({
+          tone: 'warn',
+          title: `匹配 ${total} 条，本次只验前 ${targets.length}`,
+          description: '可缩小筛选后再试'
+        });
+      }
+      const missingEmailBefore = targets.filter((a) => !String(a.email || '').trim()).length;
       const results = await window.api.checkSso(
         targets.map((a) => ({ id: a.id, sso: a.sso }))
       );
       applyResults(results);
-      // 服务端已按 SSO 补 email；再拉一次当前页/列表保证 UI 与库一致
       try {
         await fetchList();
       } catch {
@@ -715,10 +874,12 @@ export function PoolPage() {
           : missingEmailBefore > 0
             ? ' · 无邮箱号未补全（验活未返回 email 或已失效）'
             : '';
+      const scopeHint =
+        used === 'filter' ? ' · 筛后全部' : used === 'page' ? ' · 本页' : used === 'selected' ? ' · 已选' : '';
       push({
         tone: 'ok',
         title: '验活完成',
-        description: `存活 ${alive} / ${results.length}（已写入账号库 + 本机缓存）${emailHint}`
+        description: `存活 ${alive} / ${results.length}${scopeHint}（已写入账号库 + 本机缓存）${emailHint}`
       });
     } catch (err) {
       push({ tone: 'danger', title: '批量验活失败', description: String(err) });
@@ -757,15 +918,32 @@ export function PoolPage() {
   };
 
   /** 号池 SSO → 预检存活后 CPA auth 补 mint；分块并显示进度 */
-  const mintAuthFromSso = async () => {
-    const pool = actionPool();
-    const targets = pool.filter((a) => a.sso);
-    if (targets.length === 0) {
-      push({ tone: 'warn', title: '没有可 mint 的 SSO' });
-      return;
-    }
-    if (targets.length > 200) {
-      push({ tone: 'warn', title: '单次最多 200 个', description: '请缩小选择范围后再试' });
+  const mintAuthFromSso = async (scope: 'page' | 'filter' = 'filter') => {
+    let targets: ActionTarget[] = [];
+    try {
+      const r = await resolveActionTargets({
+        scope: selected.size > 0 ? 'page' : scope,
+        requireSso: true,
+        limit: 200
+      });
+      targets = r.targets;
+      if (targets.length === 0) {
+        push({ tone: 'warn', title: '没有可 mint 的 SSO' });
+        return;
+      }
+      if (r.truncated) {
+        push({
+          tone: 'warn',
+          title: `匹配 ${r.total} 条，本次只补签前 ${targets.length}`,
+          description: '补签单次上限 200'
+        });
+      }
+    } catch (err) {
+      push({
+        tone: 'danger',
+        title: '加载筛选失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
       return;
     }
 
@@ -898,11 +1076,32 @@ export function PoolPage() {
   );
 
   /** 号池 SSO → grok2api（需推送设置开启 SSO→grok2api） */
-  const pushG2aFromSso = async () => {
-    const pool = actionPool();
-    const targets = pool.filter((a) => a.sso);
-    if (targets.length === 0) {
-      push({ tone: 'warn', title: '没有可推送的 SSO' });
+  const pushG2aFromSso = async (scope: 'page' | 'filter' = 'filter') => {
+    let targets: ActionTarget[] = [];
+    try {
+      const r = await resolveActionTargets({
+        scope: selected.size > 0 ? 'page' : scope,
+        requireSso: true,
+        limit: 100
+      });
+      targets = r.targets;
+      if (targets.length === 0) {
+        push({ tone: 'warn', title: '没有可推送的 SSO' });
+        return;
+      }
+      if (r.truncated) {
+        push({
+          tone: 'warn',
+          title: `匹配 ${r.total} 条，本次只推前 ${targets.length}`,
+          description: '推送单次上限 100'
+        });
+      }
+    } catch (err) {
+      push({
+        tone: 'danger',
+        title: '加载筛选失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
       return;
     }
     if (!g2aReady) {
@@ -1165,8 +1364,20 @@ export function PoolPage() {
               <span className="mr-0.5 hidden text-[10px] font-semibold tracking-wide text-primary sm:inline">业务</span>
               <Button
                 size="sm"
-                onClick={() => void verifyBatch()}
-                disabled={busy || (serverPaged ? pageAccounts.length === 0 : filteredAccounts.length === 0)}
+                onClick={() => void verifyBatch(selected.size > 0 ? 'page' : 'filter')}
+                disabled={
+                  busy ||
+                  (serverPaged
+                    ? totalForPager === 0 && pageAccounts.length === 0
+                    : filteredAccounts.length === 0)
+                }
+                title={
+                  selected.size > 0
+                    ? '验活已选'
+                    : serverPaged
+                      ? '验活当前筛选下全部匹配（服务端，最多 500）'
+                      : '验活当前列表'
+                }
               >
                 <ShieldCheck className={cn('h-3.5 w-3.5', verifying && 'animate-pulse')} />
                 {verifying
@@ -1174,20 +1385,38 @@ export function PoolPage() {
                   : selected.size > 0
                     ? `验活(${selected.size})`
                     : serverPaged
-                      ? `验活本页(${pageAccounts.length})`
+                      ? hasActiveFilter
+                        ? `验活筛选(${totalForPager})`
+                        : `验活全部(${poolTotal})`
                       : hasActiveFilter
                         ? `验活(${filteredAccounts.length})`
                         : '验活全部'}
               </Button>
+              {serverPaged && selected.size === 0 ? (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => void verifyBatch('page')}
+                  disabled={busy || pageAccounts.length === 0}
+                  title="仅验活当前页"
+                >
+                  验活本页
+                </Button>
+              ) : null}
               <Button
                 variant="secondary"
                 size="sm"
-                onClick={() => void mintAuthFromSso()}
-                disabled={busy || (serverPaged ? pageAccounts.length === 0 : filteredAccounts.length === 0)}
+                onClick={() => void mintAuthFromSso(selected.size > 0 ? 'page' : 'filter')}
+                disabled={
+                  busy ||
+                  (serverPaged
+                    ? totalForPager === 0 && pageAccounts.length === 0
+                    : filteredAccounts.length === 0)
+                }
                 title={
                   skipBotFlag1
-                    ? '预检存活 + 跳过 bot_flag=1 后 mint'
-                    : '预检存活后 mint（含 bot_flag=1）'
+                    ? '预检存活 + 跳过 bot_flag=1 后 mint；筛后全部最多 200'
+                    : '预检存活后 mint；筛后全部最多 200'
                 }
               >
                 <Wand2 className={cn('h-3.5 w-3.5', minting && 'animate-pulse')} />
@@ -1196,7 +1425,9 @@ export function PoolPage() {
                   : selected.size > 0
                     ? `补签 Auth(${picked.filter((a) => a.sso).length})`
                     : serverPaged
-                      ? `补签本页(${pageAccounts.filter((a) => a.sso).length})`
+                      ? hasActiveFilter
+                        ? `补签筛选`
+                        : '补签全部'
                       : hasActiveFilter
                         ? `补签 Auth(${filteredAccounts.filter((a) => a.sso).length})`
                         : '补签 Auth'}
@@ -1253,27 +1484,45 @@ export function PoolPage() {
               <Button
                 variant="secondary"
                 size="sm"
-                onClick={() =>
-                  exportAccounts(
-                    picked.length > 0 ? picked : serverPaged ? accounts : filteredAccounts
-                  )
+                onClick={() => void exportByScope(selected.size > 0 ? 'page' : 'filter')}
+                disabled={
+                  busy ||
+                  (serverPaged
+                    ? totalForPager === 0 && pageAccounts.length === 0
+                    : filteredAccounts.length === 0)
                 }
-                disabled={(serverPaged ? accounts.length === 0 : filteredAccounts.length === 0) || busy}
                 title={
                   picked.length > 0
                     ? `导出已选账号（email|password|sso，共 ${picked.length}）`
-                    : hasActiveFilter
-                      ? '导出当前筛选账号（含无 SSO 行）'
-                      : '导出账号：email | password | sso（无 SSO 第三段为空）'
+                    : serverPaged
+                      ? '导出当前筛选全部（服务端，最多 2000）'
+                      : hasActiveFilter
+                        ? '导出当前筛选账号'
+                        : '导出账号：email | password | sso'
                 }
               >
                 <FileDown className="h-3.5 w-3.5" />
                 {picked.length > 0
                   ? `导出(${picked.length})`
-                  : hasActiveFilter
-                    ? '导出筛选'
-                    : '导出账号'}
+                  : serverPaged
+                    ? hasActiveFilter
+                      ? `导出筛选(${totalForPager})`
+                      : `导出全部(${poolTotal})`
+                    : hasActiveFilter
+                      ? '导出筛选'
+                      : '导出账号'}
               </Button>
+              {serverPaged && selected.size === 0 ? (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => void exportByScope('page')}
+                  disabled={busy || pageAccounts.length === 0}
+                  title="仅导出当前页"
+                >
+                  导出本页
+                </Button>
+              ) : null}
               <span className="mx-0.5 hidden h-4 w-px bg-border sm:inline-block" aria-hidden />
               <Button
                 variant="secondary"

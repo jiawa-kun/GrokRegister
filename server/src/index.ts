@@ -41,6 +41,7 @@ import {
   importAccountsFromText,
   listAccounts,
   queryAccounts,
+  matchAccounts,
   migrateAccountSecretStorage,
   resyncAccountsFromDisk
 } from './accountStore.js';
@@ -579,6 +580,29 @@ app.get('/api/accounts', asyncHandler(async (req, res) => {
       q,
       sso,
       alive
+    })
+  );
+}));
+
+/**
+ * 按筛选返回匹配账号（筛后全部操作：验活/导出/补签）。
+ * query: q, sso, alive, limit, requireSso=1
+ */
+app.get('/api/accounts/match', asyncHandler(async (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q : '';
+  const sso = typeof req.query.sso === 'string' ? req.query.sso : '';
+  const alive = typeof req.query.alive === 'string' ? req.query.alive : '';
+  const limit = Number(req.query.limit || 500);
+  const requireSso =
+    String(req.query.requireSso || '') === '1' ||
+    String(req.query.requireSso || '').toLowerCase() === 'true';
+  res.json(
+    await matchAccounts({
+      q,
+      sso,
+      alive,
+      limit,
+      requireSso
     })
   );
 }));

@@ -537,6 +537,59 @@ export async function queryAccounts(opts: AccountListQuery = {}): Promise<Accoun
   });
 }
 
+export type AccountMatchQuery = AccountListQuery & {
+  /** 最多返回条数（默认 500，硬顶 2000） */
+  limit?: number;
+  /** 仅含 SSO 的账号（验活/补签用） */
+  requireSso?: boolean;
+};
+
+export type AccountMatchItem = {
+  id: string;
+  email: string;
+  password: string;
+  sso: string;
+  createdAt: string;
+};
+
+export type AccountMatchResult = {
+  items: AccountMatchItem[];
+  total: number;
+  returned: number;
+  truncated: boolean;
+  limit: number;
+};
+
+/**
+ * 按筛选返回匹配账号（用于「筛后全部」验活/导出/补签）。
+ * 返回精简字段，避免一次拉全量 tags 大对象。
+ */
+export async function matchAccounts(opts: AccountMatchQuery = {}): Promise<AccountMatchResult> {
+  return withAccountsLock(async () => {
+    const all = await loadAccountsWithTags();
+    let filtered = all.filter((a) => matchAccountQuery(a, opts));
+    if (opts.requireSso) {
+      filtered = filtered.filter((a) => Boolean(String(a.sso || '').trim()));
+    }
+    const limit = Math.min(2000, Math.max(1, Math.floor(Number(opts.limit) || 500)));
+    const total = filtered.length;
+    const slice = filtered.slice(0, limit);
+    return {
+      items: slice.map((a) => ({
+        id: a.id,
+        email: String(a.email || ''),
+        password: String(a.password || ''),
+        sso: String(a.sso || ''),
+        createdAt: a.createdAt
+      })),
+      total,
+      returned: slice.length,
+      truncated: total > slice.length,
+      limit
+    };
+  });
+}
+
 export async function migrateAccountSecretStorage(): Promise<void> {
   await withAccountsLock(encryptPlaintextAccountsIfNeeded);
 }
