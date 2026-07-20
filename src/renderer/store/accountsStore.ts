@@ -213,8 +213,10 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
         lastQuery: null,
         fullListMode: true
       });
-    } catch {
+    } catch (err) {
+      console.error('[accountsStore] reload failed', err);
       set({ loading: false });
+      throw err;
     }
   },
 

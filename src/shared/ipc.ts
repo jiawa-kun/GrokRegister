@@ -160,6 +160,22 @@ export interface CpaAuthItem {
 export interface CpaAuthListResult {
   dir: string;
   items: CpaAuthItem[];
+  /** 分页时存在 */
+  total?: number;
+  page?: number;
+  pageSize?: number;
+  totalPages?: number;
+  facets?: {
+    all: number;
+    noSso: number;
+    noEmail: number;
+    needFill: number;
+    unprobed: number;
+    http200: number;
+    http401: number;
+    http403: number;
+    otherErr: number;
+  };
 }
 
 export interface CpaAuthResignInput {
@@ -460,6 +476,15 @@ export interface RendererApi {
 
   // CPA auth（与登录 /api/auth 区分）
   listCpaAuth(): Promise<CpaAuthListResult>;
+  /** Auth 列表服务端分页/筛选 */
+  listCpaAuthPage?(query?: {
+    page?: number;
+    pageSize?: number;
+    q?: string;
+    meta?: string;
+    status?: string;
+    push?: string;
+  }): Promise<CpaAuthListResult>;
   resignCpaAuth(input: CpaAuthResignInput): Promise<CpaAuthResignResult>;
   resignCpaAuthBatch(input: {
     filenames?: string[];

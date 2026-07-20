@@ -20,11 +20,15 @@ import { Search,
 import { Button } from '@renderer/components/ui/Button';
 import { FilterBar, FilterSegmentGroup } from '@renderer/components/ui/FilterSegmentGroup';
 import { Switch } from '@renderer/components/ui/Switch';
-import { PaginationBar } from '@renderer/components/ui/PaginationBar';
+import {
+  DEFAULT_PAGE_SIZE,
+  loadStoredPageSize,
+  PaginationBar,
+  type PageSize
+} from '@renderer/components/ui/PaginationBar';
 import { BotFlagBadge } from '@renderer/components/domain/BotFlagBadge';
 import { NsfwBadge } from '@renderer/components/domain/NsfwBadge';
 import { PushBadge } from '@renderer/components/domain/PushBadge';
-import { useClientPagination } from '@renderer/hooks/useClientPagination';
 import { useToastStore } from '@renderer/store/toastStore';
 import { useSettingsStore } from '@renderer/store/settingsStore';
 import type { CpaAuthItem } from '@shared/ipc';
@@ -335,6 +339,26 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>(() => loadStatusFilter());
   const [pushFilter, setPushFilter] = useState<PushFilter>(() => loadPushFilter());
   const [searchQuery, setSearchQuery] = useState('');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState<PageSize>(() =>
+    loadStoredPageSize(PAGE_SIZE_KEY, DEFAULT_PAGE_SIZE)
+  );
+  const [listTotal, setListTotal] = useState(0);
+  const [listTotalPages, setListTotalPages] = useState(1);
+  const [facets, setFacets] = useState<{
+    all: number;
+    noSso: number;
+    noEmail: number;
+    needFill: number;
+    unprobed: number;
+    http200: number;
+    http401: number;
+    http403: number;
+    otherErr: number;
+  } | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  /** 全量缓存：批量操作仍需要；与分页展示分离 */
+  const [allItems, setAllItems] = useState<CpaAuthItem[]>([]);
 
   /** 写入单行重登 stage（列表 + 进度条共用） */
   const setRowReloginStage = useCallback(
@@ -411,39 +435,108 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     });
   };
 
-  const reload = useCallback(async (opts?: { silent?: boolean }) => {
-    if (!opts?.silent) setLoading(true);
-    try {
-      const r = await window.api.listCpaAuth();
-      setDir(r.dir);
-      setItems(r.items);
-      // 从落盘字段恢复测活/状态列（刷新后仍显示上次结果）
-      setProbeMap((prev) => {
-        const next = { ...prev };
-        for (const it of r.items) {
-          const act = String(it.probeAction || '').trim();
-          if (!act) continue;
-          const http = Number(it.probeHttp || 0) || undefined;
-          next[it.filename] = { action: act, http };
+  const reload = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      if (!opts?.silent) setLoading(true);
+      try {
+        const api = window.api as {
+          listCpaAuthPage?: (q?: {
+            page?: number;
+            pageSize?: number;
+            q?: string;
+            meta?: string;
+            status?: string;
+            push?: string;
+          }) => Promise<{
+            dir: string;
+            items: CpaAuthItem[];
+            total?: number;
+            page?: number;
+            pageSize?: number;
+            totalPages?: number;
+            facets?: {
+              all: number;
+              noSso: number;
+              noEmail: number;
+              needFill: number;
+              unprobed: number;
+              http200: number;
+              http401: number;
+              http403: number;
+              otherErr: number;
+            };
+          }>;
+          listCpaAuth: () => Promise<{ dir: string; items: CpaAuthItem[] }>;
+        };
+
+        // 分页展示（快路径）
+        if (api.listCpaAuthPage) {
+          const r = await api.listCpaAuthPage({
+            page,
+            pageSize,
+            q: searchQuery.trim() || undefined,
+            meta: metaFilter === 'all' ? undefined : metaFilter,
+            status: statusFilter === 'all' ? undefined : statusFilter,
+            push: pushFilter === 'all' ? undefined : pushFilter
+          });
+          setDir(r.dir);
+          setItems(r.items || []);
+          setListTotal(r.total ?? r.items?.length ?? 0);
+          setListTotalPages(r.totalPages ?? 1);
+          if (r.facets) setFacets(r.facets);
+          setLoadError(null);
+          setProbeMap((prev) => {
+            const next = { ...prev };
+            for (const it of r.items || []) {
+              const act = String(it.probeAction || '').trim();
+              if (!act) continue;
+              const http = Number(it.probeHttp || 0) || undefined;
+              next[it.filename] = { action: act, http };
+            }
+            return next;
+          });
         }
-        return next;
-      });
-      setSelected((prev) => {
-        const names = new Set(r.items.map((i) => i.filename));
-        return new Set([...prev].filter((n) => names.has(n)));
-      });
-    } catch (err) {
-      if (!opts?.silent) {
-        push({
-          tone: 'danger',
-          title: '加载 Auth 失败',
-          description: err instanceof Error ? err.message : String(err)
+
+        // 全量缓存（批量操作 / 顶栏计数兜底）；服务端有 mtime 缓存，轮询成本低
+        const full = await api.listCpaAuth();
+        setDir(full.dir);
+        setAllItems(full.items || []);
+        if (!api.listCpaAuthPage) {
+          setItems(full.items || []);
+          setListTotal(full.items?.length || 0);
+          setListTotalPages(1);
+        }
+        setProbeMap((prev) => {
+          const next = { ...prev };
+          for (const it of full.items || []) {
+            const act = String(it.probeAction || '').trim();
+            if (!act) continue;
+            const http = Number(it.probeHttp || 0) || undefined;
+            next[it.filename] = { action: act, http };
+          }
+          return next;
         });
+        setSelected((prev) => {
+          const names = new Set((full.items || []).map((i) => i.filename));
+          return new Set([...prev].filter((n) => names.has(n)));
+        });
+        setLoadError(null);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setLoadError(msg);
+        if (!opts?.silent) {
+          push({
+            tone: 'danger',
+            title: '加载 Auth 失败',
+            description: msg
+          });
+        }
+      } finally {
+        if (!opts?.silent) setLoading(false);
       }
-    } finally {
-      if (!opts?.silent) setLoading(false);
-    }
-  }, [push]);
+    },
+    [push, page, pageSize, searchQuery, metaFilter, statusFilter, pushFilter]
+  );
 
   useEffect(() => {
     void reload();
@@ -515,8 +608,9 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     [resolveProbe]
   );
 
+  // 展示：服务端分页结果在 items；批量操作：用 allItems 做筛选全集
   const filteredItems = useMemo(() => {
-    let list = items;
+    let list = allItems.length > 0 ? allItems : items;
     if (metaFilter === 'no_sso') list = list.filter((i) => !hasSso(i));
     else if (metaFilter === 'no_email') list = list.filter((i) => !hasEmail(i));
     else if (metaFilter === 'need_fill')
@@ -552,29 +646,29 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
         const email = String(i.email || '').toLowerCase();
         const fn = String(i.filename || '').toLowerCase();
         const sub = String(i.sub || '').toLowerCase();
-        const sso = String((i as { sso?: string }).sso || '').toLowerCase();
-        return (
-          email.includes(q) ||
-          fn.includes(q) ||
-          sub.includes(q) ||
-          sso.includes(q)
-        );
+        return email.includes(q) || fn.includes(q) || sub.includes(q);
       });
     }
     return list;
-  }, [items, metaFilter, statusFilter, pushFilter, matchStatusFilter, searchQuery]);
+  }, [allItems, items, metaFilter, statusFilter, pushFilter, matchStatusFilter, searchQuery]);
 
-  const {
-    pageSize,
-    totalPages,
-    currentPage,
-    pageItems,
-    rangeFrom,
-    rangeTo,
-    setPage,
-    changePageSize,
-    resetPage
-  } = useClientPagination(filteredItems, PAGE_SIZE_KEY);
+  const totalPages = Math.max(1, listTotalPages);
+  const currentPage = Math.min(page, totalPages);
+  const pageItems = items;
+  const pageStart = (currentPage - 1) * pageSize;
+  const rangeFrom = listTotal === 0 ? 0 : pageStart + 1;
+  const rangeTo = Math.min(pageStart + pageSize, listTotal || items.length);
+
+  const resetPage = () => setPage(1);
+  const changePageSize = (size: PageSize) => {
+    setPageSize(size);
+    setPage(1);
+    try {
+      localStorage.setItem(PAGE_SIZE_KEY, String(size));
+    } catch {
+      /* ignore */
+    }
+  };
 
   const changeMetaFilter = (f: MetaFilter) => {
     setMetaFilter(f);
@@ -621,7 +715,10 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     filteredItems.length > 0 && filteredItems.every((i) => selected.has(i.filename));
   const pageAllSelected =
     pageItems.length > 0 && pageItems.every((i) => selected.has(i.filename));
-  const xaiCount = useMemo(() => items.filter((i) => i.xai).length, [items]);
+  const xaiCount = useMemo(
+    () => (allItems.length ? allItems : items).filter((i) => i.xai).length,
+    [allItems, items]
+  );
   const busy = batchBusy !== null || rowBusy !== null;
 
   const toggle = (filename: string) =>
@@ -1973,24 +2070,39 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   const progPct =
     prog && prog.total > 0 ? Math.min(100, Math.round((prog.done / prog.total) * 100)) : 0;
   const missingSsoCount = useMemo(
-    () => items.filter((i) => !i.hasSso).length,
-    [items]
+    () =>
+      facets?.noSso ??
+      (allItems.length ? allItems : items).filter((i) => !i.hasSso).length,
+    [facets, allItems, items]
   );
   const noEmailAuthCount = useMemo(
-    () => items.filter((i) => !String(i.email || '').trim()).length,
-    [items]
+    () =>
+      facets?.noEmail ??
+      (allItems.length ? allItems : items).filter((i) => !String(i.email || '').trim())
+        .length,
+    [facets, allItems, items]
   );
   const needFillCount = useMemo(
     () => items.filter((i) => !hasSso(i) || !hasEmail(i)).length,
     [items]
   );
   const statusCounts = useMemo(() => {
+    if (facets) {
+      return {
+        unprobed: facets.unprobed,
+        c200: facets.http200,
+        c401: facets.http401,
+        c403: facets.http403,
+        other: facets.otherErr
+      };
+    }
     let unprobed = 0;
     let c200 = 0;
     let c401 = 0;
     let c403 = 0;
     let other = 0;
-    for (const i of items) {
+    const src = allItems.length ? allItems : items;
+    for (const i of src) {
       const { action, http } = resolveProbe(i);
       const hasProbe = Boolean(action) || (http != null && http > 0);
       if (!hasProbe) {
@@ -2008,7 +2120,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       }
     }
     return { unprobed, c200, c401, c403, other };
-  }, [items, resolveProbe]);
+  }, [facets, allItems, items, resolveProbe]);
   const pushCounts = useMemo(() => {
     let cpaNone = 0;
     let cpaOk = 0;
@@ -2016,7 +2128,8 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     let s2aNone = 0;
     let s2aOk = 0;
     let s2aFail = 0;
-    for (const i of items) {
+    const src = allItems.length ? allItems : items;
+    for (const i of src) {
       const cpa = i.authCpaStatus ?? 'none';
       const s2a = i.authSub2apiStatus ?? 'none';
       if (cpa === 'ok') cpaOk += 1;
@@ -2027,7 +2140,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       else s2aNone += 1;
     }
     return { cpaNone, cpaOk, cpaFail, s2aNone, s2aOk, s2aFail };
-  }, [items]);
+  }, [allItems, items]);
   const hasActiveMetaFilter = metaFilter !== 'all';
   const hasActiveStatusFilter = statusFilter !== 'all';
   const hasActivePushFilter = pushFilter !== 'all';
@@ -2241,11 +2354,32 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   return (
     <div className="space-y-5">
       <section className="terminal-grid">
-        <AuthMetric label="Auth 文件" value={String(items.length)} Icon={KeyRound} />
+        <AuthMetric
+          label="Auth 文件"
+          value={String(facets?.all ?? (allItems.length || items.length))}
+          Icon={KeyRound}
+        />
         <AuthMetric label="xai 标识" value={String(xaiCount)} Icon={KeyRound} />
         <AuthMetric label="无 sso" value={String(missingSsoCount)} Icon={Link2} />
         <AuthMetric label="无邮箱" value={String(noEmailAuthCount)} Icon={KeyRound} />
       </section>
+
+      {loadError ? (
+        <div className="rounded-[16px] border border-destructive/40 bg-destructive/10 px-4 py-3 text-[13px]">
+          <div className="font-semibold text-destructive">Auth 列表加载失败</div>
+          <p className="mt-1 break-all text-muted-foreground">{loadError}</p>
+          <Button
+            type="button"
+            size="sm"
+            className="mt-2"
+            onClick={() => void reload()}
+            disabled={loading}
+          >
+            <RefreshCcw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+            重试
+          </Button>
+        </div>
+      ) : null}
 
       {prog && (
         <div className="rounded-[16px] border border-primary/30 bg-primary/5 px-4 py-3 shadow-[var(--ios-shadow)]">
@@ -2352,8 +2486,9 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                   {selected.size > 0 ? `已选 ${selected.size}` : '未选择'}
                 </span>
                 {hasActiveFilter
-                  ? ` · 筛选 ${filteredItems.length}/${items.length}`
-                  : ` · 共 ${items.length}`}
+                  ? ` · 筛选 ${listTotal || filteredItems.length}/${facets?.all ?? (allItems.length || items.length)}`
+                  : ` · 共 ${facets?.all ?? (allItems.length || items.length)}`}
+                {` · 服务端分页`}
                 {missingSsoCount > 0 ? ` · 无sso ${missingSsoCount}` : ''}
                 {noEmailAuthCount > 0 ? ` · 无邮箱 ${noEmailAuthCount}` : ''}
                 {!deleteOnDead ? ' · 测活死号不删' : ''}
@@ -3297,7 +3432,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
           totalPages={totalPages}
           rangeFrom={rangeFrom}
           rangeTo={rangeTo}
-          total={filteredItems.length}
+          total={listTotal || filteredItems.length}
           pageSize={pageSize}
           onChange={setPage}
           onPageSizeChange={changePageSize}

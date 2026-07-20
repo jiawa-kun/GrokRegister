@@ -414,12 +414,49 @@ async function buildPoolPasswordMap(): Promise<Map<string, boolean>> {
   return map;
 }
 
-export async function listCpaAuth(): Promise<{ dir: string; items: CpaAuthItem[] }> {
+let listCpaAuthCache: {
+  at: number;
+  mtimeMs: number;
+  dir: string;
+  items: CpaAuthItem[];
+} | null = null;
+const LIST_CPA_AUTH_TTL_MS = 20_000;
+
+/** Auth 目录变更后清列表缓存（与号池 auth 索引失效一起调用） */
+export function invalidateCpaAuthListCache(): void {
+  listCpaAuthCache = null;
+}
+
+async function authDirMtimeMs(dir: string): Promise<number> {
+  try {
+    const st = await fsp.stat(dir);
+    return Number(st.mtimeMs) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+export async function listCpaAuth(opts?: {
+  force?: boolean;
+}): Promise<{ dir: string; items: CpaAuthItem[] }> {
   const settings = await loadSettings();
   const dir = resolveAuthDir(settings.authDir);
   if (!existsSync(dir)) {
+    listCpaAuthCache = null;
     return { dir, items: [] };
   }
+  const mtimeMs = await authDirMtimeMs(dir);
+  const now = Date.now();
+  if (
+    !opts?.force &&
+    listCpaAuthCache &&
+    listCpaAuthCache.dir === dir &&
+    listCpaAuthCache.mtimeMs === mtimeMs &&
+    now - listCpaAuthCache.at < LIST_CPA_AUTH_TTL_MS
+  ) {
+    return { dir, items: listCpaAuthCache.items };
+  }
+
   const poolPw = await buildPoolPasswordMap();
   const accountTags = loadAccountTags();
   const names = await fsp.readdir(dir);
@@ -614,7 +651,149 @@ export async function listCpaAuth(): Promise<{ dir: string; items: CpaAuthItem[]
     );
   }
 
+  listCpaAuthCache = { at: Date.now(), mtimeMs, dir, items };
   return { dir, items };
+}
+
+export type CpaAuthListQuery = {
+  page?: number;
+  pageSize?: number;
+  q?: string;
+  /** all | no_sso | no_email | need_fill */
+  meta?: string;
+  /** all | unprobed | 200 | 401 | 403 | other_err */
+  status?: string;
+  /** all | cpa_none | cpa_ok | cpa_fail | s2a_none | s2a_ok | s2a_fail */
+  push?: string;
+};
+
+export type CpaAuthListFacets = {
+  all: number;
+  noSso: number;
+  noEmail: number;
+  needFill: number;
+  unprobed: number;
+  http200: number;
+  http401: number;
+  http403: number;
+  otherErr: number;
+};
+
+export type CpaAuthListPage = {
+  dir: string;
+  items: CpaAuthItem[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  facets: CpaAuthListFacets;
+};
+
+function matchCpaAuthItem(i: CpaAuthItem, opts: CpaAuthListQuery): boolean {
+  const meta = String(opts.meta || 'all').trim().toLowerCase();
+  const hasSso = Boolean(i.hasSso);
+  const hasEmail = Boolean(String(i.email || '').trim());
+  if (meta === 'no_sso' && hasSso) return false;
+  if (meta === 'no_email' && hasEmail) return false;
+  if (meta === 'need_fill' && hasSso && hasEmail) return false;
+
+  const status = String(opts.status || 'all').trim().toLowerCase();
+  if (status !== 'all') {
+    const http = Number(i.probeHttp || 0) || 0;
+    const action = String(i.probeAction || '').trim();
+    const probed = Boolean(action) || http > 0;
+    if (status === 'unprobed') {
+      if (probed) return false;
+    } else if (status === '200') {
+      if (http !== 200 && action !== 'ok') return false;
+    } else if (status === '401') {
+      if (http !== 401) return false;
+    } else if (status === '403') {
+      if (http !== 403) return false;
+    } else if (status === 'other_err') {
+      if (!probed) return false;
+      if (http === 200 || action === 'ok' || http === 401 || http === 403) return false;
+    }
+  }
+
+  const push = String(opts.push || 'all').trim().toLowerCase();
+  if (push !== 'all') {
+    const cpa = i.authCpaStatus ?? 'none';
+    const s2a = i.authSub2apiStatus ?? 'none';
+    if (push === 'cpa_none' && cpa !== 'none') return false;
+    if (push === 'cpa_ok' && cpa !== 'ok') return false;
+    if (push === 'cpa_fail' && cpa !== 'fail') return false;
+    if (push === 's2a_none' && s2a !== 'none') return false;
+    if (push === 's2a_ok' && s2a !== 'ok') return false;
+    if (push === 's2a_fail' && s2a !== 'fail') return false;
+  }
+
+  const q = String(opts.q || '').trim().toLowerCase();
+  if (q) {
+    const email = String(i.email || '').toLowerCase();
+    const fn = String(i.filename || '').toLowerCase();
+    const sub = String(i.sub || '').toLowerCase();
+    if (!email.includes(q) && !fn.includes(q) && !sub.includes(q)) return false;
+  }
+  return true;
+}
+
+function buildCpaAuthFacets(all: CpaAuthItem[]): CpaAuthListFacets {
+  let noSso = 0;
+  let noEmail = 0;
+  let needFill = 0;
+  let unprobed = 0;
+  let http200 = 0;
+  let http401 = 0;
+  let http403 = 0;
+  let otherErr = 0;
+  for (const i of all) {
+    const hasSso = Boolean(i.hasSso);
+    const hasEmail = Boolean(String(i.email || '').trim());
+    if (!hasSso) noSso++;
+    if (!hasEmail) noEmail++;
+    if (!hasSso || !hasEmail) needFill++;
+    const http = Number(i.probeHttp || 0) || 0;
+    const action = String(i.probeAction || '').trim();
+    const probed = Boolean(action) || http > 0;
+    if (!probed) unprobed++;
+    else if (http === 200 || action === 'ok') http200++;
+    else if (http === 401) http401++;
+    else if (http === 403) http403++;
+    else otherErr++;
+  }
+  return {
+    all: all.length,
+    noSso,
+    noEmail,
+    needFill,
+    unprobed,
+    http200,
+    http401,
+    http403,
+    otherErr
+  };
+}
+
+/** 服务端筛选 + 分页（底层 list 带 mtime 缓存） */
+export async function queryCpaAuth(opts: CpaAuthListQuery = {}): Promise<CpaAuthListPage> {
+  const { dir, items: all } = await listCpaAuth();
+  const facets = buildCpaAuthFacets(all);
+  const filtered = all.filter((i) => matchCpaAuthItem(i, opts));
+  const pageSize = Math.min(2000, Math.max(1, Math.floor(Number(opts.pageSize) || 20)));
+  const total = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize) || 1);
+  const page = Math.min(totalPages, Math.max(1, Math.floor(Number(opts.page) || 1)));
+  const start = (page - 1) * pageSize;
+  return {
+    dir,
+    items: filtered.slice(start, start + pageSize),
+    total,
+    page,
+    pageSize,
+    totalPages,
+    facets
+  };
 }
 
 export interface BackfillCpaAuthSsoResult {

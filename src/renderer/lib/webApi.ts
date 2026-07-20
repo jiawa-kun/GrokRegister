@@ -230,6 +230,17 @@ const webApi: RendererApi = {
     http('POST', '/api/accounts/push-grok2api', input),
 
   listCpaAuth: () => http('GET', '/api/cpa-auth'),
+  listCpaAuthPage: (query) => {
+    const qs = new URLSearchParams();
+    qs.set('paged', '1');
+    if (query?.page != null) qs.set('page', String(query.page));
+    if (query?.pageSize != null) qs.set('pageSize', String(query.pageSize));
+    if (query?.q) qs.set('q', query.q);
+    if (query?.meta) qs.set('meta', query.meta);
+    if (query?.status) qs.set('status', query.status);
+    if (query?.push) qs.set('push', query.push);
+    return http('GET', `/api/cpa-auth?${qs.toString()}`);
+  },
   resignCpaAuth: (input) => http('POST', '/api/cpa-auth/resign', input),
   resignCpaAuthBatch: (input) => http('POST', '/api/cpa-auth/resign-batch', input),
   mintCpaAuthFromSso: (input) => http('POST', '/api/cpa-auth/mint', input),

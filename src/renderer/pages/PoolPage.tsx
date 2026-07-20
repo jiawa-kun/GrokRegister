@@ -341,6 +341,8 @@ export function PoolPage() {
     });
   };
 
+  const [poolLoadError, setPoolLoadError] = useState<string | null>(null);
+
   const doReload = async (scanHistory = false) => {
     try {
       if (scanHistory) {
@@ -355,6 +357,7 @@ export function PoolPage() {
       } else {
         await fetchList();
       }
+      setPoolLoadError(null);
       try {
         await reloadAuthEmails();
       } catch (authErr) {
@@ -362,10 +365,12 @@ export function PoolPage() {
         console.warn('[PoolPage] reloadAuthEmails failed', authErr);
       }
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setPoolLoadError(msg);
       push({
         tone: 'danger',
         title: '加载 SSO 失败',
-        description: err instanceof Error ? err.message : String(err)
+        description: msg
       });
     } finally {
       setLastRefresh(new Date().toISOString());
@@ -1137,6 +1142,23 @@ export function PoolPage() {
           Icon={RefreshCcw}
         />
       </section>
+
+      {poolLoadError ? (
+        <div className="rounded-[16px] border border-destructive/40 bg-destructive/10 px-4 py-3 text-[13px]">
+          <div className="font-semibold text-destructive">号池加载失败</div>
+          <p className="mt-1 break-all text-muted-foreground">{poolLoadError}</p>
+          <Button
+            type="button"
+            size="sm"
+            className="mt-2"
+            onClick={() => void doReload(false)}
+            disabled={loading}
+          >
+            <RefreshCcw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+            重试
+          </Button>
+        </div>
+      ) : null}
 
       {mintProg && (
         <div className="rounded-[16px] border border-primary/30 bg-primary/5 px-4 py-3 shadow-[var(--ios-shadow)]">

@@ -20,6 +20,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
     } catch (err) {
       console.error('[settingsStore] reload failed', err);
       set({ loading: false });
+      throw err;
     }
   }
 }));

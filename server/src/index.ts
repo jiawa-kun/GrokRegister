@@ -80,6 +80,8 @@ import {
   backfillCpaAuthSsoFromPool,
   deleteCpaAuthBatch,
   listCpaAuth,
+  queryCpaAuth,
+  invalidateCpaAuthListCache,
   mintCpaAuthFromSso,
   probeCpaAuthBatch,
   pushCpaAuthRemoteBatch,
@@ -567,6 +569,7 @@ app.post(
   '/api/internal/auth-index/invalidate',
   asyncHandler(async (_req, res) => {
     invalidateAuthIndexCache();
+    invalidateCpaAuthListCache();
     res.json({ ok: true });
   })
 );
@@ -688,9 +691,30 @@ app.post('/api/accounts/push-grok2api', asyncHandler(async (req: Request, res: R
 }));
 
 /** CPA auth 文件列表（data/auth 或 settings.authDir） */
-app.get('/api/cpa-auth', asyncHandler(async (_req, res) => {
+app.get('/api/cpa-auth', asyncHandler(async (req, res) => {
   try {
-    res.json(await listCpaAuth());
+    const pageRaw = req.query.page;
+    const pageSizeRaw = req.query.pageSize ?? req.query.limit;
+    const wantsPage =
+      pageRaw != null ||
+      pageSizeRaw != null ||
+      String(req.query.paged || '') === '1' ||
+      String(req.query.paged || '').toLowerCase() === 'true';
+    if (!wantsPage) {
+      // 兼容：无分页参数仍返回全量 { dir, items }
+      res.json(await listCpaAuth());
+      return;
+    }
+    res.json(
+      await queryCpaAuth({
+        page: Number(pageRaw || 1),
+        pageSize: Number(pageSizeRaw || 20),
+        q: typeof req.query.q === 'string' ? req.query.q : '',
+        meta: typeof req.query.meta === 'string' ? req.query.meta : '',
+        status: typeof req.query.status === 'string' ? req.query.status : '',
+        push: typeof req.query.push === 'string' ? req.query.push : ''
+      })
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: message });
@@ -709,6 +733,7 @@ app.post('/api/cpa-auth/resign', asyncHandler(async (req: Request, res: Response
     };
     const result = await resignCpaAuth(body);
     invalidateAuthIndexCache();
+    invalidateCpaAuthListCache();
     res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -728,6 +753,7 @@ app.post('/api/cpa-auth/resign-batch', asyncHandler(async (req: Request, res: Re
     };
     const result = await resignCpaAuthBatch(body);
     invalidateAuthIndexCache();
+    invalidateCpaAuthListCache();
     res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -781,6 +807,7 @@ app.post('/api/cpa-auth/mint', asyncHandler(async (req: Request, res: Response) 
       precheck: body.precheck
     });
     invalidateAuthIndexCache();
+    invalidateCpaAuthListCache();
     res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -800,6 +827,7 @@ app.post('/api/cpa-auth/probe-batch', asyncHandler(async (req: Request, res: Res
     const result = await probeCpaAuthBatch(body);
     // 可能删死号 auth 文件
     invalidateAuthIndexCache();
+    invalidateCpaAuthListCache();
     res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -819,6 +847,7 @@ app.post('/api/cpa-auth/relogin', asyncHandler(async (req: Request, res: Respons
     };
     const result = await reloginCpaAuth(body);
     invalidateAuthIndexCache();
+    invalidateCpaAuthListCache();
     res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -832,6 +861,7 @@ app.post('/api/cpa-auth/delete', asyncHandler(async (req: Request, res: Response
     const body = (req.body ?? {}) as { filenames?: string[]; paths?: string[] };
     const result = await deleteCpaAuthBatch(body);
     invalidateAuthIndexCache();
+    invalidateCpaAuthListCache();
     res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -854,6 +884,7 @@ app.post('/api/cpa-auth/export', asyncHandler(async (req: Request, res: Response
 app.post('/api/cpa-auth/backfill-sso', asyncHandler(async (req: Request, res: Response) => {
   try {
     invalidateAuthIndexCache();
+    invalidateCpaAuthListCache();
     const body = (req.body ?? {}) as {
       filenames?: string[];
       force?: boolean;
