@@ -166,13 +166,15 @@ docker exec $( $ContainerName ) sh -c 'set -e
 '
 rm -f $( $remoteTar )
 $restartBlock
-# Health: node classic function() (container may lack curl; avoid => for bash/ssh)
-code=`$(docker exec $( $ContainerName ) node -e "require('http').get('http://127.0.0.1:6657/',function(r){process.stdout.write(String(r.statusCode));process.exit(0)}).on('error',function(){process.stdout.write('0');process.exit(0)})" 2>/dev/null || echo 0)
-echo "health_http=`$code"
 docker ps --filter name=$( $ContainerName ) --format '{{.Names}} {{.Status}}'
 echo "HOT_DEPLOY_OK build=$stamp"
 "@
     Invoke-Checked "ssh" ($sshBaseArgs + @($HostName, $remote))
+
+    Write-Step "health check"
+    # Separate simple SSH: no nested node/python one-liners (bash $() + parens breaks)
+    $healthRemote = "echo BUILD_ID=`$(docker exec $ContainerName cat /app/register/BUILD_ID 2>/dev/null || echo missing); echo dist=`$(docker exec $ContainerName sh -c 'test -f /app/server/dist/server/src/index.js && echo ok || echo missing'); docker ps --filter name=$ContainerName --format '{{.Names}} {{.Status}}'"
+    Invoke-Checked "ssh" ($sshBaseArgs + @($HostName, $healthRemote))
 
     Write-Host ""
     Write-Host "Hot deployed build=$stamp"
