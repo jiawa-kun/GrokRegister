@@ -336,7 +336,170 @@ const webApi: RendererApi = {
   },
   resignCpaAuth: (input) => http('POST', '/api/cpa-auth/resign', input),
   resignCpaAuthBatch: (input) => http('POST', '/api/cpa-auth/resign-batch', input),
+  resignCpaAuthBatchStream: async (input, onItem) => {
+    const signal =
+      activeAbortSignal && !activeAbortSignal.aborted ? activeAbortSignal : undefined;
+    const res = await fetch('/api/cpa-auth/resign-stream', {
+      method: 'POST',
+      credentials: 'include',
+      headers: buildHeaders(input),
+      body: JSON.stringify(input),
+      signal
+    });
+    if (!res.ok) {
+      let detail = '';
+      try {
+        detail = await res.text();
+      } catch {
+        /* ignore */
+      }
+      if (detail.length > 240 || /<!DOCTYPE html/i.test(detail)) {
+        detail = detail.replace(/\s+/g, ' ').slice(0, 180) + '…';
+      }
+      throw new Error(
+        `POST /api/cpa-auth/resign-stream → HTTP ${res.status}: ${detail}`
+      );
+    }
+    if (!res.body) {
+      return http('POST', '/api/cpa-auth/resign-batch', input);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let summary: import('@shared/ipc').CpaAuthBatchResult | null = null;
+    const results: import('@shared/ipc').CpaAuthBatchResultItem[] = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split('\n');
+      buf = parts.pop() || '';
+      for (const line of parts) {
+        const t = line.trim();
+        if (!t) continue;
+        let msg: Record<string, unknown>;
+        try {
+          msg = JSON.parse(t) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        if (msg.type === 'item') {
+          const item = { ...msg } as unknown as import('@shared/ipc').CpaAuthBatchResultItem & {
+            type?: string;
+          };
+          delete (item as { type?: string }).type;
+          results.push(item);
+          onItem(item);
+        } else if (msg.type === 'done') {
+          summary = {
+            total: Number(msg.total) || results.length,
+            ok: Number(msg.ok) || 0,
+            failed: Number(msg.failed) || 0,
+            remoteOk: Number(msg.remoteOk) || 0,
+            remoteFailed: Number(msg.remoteFailed) || 0,
+            results
+          };
+        } else if (msg.type === 'error') {
+          throw new Error(String(msg.error || '重签流失败'));
+        }
+      }
+    }
+    if (summary) return summary;
+    const ok = results.filter((r) => r.ok).length;
+    return {
+      total: results.length,
+      ok,
+      failed: results.length - ok,
+      remoteOk: results.filter((r) => r.remoteOk === true).length,
+      remoteFailed: results.filter((r) => r.remoteOk === false).length,
+      results
+    };
+  },
   mintCpaAuthFromSso: (input) => http('POST', '/api/cpa-auth/mint', input),
+  mintCpaAuthFromSsoStream: async (input, onItem) => {
+    const signal =
+      activeAbortSignal && !activeAbortSignal.aborted ? activeAbortSignal : undefined;
+    const res = await fetch('/api/cpa-auth/mint-stream', {
+      method: 'POST',
+      credentials: 'include',
+      headers: buildHeaders(input),
+      body: JSON.stringify(input),
+      signal
+    });
+    if (!res.ok) {
+      let detail = '';
+      try {
+        detail = await res.text();
+      } catch {
+        /* ignore */
+      }
+      if (detail.length > 240 || /<!DOCTYPE html/i.test(detail)) {
+        detail = detail.replace(/\s+/g, ' ').slice(0, 180) + '…';
+      }
+      throw new Error(
+        `POST /api/cpa-auth/mint-stream → HTTP ${res.status}: ${detail}`
+      );
+    }
+    if (!res.body) {
+      return http('POST', '/api/cpa-auth/mint', input);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let summary: import('@shared/ipc').CpaAuthBatchResult | null = null;
+    const results: import('@shared/ipc').CpaAuthBatchResultItem[] = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split('\n');
+      buf = parts.pop() || '';
+      for (const line of parts) {
+        const t = line.trim();
+        if (!t) continue;
+        let msg: Record<string, unknown>;
+        try {
+          msg = JSON.parse(t) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        if (msg.type === 'item') {
+          const item = { ...msg } as unknown as import('@shared/ipc').CpaAuthBatchResultItem & {
+            type?: string;
+          };
+          delete (item as { type?: string }).type;
+          results.push(item);
+          onItem(item);
+        } else if (msg.type === 'done') {
+          summary = {
+            total: Number(msg.total) || results.length,
+            ok: Number(msg.ok) || 0,
+            failed: Number(msg.failed) || 0,
+            skipped: Number(msg.skipped) || 0,
+            banned: Number(msg.banned) || 0,
+            remoteOk: Number(msg.remoteOk) || 0,
+            remoteFailed: Number(msg.remoteFailed) || 0,
+            results
+          };
+        } else if (msg.type === 'error') {
+          throw new Error(String(msg.error || '补签流失败'));
+        }
+      }
+    }
+    if (summary) return summary;
+    const ok = results.filter((r) => r.ok).length;
+    const skipped = results.filter((r) => r.skipped).length;
+    return {
+      total: results.length,
+      ok,
+      failed: results.length - ok - skipped,
+      skipped,
+      banned: results.filter((r) => r.verdict === 'banned').length,
+      remoteOk: results.filter((r) => r.remoteOk === true).length,
+      remoteFailed: results.filter((r) => r.remoteOk === false).length,
+      results
+    };
+  },
   probeCpaAuthBatch: (input) => http('POST', '/api/cpa-auth/probe-batch', input),
   probeCpaAuthBatchStream: async (input, onItem) => {
     const signal =

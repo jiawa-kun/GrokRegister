@@ -273,6 +273,8 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     | null
   >(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  /** 上次批量重签失败文件名（会话内「仅失败」复检） */
+  const lastResignFailedRef = useRef<string[]>([]);
 
   type BatchKind =
     | 'resign'
@@ -1424,18 +1426,99 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       .join(' ');
   };
 
-  const resignBatch = async (baseUrlTarget: 'cli' | 'api' = 'cli') => {
-    const label = baseUrlTarget === 'api' ? '重签 api' : '重签 cli';
+  type ResignRecheck = 'all' | 'failed' | 'no_refresh' | 'no_sso' | '401';
+
+  const resignBatch = async (
+    baseUrlTarget: 'cli' | 'api' = 'cli',
+    opts?: { recheck?: ResignRecheck }
+  ) => {
+    const recheck: ResignRecheck = opts?.recheck || 'all';
+    const recheckHint =
+      recheck === 'failed'
+        ? '仅失败'
+        : recheck === 'no_refresh'
+          ? '仅无refresh'
+          : recheck === 'no_sso'
+            ? '仅缺SSO'
+            : recheck === '401'
+              ? '仅401'
+              : '';
+    const label =
+      (baseUrlTarget === 'api' ? '重签 api' : '重签 cli') +
+      (recheckHint ? '·' + recheckHint : '');
     let filenames: string[] = [];
     try {
-      const r = await resolveTargetNames({ limit: 500 });
-      filenames = r.names;
-      if (r.truncated) {
-        push({
-          tone: 'warn',
-          title: `匹配 ${r.total} 条，本次 ${r.names.length}`,
-          description: `${label} 单次上限 500`
+      if (recheck === 'failed') {
+        filenames = [...lastResignFailedRef.current];
+        if (filenames.length === 0) {
+          push({
+            tone: 'warn',
+            title: '没有上次失败的重签目标',
+            description: '请先跑一轮批量重签'
+          });
+          return;
+        }
+      } else if (recheck === '401') {
+        if (selected.size > 0) {
+          filenames = [...selected];
+        } else {
+          const r = await resolveTargetNames({
+            query: authFilterQuery({ status: '401' }),
+            limit: 500,
+            ignoreSelected: true
+          });
+          filenames = r.names;
+        }
+      } else if (recheck === 'no_sso') {
+        const r = await resolveTargetNames({
+          requireMissingSso: true,
+          limit: 500
         });
+        filenames = r.names;
+      } else if (recheck === 'no_refresh') {
+        const api = window.api as {
+          matchCpaAuth?: (q?: Record<string, unknown>) => Promise<{
+            items: { filename: string; hasRefresh?: boolean }[];
+            total: number;
+            truncated: boolean;
+          }>;
+        };
+        if (selected.size > 0) {
+          const set = new Set(selected);
+          filenames = (items.length ? items : filteredItems)
+            .filter((i) => set.has(i.filename) && !i.hasRefresh)
+            .map((i) => i.filename);
+        } else if (api.matchCpaAuth) {
+          const r = await api.matchCpaAuth({
+            ...authFilterQuery(),
+            limit: 500
+          });
+          filenames = (r.items || [])
+            .filter((i) => i.hasRefresh === false)
+            .map((i) => i.filename);
+          if (r.truncated) {
+            push({
+              tone: 'warn',
+              title: '匹配较多，本次仅无 refresh ' + filenames.length + ' 条',
+              description: '可缩小筛选后再试'
+            });
+          }
+        } else {
+          filenames = filteredItems
+            .filter((i) => !i.hasRefresh)
+            .map((i) => i.filename)
+            .slice(0, 500);
+        }
+      } else {
+        const r = await resolveTargetNames({ limit: 500 });
+        filenames = r.names;
+        if (r.truncated) {
+          push({
+            tone: 'warn',
+            title: '匹配 ' + r.total + ' 条，本次 ' + r.names.length,
+            description: label + ' 单次上限 500'
+          });
+        }
       }
     } catch (err) {
       push({
@@ -1446,7 +1529,17 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       return;
     }
     if (filenames.length === 0) {
-      push({ tone: 'warn', title: `没有可${label}的文件` });
+      const tip =
+        recheck === 'failed'
+          ? '没有上次失败的目标'
+          : recheck === 'no_refresh'
+            ? '没有缺 refresh_token 的 Auth'
+            : recheck === 'no_sso'
+              ? '没有缺 SSO 的 Auth'
+              : recheck === '401'
+                ? '没有 HTTP 401 的 Auth'
+                : '没有可' + label + '的文件';
+      push({ tone: 'warn', title: tip });
       return;
     }
     const signal = beginBatch('resign');
@@ -1461,87 +1554,171 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       running: true
     });
     try {
-      // 分块：块大小贴近并发，避免一次打爆限流
-      const CHUNK = Math.max(resignConcurrency * 2, 4);
       let ok = 0;
       let failed = 0;
       let noXai = 0;
       let remoteOkN = 0;
       let remoteFailedN = 0;
       let cancelled = false;
-      const modeParts: string[] = [];
-      for (let i = 0; i < filenames.length; i += CHUNK) {
-        throwIfAborted(signal);
-        const chunk = filenames.slice(i, i + CHUNK);
-        setProg((p) =>
-          p
-            ? { ...p, current: chunk[0], running: true }
-            : p
-        );
-        try {
-          const r = await window.api.resignCpaAuthBatch({
-            filenames: chunk,
-            concurrency: resignConcurrency,
-            pushRemote: resignPushRemote,
-            baseUrlTarget
-          });
-          ok += r.ok || 0;
-          failed += r.failed || 0;
-          noXai += r.results.filter((x) => x.ok && x.xai === false).length;
-          remoteOkN += r.remoteOk ?? r.results.filter((x) => x.remoteOk === true).length;
-          remoteFailedN +=
-            r.remoteFailed ?? r.results.filter((x) => x.remoteOk === false).length;
-          const ms = summarizeModes(r.results || []);
-          if (ms) modeParts.push(ms);
-        } catch (err) {
-          if (isAbortError(err) || signal.aborted) {
-            cancelled = true;
-            break;
-          }
-          throw err;
+      const failedNames: string[] = [];
+      const modeCounts: Record<string, number> = {};
+      const allResults: {
+        mode?: string;
+        ok?: boolean;
+        filename?: string;
+        xai?: boolean;
+        remoteOk?: boolean | null;
+      }[] = [];
+
+      const applyItem = (x: {
+        ok?: boolean;
+        mode?: string;
+        filename?: string;
+        xai?: boolean;
+        remoteOk?: boolean | null;
+        error?: string;
+      }) => {
+        allResults.push(x);
+        if (x.ok) ok += 1;
+        else {
+          failed += 1;
+          if (x.filename) failedNames.push(x.filename);
         }
-        if (signal.aborted) {
-          cancelled = true;
-          break;
-        }
+        if (x.ok && x.xai === false) noXai += 1;
+        if (x.remoteOk === true) remoteOkN += 1;
+        if (x.remoteOk === false) remoteFailedN += 1;
+        const m = x.mode || (x.ok ? 'ok' : 'error');
+        modeCounts[m] = (modeCounts[m] || 0) + 1;
         setProg({
           kind: 'resign',
           total: filenames.length,
-          done: Math.min(i + chunk.length, filenames.length),
+          done: allResults.length,
           ok,
           failed,
           remoteOk: remoteOkN,
           remoteFailed: remoteFailedN,
-          running: i + chunk.length < filenames.length,
-          current: chunk[chunk.length - 1],
-          modeSummary: modeParts.join(' · ')
+          running: allResults.length < filenames.length && !signal.aborted,
+          current: x.filename || x.mode,
+          modeSummary: Object.entries(modeCounts)
+            .map(([k, v]) => k + ':' + v)
+            .join(' ')
         });
+      };
+
+      const streamFn = window.api.resignCpaAuthBatchStream;
+      if (typeof streamFn === 'function') {
+        try {
+          await streamFn(
+            {
+              filenames,
+              concurrency: resignConcurrency,
+              pushRemote: resignPushRemote,
+              baseUrlTarget
+            },
+            (item) => {
+              if (signal.aborted) return;
+              applyItem(item);
+            }
+          );
+          if (signal.aborted) cancelled = true;
+        } catch (err) {
+          if (isAbortError(err) || signal.aborted) {
+            cancelled = true;
+          } else {
+            console.warn('[resign] stream failed, fallback chunk', err);
+            const CHUNK = Math.max(resignConcurrency * 2, 4);
+            for (let i = 0; i < filenames.length; i += CHUNK) {
+              throwIfAborted(signal);
+              const chunk = filenames.slice(i, i + CHUNK);
+              const r = await window.api.resignCpaAuthBatch({
+                filenames: chunk,
+                concurrency: resignConcurrency,
+                pushRemote: resignPushRemote,
+                baseUrlTarget
+              });
+              for (const x of r.results || []) applyItem(x);
+              if (signal.aborted) {
+                cancelled = true;
+                break;
+              }
+            }
+          }
+        }
+      } else {
+        const CHUNK = Math.max(resignConcurrency * 2, 4);
+        for (let i = 0; i < filenames.length; i += CHUNK) {
+          throwIfAborted(signal);
+          const chunk = filenames.slice(i, i + CHUNK);
+          try {
+            const r = await window.api.resignCpaAuthBatch({
+              filenames: chunk,
+              concurrency: resignConcurrency,
+              pushRemote: resignPushRemote,
+              baseUrlTarget
+            });
+            for (const x of r.results || []) applyItem(x);
+          } catch (err) {
+            if (isAbortError(err) || signal.aborted) {
+              cancelled = true;
+              break;
+            }
+            throw err;
+          }
+          if (signal.aborted) {
+            cancelled = true;
+            break;
+          }
+        }
       }
+
+      lastResignFailedRef.current = failedNames;
+
+      const modePart = Object.entries(modeCounts)
+        .map(([k, v]) => k + ':' + v)
+        .join(' ');
       if (cancelled || signal.aborted) {
         push({
           tone: 'warn',
-          title: `批量${label}已取消`,
-          description: `已处理约 ${ok + failed}/${filenames.length} · 成功 ${ok} · 失败 ${failed}`
+          title: '批量' + label + '已取消',
+          description:
+            '已处理 ' +
+            allResults.length +
+            '/' +
+            filenames.length +
+            ' · 成功 ' +
+            ok +
+            ' · 失败 ' +
+            failed +
+            (modePart ? ' · ' + modePart : '')
         });
       } else {
         const remotePart = resignPushRemote
-          ? ` · 远程OK ${remoteOkN}${remoteFailedN ? ` · 远程失败 ${remoteFailedN}` : ''}`
+          ? ' · 远程OK ' +
+            remoteOkN +
+            (remoteFailedN ? ' · 远程失败 ' + remoteFailedN : '')
           : '';
-        const modePart = modeParts.length ? ` · ${modeParts.join(' ')}` : '';
         push({
           tone: failed > 0 || remoteFailedN > 0 ? 'warn' : 'ok',
-          title: `批量${label}完成`,
-          description: `成功 ${ok} · 失败 ${failed}${noXai ? ` · 无 xai ${noXai}` : ''}${remotePart}${modePart}`
+          title: '批量' + label + '完成',
+          description:
+            '成功 ' +
+            ok +
+            ' · 失败 ' +
+            failed +
+            (noXai ? ' · 无 xai ' + noXai : '') +
+            remotePart +
+            (modePart ? ' · ' + modePart : '') +
+            (failedNames.length ? ' · 可点「仅失败」复检' : '')
         });
       }
       await reload();
     } catch (err) {
       if (isAbortError(err) || signal.aborted) {
-        push({ tone: 'warn', title: `批量${label}已取消` });
+        push({ tone: 'warn', title: '批量' + label + '已取消' });
       } else {
         push({
           tone: 'danger',
-          title: `批量${label}失败`,
+          title: '批量' + label + '失败',
           description: err instanceof Error ? err.message : String(err)
         });
       }
@@ -3267,6 +3444,45 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                   <RefreshCw className="h-3.5 w-3.5" />
                 )}
                 {batchBusy === 'refresh401' ? '取消' : '死者苏生'}
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                className="min-w-[4.5rem] justify-center tabular-nums"
+                disabled={Boolean(busy) && batchBusy !== 'resign'}
+                onClick={() => {
+                  if (batchBusy === 'resign') cancelBatch('resign');
+                  else void resignBatch('cli', { recheck: 'failed' });
+                }}
+                title="仅复检上次批量重签失败的文件（会话记忆）"
+              >
+                仅失败
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                className="min-w-[5rem] justify-center tabular-nums"
+                disabled={Boolean(busy) && batchBusy !== 'resign'}
+                onClick={() => {
+                  if (batchBusy === 'resign') cancelBatch('resign');
+                  else void resignBatch('cli', { recheck: 'no_refresh' });
+                }}
+                title="仅重签无 refresh_token 的 Auth（优先 SSO/号池补 SSO）"
+              >
+                仅无refresh
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                className="min-w-[4.5rem] justify-center tabular-nums"
+                disabled={Boolean(busy) && batchBusy !== 'resign'}
+                onClick={() => {
+                  if (batchBusy === 'resign') cancelBatch('resign');
+                  else void resignBatch('cli', { recheck: 'no_sso' });
+                }}
+                title="仅重签缺 SSO 的 Auth（会从号池按邮箱自动补 SSO）"
+              >
+                仅缺SSO
               </Button>
               <Button
                 variant={batchBusy === 'backfill' ? 'danger' : 'secondary'}

@@ -415,6 +415,33 @@ async function buildPoolPasswordMap(): Promise<Map<string, boolean>> {
   return map;
 }
 
+/** 号池：email(lower) → 最新非空 SSO（重签缺 sso 时自动补） */
+async function buildPoolEmailToSsoMap(): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  const created = new Map<string, string>();
+  try {
+    const { listAccountsLite } = await import('./accountStore.js');
+    const accounts = await listAccountsLite();
+    for (const a of accounts) {
+      const email = String(a.email || '')
+        .trim()
+        .toLowerCase();
+      const sso = normalizeSsoToken(String(a.sso || ''));
+      if (!email || !sso || sso.length < 8) continue;
+      const ca = String(a.createdAt || '');
+      const prevCa = created.get(email) || '';
+      if (!map.has(email) || ca > prevCa) {
+        map.set(email, sso);
+        created.set(email, ca);
+      }
+    }
+  } catch {
+    /* 无号池 */
+  }
+  return map;
+}
+
+
 let listCpaAuthCache: {
   at: number;
   mtimeMs: number;
@@ -1208,6 +1235,32 @@ export async function resignCpaAuth(input: {
   const runtime = resolveRegisterRuntime(settings);
   if (!runtime) throw new Error('未找到注册脚本目录，无法调用 Python 重签');
 
+    // P4：入参无 sso 时读文件；仍无则按 email 从号池补 SSO
+  let resolvedSso = String(input.sso || '').trim();
+  let emailHint = '';
+  try {
+    const raw = await fsp.readFile(resolved, 'utf-8');
+    const doc = JSON.parse(raw) as Record<string, unknown>;
+    emailHint = String(doc.email || '').trim();
+    if (!resolvedSso) {
+      resolvedSso = extractSsoFromAuthData(doc);
+    }
+  } catch {
+    /* ignore read */
+  }
+  let ssoFromPool = false;
+  if (!resolvedSso && emailHint) {
+    const poolSso = await buildPoolEmailToSsoMap();
+    const hit = poolSso.get(emailHint.toLowerCase()) || '';
+    if (hit) {
+      resolvedSso = hit;
+      ssoFromPool = true;
+      console.log(
+        `[cpa-auth] resign: filled sso from pool email=${emailHint.slice(0, 48)}`
+      );
+    }
+  }
+
   const pushRemote = input.pushRemote === true;
   const baseUrlTarget = String(input.baseUrlTarget || 'cli').trim() || 'cli';
   const code = `
@@ -1235,7 +1288,7 @@ print(json.dumps(r, ensure_ascii=False))
   const r = await runPythonJson(runtime.pythonPath, runtime.registerDir, code, [
     resolved,
     proxy,
-    String(input.sso || '').trim(),
+    resolvedSso,
     pushRemote ? '1' : '0',
     baseUrlTarget
   ]);
@@ -1254,6 +1307,7 @@ print(json.dumps(r, ensure_ascii=False))
     ...r,
     filename: r.filename || basename(outPath),
     mode,
+    ssoFromPool,
     ...flags,
     remoteOk: remote.remoteOk,
     remoteError: remote.remoteError,
@@ -1270,12 +1324,17 @@ export async function resignCpaAuthBatch(input: {
   pushRemote?: boolean;
   /** cli | api — 写入 base_url */
   baseUrlTarget?: 'cli' | 'api' | string;
+  /** 每完成一条回调（NDJSON 流） */
+  onItem?: (item: CpaAuthBatchResultItem) => void | Promise<void>;
+  /** 客户端断开/取消时停止领取新任务 */
+  isAborted?: () => boolean;
 }): Promise<{
   total: number;
   ok: number;
   failed: number;
   remoteOk?: number;
   remoteFailed?: number;
+  cancelled?: boolean;
   results: CpaAuthBatchResultItem[];
 }> {
   const names = Array.isArray(input.filenames) ? input.filenames : [];
@@ -1288,7 +1347,7 @@ export async function resignCpaAuthBatch(input: {
     if (String(p || '').trim()) jobs.push({ path: String(p).trim() });
   }
   if (jobs.length === 0) throw new Error('缺少 filenames 或 paths');
-  if (jobs.length > 100) throw new Error('单次批量重签最多 100 个');
+  if (jobs.length > 200) throw new Error('单次批量重签最多 200 个');
 
   const settings = await loadSettings();
   // 并发上限：设置 cpaResignConcurrency（默认 2）硬顶 3，防 accounts.x.ai 限流
@@ -1305,11 +1364,24 @@ export async function resignCpaAuthBatch(input: {
   let idx = 0;
   const gapMs = concurrency >= 3 ? 180 : concurrency === 2 ? 80 : 0;
 
+  const emitItem = async (item: CpaAuthBatchResultItem) => {
+    results.push(item);
+    if (input.onItem) {
+      try {
+        await input.onItem(item);
+      } catch {
+        /* 流写失败不阻断 */
+      }
+    }
+  };
+
   async function worker() {
     while (idx < jobs.length) {
+      if (input.isAborted?.()) break;
       const i = idx++;
       const job = jobs[i];
       try {
+        if (input.isAborted?.()) break;
         if (gapMs > 0 && i > 0) {
           await new Promise((r) => setTimeout(r, gapMs));
         }
@@ -1318,7 +1390,7 @@ export async function resignCpaAuthBatch(input: {
           r.probe && typeof r.probe === 'object'
             ? (r.probe as Record<string, unknown>)
             : null;
-        results.push({
+        await emitItem({
           filename: String(r.filename || job.filename || ''),
           email: String(r.email || ''),
           ok: r.ok !== false && !r.error,
@@ -1343,7 +1415,7 @@ export async function resignCpaAuthBatch(input: {
           remoteName: r.remoteName ? String(r.remoteName) : undefined
         });
       } catch (err) {
-        results.push({
+        await emitItem({
           filename: job.filename || basename(job.path || ''),
           ok: false,
           error: err instanceof Error ? err.message : String(err)
@@ -1365,12 +1437,14 @@ export async function resignCpaAuthBatch(input: {
     `[cpa-auth] resign-batch total=${results.length} ok=${ok} failed=${results.length - ok} ` +
       `concurrency=${concurrency} modes=${JSON.stringify(modeCounts)}`
   );
+  const cancelled = Boolean(input.isAborted?.());
   return {
     total: results.length,
     ok,
     failed: results.length - ok,
     remoteOk,
     remoteFailed,
+    cancelled,
     results
   };
 }
@@ -2487,6 +2561,8 @@ export async function mintCpaAuthFromSso(input: {
    * 只读过滤，无法改掉服务端已签发的 claim。
    */
   skipBotFlag1?: boolean;
+  onItem?: (item: CpaAuthBatchResultItem) => void | Promise<void>;
+  isAborted?: () => boolean;
 }): Promise<{
   total: number;
   ok: number;
@@ -2497,11 +2573,12 @@ export async function mintCpaAuthFromSso(input: {
   botFlagSkipped?: number;
   remoteOk?: number;
   remoteFailed?: number;
+  cancelled?: boolean;
   results: CpaAuthBatchResultItem[];
 }> {
   const items = Array.isArray(input.items) ? input.items : [];
   if (items.length === 0) throw new Error('缺少 SSO 列表');
-  if (items.length > 50) throw new Error('单次 mint 最多 50 个');
+  if (items.length > 200) throw new Error('单次 mint 最多 200 个');
   const doPrecheck = input.precheck !== false;
   const skipBotFlag1 = input.skipBotFlag1 !== false;
 
@@ -2577,14 +2654,26 @@ print(json.dumps(r, ensure_ascii=False))
   const results: CpaAuthBatchResultItem[] = [];
   let idx = 0;
 
+  const emitItem = async (item: CpaAuthBatchResultItem) => {
+    results.push(item);
+    if (input.onItem) {
+      try {
+        await input.onItem(item);
+      } catch {
+        /* ignore stream write */
+      }
+    }
+  };
+
   async function worker() {
     while (idx < items.length) {
+      if (input.isAborted?.()) break;
       const i = idx++;
       const item = items[i];
       const sso = String(item.sso || '').trim();
       const email = String(item.email || '').trim();
       if (!sso) {
-        results.push({
+        await emitItem({
           email,
           ok: false,
           skipped: true,
@@ -2596,7 +2685,7 @@ print(json.dumps(r, ensure_ascii=False))
       }
       const ssoFlag = readBotFlagFromToken(sso);
       if (skipBotFlag1 && ssoFlag.isBotFlag1) {
-        results.push({
+        await emitItem({
           email,
           ok: false,
           skipped: true,
@@ -2619,7 +2708,7 @@ print(json.dumps(r, ensure_ascii=False))
         ]);
         const skipped = Boolean(r.skipped) || String(r.mode || '').startsWith('skipped_');
         if (skipped) {
-          results.push({
+          await emitItem({
             email: String(r.email || email),
             ok: false,
             skipped: true,
@@ -2652,7 +2741,7 @@ print(json.dumps(r, ensure_ascii=False))
           }
         }
         const remote = parseRemoteField(r.remote);
-        results.push({
+        await emitItem({
           filename: String(r.filename || (outPath ? basename(outPath) : '')),
           email: String(r.email || email),
           ok: r.ok !== false && !r.error,
@@ -2676,7 +2765,7 @@ print(json.dumps(r, ensure_ascii=False))
           remoteName: remote.remoteName
         });
       } catch (err) {
-        results.push({
+        await emitItem({
           email,
           ok: false,
           skipped: false,
@@ -2699,6 +2788,7 @@ print(json.dumps(r, ensure_ascii=False))
   const alive = results.filter((r) => !r.skipped).length;
   const remoteOkN = results.filter((r) => r.remoteOk === true).length;
   const remoteFailedN = results.filter((r) => r.remoteOk === false).length;
+  const cancelled = Boolean(input.isAborted?.());
   return {
     total: results.length,
     ok,
@@ -2709,6 +2799,7 @@ print(json.dumps(r, ensure_ascii=False))
     botFlagSkipped,
     remoteOk: remoteOkN,
     remoteFailed: remoteFailedN,
+    cancelled,
     results
   };
 }

@@ -893,6 +893,69 @@ app.post('/api/cpa-auth/resign-batch', asyncHandler(async (req: Request, res: Re
   }
 }));
 
+
+/** 批量重签 NDJSON 流：每完成一条 type=item，结束 type=done；客户端断开则停止领新任务 */
+app.post('/api/cpa-auth/resign-stream', asyncHandler(async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    filenames?: string[];
+    paths?: string[];
+    concurrency?: number;
+    pushRemote?: boolean;
+    baseUrlTarget?: string;
+  };
+  res.status(200);
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  const resAny = res as Response & { flushHeaders?: () => void };
+  if (typeof resAny.flushHeaders === 'function') resAny.flushHeaders();
+
+  const writeLine = (obj: unknown) => {
+    if (res.writableEnded) return;
+    res.write(JSON.stringify(obj) + String.fromCharCode(10));
+  };
+
+  let aborted = false;
+  const markAbort = () => {
+    aborted = true;
+  };
+  req.on('close', markAbort);
+  req.on('aborted', markAbort);
+
+  try {
+    const names = Array.isArray(body.filenames) ? body.filenames : [];
+    const paths = Array.isArray(body.paths) ? body.paths : [];
+    const total =
+      names.filter((f) => String(f || '').trim()).length +
+      paths.filter((p) => String(p || '').trim()).length;
+    writeLine({ type: 'start', total });
+
+    const result = await resignCpaAuthBatch({
+      ...body,
+      isAborted: () => aborted || res.writableEnded,
+      onItem: (item) => {
+        writeLine({ type: 'item', ...item });
+      }
+    });
+    invalidateAuthIndexCache();
+    invalidateCpaAuthListCache();
+    writeLine({
+      type: 'done',
+      total: result.total,
+      ok: result.ok,
+      failed: result.failed,
+      remoteOk: result.remoteOk,
+      remoteFailed: result.remoteFailed,
+      cancelled: result.cancelled
+    });
+    res.end();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    writeLine({ type: 'error', error: message });
+    res.end();
+  }
+}));
+
 /** 批量推送已有 auth 到远程 CPA（不重新 mint） */
 app.post('/api/cpa-auth/push-remote', asyncHandler(async (req: Request, res: Response) => {
   try {
@@ -944,6 +1007,71 @@ app.post('/api/cpa-auth/mint', asyncHandler(async (req: Request, res: Response) 
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
+  }
+}));
+
+
+/** 号池 SSO→Auth mint NDJSON 流：每完成一条 type=item；客户端断开停止领新任务 */
+app.post('/api/cpa-auth/mint-stream', asyncHandler(async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    items?: { sso: string; email?: string }[];
+    concurrency?: number;
+    skipBotFlag1?: boolean;
+    precheck?: boolean;
+  };
+  res.status(200);
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  const resAny = res as Response & { flushHeaders?: () => void };
+  if (typeof resAny.flushHeaders === 'function') resAny.flushHeaders();
+
+  const writeLine = (obj: unknown) => {
+    if (res.writableEnded) return;
+    res.write(JSON.stringify(obj) + String.fromCharCode(10));
+  };
+
+  let aborted = false;
+  const markAbort = () => {
+    aborted = true;
+  };
+  req.on('close', markAbort);
+  req.on('aborted', markAbort);
+
+  try {
+    const items = Array.isArray(body.items) ? body.items : [];
+    writeLine({ type: 'start', total: items.length });
+
+    const result = await mintCpaAuthFromSso({
+      items,
+      concurrency: body.concurrency,
+      skipBotFlag1: body.skipBotFlag1,
+      precheck: body.precheck,
+      isAborted: () => aborted || res.writableEnded,
+      onItem: (item) => {
+        writeLine({ type: 'item', ...item });
+      }
+    });
+    invalidateAuthIndexCache();
+    invalidateCpaAuthListCache();
+    writeLine({
+      type: 'done',
+      total: result.total,
+      ok: result.ok,
+      failed: result.failed,
+      skipped: result.skipped,
+      alive: result.alive,
+      banned: result.banned,
+      botFlagSkipped: result.botFlagSkipped,
+      remoteOk: result.remoteOk,
+      remoteFailed: result.remoteFailed,
+      cancelled: result.cancelled
+    });
+    res.end();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    writeLine({ type: 'error', error: message });
+    res.end();
   }
 }));
 

@@ -184,6 +184,9 @@ export function PoolPage() {
   const [verifying, setVerifying] = useState(false);
   const [verifyProg, setVerifyProg] = useState<VerifyProgress | null>(null);
   const verifyAbortRef = useRef<AbortController | null>(null);
+  const mintAbortRef = useRef<AbortController | null>(null);
+  /** 上次补签失败目标（会话内仅失败复检） */
+  const lastMintFailedRef = useRef<{ sso: string; email?: string }[]>([]);
   const [pushingG2a, setPushingG2a] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -1350,26 +1353,81 @@ export function PoolPage() {
     }
   };
 
-  /** 号池 SSO → 预检存活后 CPA auth 补 mint；分块并显示进度 */
-  const mintAuthFromSso = async (scope: 'page' | 'filter' = 'filter') => {
+  const cancelMint = () => {
+    mintAbortRef.current?.abort();
+    setWebApiAbortSignal(null);
+    setMintProg((p) => (p ? { ...p, running: false } : p));
+  };
+
+  /**
+   * 号池 SSO → 预检存活后 CPA auth 补 mint。
+   * 优先 mint-stream 逐条进度；支持取消与智能复检。
+   */
+  const mintAuthFromSso = async (
+    scope: 'page' | 'filter' = 'filter',
+    opts?: { recheck?: 'all' | 'failed' | 'unconverted' }
+  ) => {
+    if (mintProg?.running) {
+      cancelMint();
+      return;
+    }
+    const recheck = opts?.recheck || 'all';
     let targets: ActionTarget[] = [];
     try {
-      const r = await resolveActionTargets({
-        scope: selected.size > 0 ? 'page' : scope,
-        requireSso: true,
-        limit: 200
-      });
-      targets = r.targets;
-      if (targets.length === 0) {
-        push({ tone: 'warn', title: '没有可 mint 的 SSO' });
-        return;
-      }
-      if (r.truncated) {
-        push({
-          tone: 'warn',
-          title: `匹配 ${r.total} 条，本次只补签前 ${targets.length}`,
-          description: '补签单次上限 200'
+      if (recheck === 'failed') {
+        targets = lastMintFailedRef.current
+          .filter((x) => x.sso)
+          .map((x, i) => ({
+            id: 'failed-' + i,
+            sso: x.sso,
+            email: x.email || '',
+            password: ''
+          }));
+        if (targets.length === 0) {
+          push({
+            tone: 'warn',
+            title: '没有上次失败的补签目标',
+            description: '请先跑一轮补签 Auth'
+          });
+          return;
+        }
+      } else {
+        const r = await resolveActionTargets({
+          scope: selected.size > 0 ? 'page' : scope,
+          requireSso: true,
+          limit: 200,
+          // unconverted：仅 Auth 未转
+          ...(recheck === 'unconverted' ? { authOverride: 'unconverted' } : {})
         });
+        targets = r.targets;
+        if (recheck === 'unconverted' && targets.length === 0) {
+          // 回退：本地用 authEmails 过滤当前页/已解析目标
+          const r2 = await resolveActionTargets({
+            scope: selected.size > 0 ? 'page' : scope,
+            requireSso: true,
+            limit: 200
+          });
+          targets = r2.targets.filter((a) => {
+            const em = String(a.email || '').trim().toLowerCase();
+            if (em && authEmails.has(em)) return false;
+            return true;
+          });
+        }
+        if (targets.length === 0) {
+          push({
+            tone: 'warn',
+            title:
+              recheck === 'unconverted' ? '没有未转 Auth 的 SSO' : '没有可 mint 的 SSO'
+          });
+          return;
+        }
+        if (r.truncated) {
+          push({
+            tone: 'warn',
+            title: '匹配 ' + r.total + ' 条，本次只补签前 ' + targets.length,
+            description: '补签单次上限 200'
+          });
+        }
       }
     } catch (err) {
       push({
@@ -1379,6 +1437,10 @@ export function PoolPage() {
       });
       return;
     }
+
+    const ac = new AbortController();
+    mintAbortRef.current = ac;
+    setWebApiAbortSignal(ac.signal);
 
     setMintProg({
       total: targets.length,
@@ -1398,93 +1460,155 @@ export function PoolPage() {
     let probeDead = 0;
     let probeOk = 0;
     let noXai = 0;
+    let cancelled = false;
     const allResults: CpaAuthBatchResultItem[] = [];
+    const failedTargets: { sso: string; email?: string }[] = [];
+    const ssoByEmail = new Map(
+      targets.map((t) => [String(t.email || '').toLowerCase(), t.sso] as const)
+    );
+        const applyItem = (x: CpaAuthBatchResultItem) => {
+      allResults.push(x);
+      if (x.skipped) {
+        skipped += 1;
+      } else if (x.ok) {
+        ok += 1;
+      } else {
+        failed += 1;
+        const em = String(x.email || '').toLowerCase();
+        const sso =
+          (em && ssoByEmail.get(em)) ||
+          targets.find((t) => t.email && t.email.toLowerCase() === em)?.sso ||
+          '';
+        if (sso) failedTargets.push({ sso, email: x.email });
+      }
+      if (x.verdict === 'banned') banned += 1;
+      if (x.probeAction === 'dead' || x.probeDeleted) probeDead += 1;
+      if (x.probeAction === 'ok') probeOk += 1;
+      if (x.ok && x.xai === false) noXai += 1;
+      setMintProg({
+        total: targets.length,
+        done: allResults.length,
+        ok,
+        failed,
+        skipped,
+        banned,
+        current: x.email || x.filename || '',
+        running: allResults.length < targets.length && !ac.signal.aborted
+      });
+    };
 
     try {
-      for (let i = 0; i < targets.length; i += MINT_CHUNK) {
-        const chunk = targets.slice(i, i + MINT_CHUNK);
-        setMintProg((p) =>
-          p
-            ? {
-                ...p,
-                current: chunk[0]?.email || chunk[0]?.sso?.slice(0, 12) || '',
-                running: true
+      const streamFn = window.api.mintCpaAuthFromSsoStream;
+      const items = targets.map((a) => ({ sso: a.sso, email: a.email }));
+      if (typeof streamFn === 'function') {
+        try {
+          await streamFn(
+            {
+              items,
+              concurrency: Math.min(3, items.length),
+              skipBotFlag1
+            },
+            (item) => {
+              if (ac.signal.aborted) return;
+              applyItem(item);
+            }
+          );
+          if (ac.signal.aborted) cancelled = true;
+        } catch (err) {
+          if (
+            (err instanceof Error && err.name === 'AbortError') ||
+            ac.signal.aborted
+          ) {
+            cancelled = true;
+          } else {
+            console.warn('[mint] stream failed, fallback chunk', err);
+            for (let i = 0; i < targets.length; i += MINT_CHUNK) {
+              if (ac.signal.aborted) {
+                cancelled = true;
+                break;
               }
-            : p
-        );
-        const r = await window.api.mintCpaAuthFromSso({
-          items: chunk.map((a) => ({ sso: a.sso, email: a.email })),
-          concurrency: Math.min(3, chunk.length),
-          skipBotFlag1
-        });
-        allResults.push(...(r.results || []));
-        ok += r.ok || 0;
-        failed += r.failed || 0;
-        skipped += r.skipped ?? r.results.filter((x) => x.skipped).length;
-        banned += r.banned ?? r.results.filter((x) => x.verdict === 'banned').length;
-        const botSkip =
-          r.botFlagSkipped ?? r.results.filter((x) => x.verdict === 'bot_flag').length;
-        skipped += 0; // keep skipped as server total
-        probeDead += r.results.filter((x) => x.probeAction === 'dead' || x.probeDeleted).length;
-        probeOk += r.results.filter((x) => x.probeAction === 'ok').length;
-        noXai += r.results.filter((x) => x.ok && x.xai === false).length;
-        // bot flag 计入 skipped 已由 r.skipped 包含
-        void botSkip;
-
-        const done = Math.min(i + chunk.length, targets.length);
-        setMintProg({
-          total: targets.length,
-          done,
-          ok,
-          failed,
-          skipped,
-          banned,
-          current: chunk[chunk.length - 1]?.email || '',
-          running: done < targets.length
-        });
+              const chunk = targets.slice(i, i + MINT_CHUNK);
+              const r = await window.api.mintCpaAuthFromSso({
+                items: chunk.map((a) => ({ sso: a.sso, email: a.email })),
+                concurrency: Math.min(3, chunk.length),
+                skipBotFlag1
+              });
+              for (const x of r.results || []) applyItem(x);
+            }
+          }
+        }
+      } else {
+        for (let i = 0; i < targets.length; i += MINT_CHUNK) {
+          if (ac.signal.aborted) {
+            cancelled = true;
+            break;
+          }
+          const chunk = targets.slice(i, i + MINT_CHUNK);
+          const r = await window.api.mintCpaAuthFromSso({
+            items: chunk.map((a) => ({ sso: a.sso, email: a.email })),
+            concurrency: Math.min(3, chunk.length),
+            skipBotFlag1
+          });
+          for (const x of r.results || []) applyItem(x);
+        }
       }
+
+      lastMintFailedRef.current = failedTargets;
 
       const botFlagN = allResults.filter((x) => x.verdict === 'bot_flag').length;
       const remoteOkN = allResults.filter((x) => x.remoteOk === true).length;
       const remoteFailN = allResults.filter((x) => x.remoteOk === false).length;
       const remoteErrSample = allResults.find((x) => x.remoteOk === false)?.remoteError;
       const parts = [
-        `成功 ${ok}`,
-        `失败 ${failed}`,
-        skipped ? `预检跳过 ${skipped}` : '',
-        botFlagN ? `bot_flag=1 跳过 ${botFlagN}` : '',
-        banned ? `封禁 ${banned}` : '',
-        probeOk ? `CPA测活OK ${probeOk}` : '',
-        probeDead ? `CPA测活挂 ${probeDead}` : '',
-        noXai ? `无 xai ${noXai}` : ok > 0 ? '均含 xai' : '',
-        remoteOkN ? `远程推送OK ${remoteOkN}` : '',
+        '成功 ' + ok,
+        '失败 ' + failed,
+        skipped ? '预检跳过 ' + skipped : '',
+        botFlagN ? 'bot_flag=1 跳过 ' + botFlagN : '',
+        banned ? '封禁 ' + banned : '',
+        probeOk ? 'CPA测活OK ' + probeOk : '',
+        probeDead ? 'CPA测活挂 ' + probeDead : '',
+        noXai ? '无 xai ' + noXai : ok > 0 ? '均含 xai' : '',
+        remoteOkN ? '远程推送OK ' + remoteOkN : '',
         remoteFailN
-          ? `远程失败 ${remoteFailN}${remoteErrSample ? `（${remoteErrSample.slice(0, 80)}）` : ''}`
-          : ''
+          ? '远程失败 ' +
+            remoteFailN +
+            (remoteErrSample ? '（' + remoteErrSample.slice(0, 80) + '）' : '')
+          : '',
+        failedTargets.length ? '可点「仅失败」复检' : '',
+        cancelled ? '已取消' : ''
       ].filter(Boolean);
       push({
         tone:
-          failed > 0 || banned > 0 || probeDead > 0 || remoteFailN > 0
+          cancelled || failed > 0 || banned > 0 || probeDead > 0 || remoteFailN > 0
             ? 'warn'
             : ok > 0
               ? 'ok'
               : 'warn',
-        title: 'SSO 补签 Auth 完成',
+        title: cancelled ? 'SSO 补签 Auth 已取消' : 'SSO 补签 Auth 完成',
         description: parts.join(' · ')
       });
     } catch (err) {
-      push({
-        tone: 'danger',
-        title: '补签 Auth 失败',
-        description: err instanceof Error ? err.message : String(err)
-      });
+      if (
+        (err instanceof Error && err.name === 'AbortError') ||
+        ac.signal.aborted
+      ) {
+        push({ tone: 'warn', title: '补签 Auth 已取消' });
+      } else {
+        push({
+          tone: 'danger',
+          title: '补签 Auth 失败',
+          description: err instanceof Error ? err.message : String(err)
+        });
+      }
     } finally {
+      mintAbortRef.current = null;
+      setWebApiAbortSignal(null);
       setMintProg((p) =>
         p
           ? {
               ...p,
               running: false,
-              done: p.total,
+              done: Math.max(p.done, allResults.length),
               ok,
               failed,
               skipped,
@@ -1492,7 +1616,6 @@ export function PoolPage() {
             }
           : null
       );
-      // 进度条保留几秒再收起
       window.setTimeout(() => setMintProg(null), 4000);
     }
   };
@@ -1723,7 +1846,14 @@ export function PoolPage() {
                 {mintProg.banned ? ` · 封禁 ${mintProg.banned}` : ''}
               </p>
             </div>
-            <span className="chip tabular-nums">{mintPct}%</span>
+            <div className="flex items-center gap-2">
+              {mintProg.running ? (
+                <Button size="sm" variant="secondary" onClick={cancelMint} title="取消剩余补签">
+                  取消
+                </Button>
+              ) : null}
+              <span className="chip tabular-nums">{mintPct}%</span>
+            </div>
           </div>
           <div className="mt-2 h-2 overflow-hidden rounded-full bg-muted">
             <div
@@ -1985,7 +2115,10 @@ export function PoolPage() {
               <Button
                 variant="secondary"
                 size="sm"
-                onClick={() => void mintAuthFromSso(selected.size > 0 ? 'page' : 'filter')}
+                onClick={() => {
+                  if (minting) cancelMint();
+                  else void mintAuthFromSso(selected.size > 0 ? 'page' : 'filter');
+                }}
                 disabled={
                   busy ||
                   (serverPaged
@@ -2033,6 +2166,32 @@ export function PoolPage() {
               >
                 <Bot className="h-3.5 w-3.5" />
                 跳过 Bot
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={busy && !minting}
+                onClick={() => {
+                  if (minting) cancelMint();
+                  else void mintAuthFromSso(selected.size > 0 ? 'page' : 'filter', { recheck: 'failed' });
+                }}
+                title="仅复检上次补签失败的 SSO（会话记忆）"
+              >
+                仅失败
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={busy && !minting}
+                onClick={() => {
+                  if (minting) cancelMint();
+                  else void mintAuthFromSso(selected.size > 0 ? 'page' : 'filter', {
+                    recheck: 'unconverted'
+                  });
+                }}
+                title="仅补签尚未转 Auth 的 SSO"
+              >
+                仅未转Auth
               </Button>
             </div>
             <div className="flex flex-wrap items-center gap-1.5">

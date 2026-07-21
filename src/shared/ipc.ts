@@ -561,12 +561,33 @@ export interface RendererApi {
     pushRemote?: boolean;
     baseUrlTarget?: 'cli' | 'api' | string;
   }): Promise<CpaAuthBatchResult>;
+  /** 批量重签 NDJSON 流；不可用时前端回退 resignCpaAuthBatch */
+  resignCpaAuthBatchStream?(
+    input: {
+      filenames?: string[];
+      paths?: string[];
+      concurrency?: number;
+      pushRemote?: boolean;
+      baseUrlTarget?: 'cli' | 'api' | string;
+    },
+    onItem: (item: CpaAuthBatchResultItem) => void
+  ): Promise<CpaAuthBatchResult>;
   mintCpaAuthFromSso(input: {
     items: CpaAuthMintItem[];
     concurrency?: number;
     /** 默认 true：跳过 bot_flag_source=1 的 SSO */
     skipBotFlag1?: boolean;
   }): Promise<CpaAuthBatchResult>;
+  /** 号池补签 Auth NDJSON 流；不可用时前端回退 mintCpaAuthFromSso */
+  mintCpaAuthFromSsoStream?(
+    input: {
+      items: CpaAuthMintItem[];
+      concurrency?: number;
+      skipBotFlag1?: boolean;
+      precheck?: boolean;
+    },
+    onItem: (item: CpaAuthBatchResultItem) => void
+  ): Promise<CpaAuthBatchResult>;
   /** 批量 CPA 测活（cehuo /responses） */
   probeCpaAuthBatch(input: {
     filenames?: string[];
