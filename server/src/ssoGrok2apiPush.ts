@@ -5,6 +5,7 @@
 import { loadSettings } from './settingsStore.js';
 import { resolveRegisterRuntime } from './bot/registerRuntime.js';
 import { setPushTag, loadAccountTags, lookupNsfwTag, isPushOkFromTag } from './accountTags.js';
+import { classifyPushFailReason, summarizeFailReasons } from './pythonJobPool.js';
 import { spawn } from 'child_process';
 
 export type SsoG2PushItem = {
@@ -20,6 +21,7 @@ export type SsoG2PushResultItem = {
   email?: string;
   id?: string;
   mode?: string;
+  failReason?: string;
 };
 
 function runPythonJson(
@@ -69,18 +71,24 @@ function runPythonJson(
 export async function pushSsoToGrok2apiBatch(input: {
   items: SsoG2PushItem[];
   concurrency?: number;
+  /** true：忽略 already_pushed，强制重新上传 */
+  force?: boolean;
+  onItem?: (item: SsoG2PushResultItem) => void | Promise<void>;
+  isAborted?: () => boolean;
 }): Promise<{
   total: number;
   ok: number;
   failed: number;
   skipped: number;
+  cancelled?: boolean;
   remoteConfigured: boolean;
   remoteUrl?: string;
+  failReasons?: Record<string, number>;
   results: SsoG2PushResultItem[];
 }> {
   const items = Array.isArray(input.items) ? input.items : [];
   if (items.length === 0) throw new Error('缺少 SSO 列表');
-  if (items.length > 100) throw new Error('单次推送最多 100 个');
+  if (items.length > 200) throw new Error('单次推送最多 200 个');
 
   const settings = await loadSettings();
   const allow =
@@ -136,9 +144,10 @@ except Exception as e:
 `.trim();
 
   const concurrency = Math.min(
-    2,
+    4,
     Math.max(1, Number(input.concurrency) || 1)
   );
+  const force = Boolean(input.force);
   const results: SsoG2PushResultItem[] = [];
   let ok = 0;
   let failed = 0;
@@ -146,37 +155,59 @@ except Exception as e:
   const { loadAccountTagsAsync } = await import('./accountTags.js');
   const pushTagsSnapshot = await loadAccountTagsAsync();
 
+  const emit = async (item: SsoG2PushResultItem, index: number) => {
+    if (!item.ok && !item.failReason) {
+      item.failReason = classifyPushFailReason(item);
+    }
+    results[index] = item;
+    if (input.onItem) {
+      try {
+        await input.onItem(item);
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+
   let idx = 0;
   async function worker() {
     while (idx < items.length) {
+      if (input.isAborted?.()) break;
       const i = idx++;
       const it = items[i];
       const sso = String(it?.sso || '').trim();
       const email = String(it?.email || '').trim();
       const id = it?.id;
       if (!sso) {
-        results[i] = {
-          ok: false,
-          error: 'empty sso',
-          email,
-          id
-        };
         failed++;
+        await emit(
+          {
+            ok: false,
+            error: 'empty sso',
+            email,
+            id,
+            failReason: 'empty_sso'
+          },
+          i
+        );
         continue;
       }
-      // 已成功推送过则跳过（与 Python is_push_ok 对齐）
-      {
+      // 已成功推送过则跳过（force 时强制重推）
+      if (!force) {
         const tag = lookupNsfwTag(pushTagsSnapshot, { email, sso });
         if (isPushOkFromTag(tag, 'sso_g2')) {
           skipped++;
-          results[i] = {
-            ok: true,
-            skipped: true,
-            error: 'already_pushed',
-            email,
-            id,
-            mode: 'already_pushed'
-          };
+          await emit(
+            {
+              ok: true,
+              skipped: true,
+              error: 'already_pushed',
+              email,
+              id,
+              mode: 'already_pushed'
+            },
+            i
+          );
           continue;
         }
       }
@@ -194,21 +225,28 @@ except Exception as e:
           } catch {
             /* ignore */
           }
-          results[i] = {
-            ok: true,
-            email,
-            id,
-            mode: r.mode ? String(r.mode) : 'web_convert'
-          };
+          await emit(
+            {
+              ok: true,
+              email,
+              id,
+              mode: r.mode ? String(r.mode) : force ? 'reuploaded' : 'web_convert'
+            },
+            i
+          );
         } else if (r.skipped === true) {
           skipped++;
-          results[i] = {
-            ok: false,
-            skipped: true,
-            error: String(r.error || 'skipped'),
-            email,
-            id
-          };
+          await emit(
+            {
+              ok: false,
+              skipped: true,
+              error: String(r.error || 'skipped'),
+              email,
+              id,
+              mode: 'skipped'
+            },
+            i
+          );
         } else {
           failed++;
           try {
@@ -222,12 +260,16 @@ except Exception as e:
           } catch {
             /* ignore */
           }
-          results[i] = {
-            ok: false,
-            error: String(r.error || 'push failed'),
-            email,
-            id
-          };
+          await emit(
+            {
+              ok: false,
+              error: String(r.error || 'push failed'),
+              email,
+              id,
+              mode: 'error'
+            },
+            i
+          );
         }
       } catch (err) {
         failed++;
@@ -237,12 +279,16 @@ except Exception as e:
         } catch {
           /* ignore */
         }
-        results[i] = {
-          ok: false,
-          error: errMsg,
-          email,
-          id
-        };
+        await emit(
+          {
+            ok: false,
+            error: errMsg,
+            email,
+            id,
+            mode: 'error'
+          },
+          i
+        );
       }
     }
   }
@@ -251,13 +297,34 @@ except Exception as e:
     Array.from({ length: Math.min(concurrency, items.length) }, () => worker())
   );
 
+  // 稀疏数组填满（取消时未处理的槽位）
+  for (let i = 0; i < items.length; i++) {
+    if (!results[i]) {
+      results[i] = {
+        ok: false,
+        skipped: true,
+        error: 'cancelled',
+        email: items[i]?.email,
+        id: items[i]?.id,
+        mode: 'cancelled',
+        failReason: 'cancelled'
+      };
+    } else if (!results[i].ok && !results[i].failReason) {
+      results[i].failReason = classifyPushFailReason(results[i]);
+    }
+  }
+  const failReasons = summarizeFailReasons(results.filter((r) => r && !r.ok));
+  const cancelled = Boolean(input.isAborted?.());
+
   return {
     total: items.length,
     ok,
     failed,
     skipped,
+    cancelled,
     remoteConfigured: true,
     remoteUrl: url,
+    failReasons,
     results
   };
 }

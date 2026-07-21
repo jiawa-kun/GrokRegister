@@ -144,6 +144,18 @@ type MintProgress = {
   failReasons?: Record<string, number>;
 };
 
+type G2aProgress = {
+  total: number;
+  done: number;
+  ok: number;
+  failed: number;
+  skipped: number;
+  current?: string;
+  running: boolean;
+  failReasonSummary?: string;
+  failReasons?: Record<string, number>;
+};
+
 /** SSO 批量验活进度 */
 type VerifyProgress = {
   total: number;
@@ -194,6 +206,12 @@ export function PoolPage() {
   const lastMintFailedByReasonRef = useRef<
     Record<string, { sso: string; email?: string }[]>
   >({});
+  const lastG2aFailedRef = useRef<{ sso: string; email?: string; id?: string }[]>([]);
+  const lastG2aFailedByReasonRef = useRef<
+    Record<string, { sso: string; email?: string; id?: string }[]>
+  >({});
+  const g2aAbortRef = useRef<AbortController | null>(null);
+  const [g2aProg, setG2aProg] = useState<G2aProgress | null>(null);
   const [pushingG2a, setPushingG2a] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -1695,25 +1713,86 @@ export function PoolPage() {
   );
 
   /** 号池 SSO → grok2api（需推送设置开启 SSO→grok2api） */
-  const pushG2aFromSso = async (scope: 'page' | 'filter' = 'filter') => {
+  type G2aRecheck = 'all' | 'failed' | 'fail_reason';
+
+  const cancelG2a = () => {
+    try {
+      g2aAbortRef.current?.abort();
+    } catch {
+      /* ignore */
+    }
+    g2aAbortRef.current = null;
+    setWebApiAbortSignal(null);
+    setG2aProg((p) => (p ? { ...p, running: false } : p));
+    setPushingG2a(false);
+  };
+
+  const pushG2aFromSso = async (
+    scope: 'page' | 'filter' = 'filter',
+    opts?: { force?: boolean; recheck?: G2aRecheck; failReason?: string }
+  ) => {
+    if (g2aProg?.running) {
+      cancelG2a();
+      return;
+    }
+    const force = Boolean(opts?.force);
+    const recheck: G2aRecheck = opts?.recheck || 'all';
+    const failReasonKey = String(opts?.failReason || '').trim();
     let targets: ActionTarget[] = [];
     try {
-      const r = await resolveActionTargets({
-        scope: selected.size > 0 ? 'page' : scope,
-        requireSso: true,
-        limit: 100
-      });
-      targets = r.targets;
-      if (targets.length === 0) {
-        push({ tone: 'warn', title: '没有可推送的 SSO' });
-        return;
-      }
-      if (r.truncated) {
-        push({
-          tone: 'warn',
-          title: `匹配 ${r.total} 条，本次只推前 ${targets.length}`,
-          description: '推送单次上限 100'
+      if (recheck === 'failed') {
+        targets = lastG2aFailedRef.current
+          .filter((x) => x.sso)
+          .map((x, i) => ({
+            id: x.id || 'g2a-failed-' + i,
+            sso: x.sso,
+            email: x.email || '',
+            password: ''
+          }));
+        if (targets.length === 0) {
+          push({
+            tone: 'warn',
+            title: '没有上次 G2A 推送失败目标',
+            description: '请先跑一轮推送 G2A'
+          });
+          return;
+        }
+      } else if (recheck === 'fail_reason') {
+        const list = lastG2aFailedByReasonRef.current[failReasonKey] || [];
+        targets = list
+          .filter((x) => x.sso)
+          .map((x, i) => ({
+            id: x.id || 'g2a-fr-' + i,
+            sso: x.sso,
+            email: x.email || '',
+            password: ''
+          }));
+        if (!failReasonKey || targets.length === 0) {
+          push({
+            tone: 'warn',
+            title: '没有该原因的 G2A 失败目标',
+            description: failReasonKey || '未指定 failReason'
+          });
+          return;
+        }
+      } else {
+        const r = await resolveActionTargets({
+          scope: selected.size > 0 ? 'page' : scope,
+          requireSso: true,
+          limit: 200
         });
+        targets = r.targets;
+        if (targets.length === 0) {
+          push({ tone: 'warn', title: '没有可推送的 SSO' });
+          return;
+        }
+        if (r.truncated) {
+          push({
+            tone: 'warn',
+            title: '匹配 ' + r.total + ' 条，本次只推前 ' + targets.length,
+            description: '推送单次上限 200'
+          });
+        }
       }
     } catch (err) {
       push({
@@ -1727,48 +1806,242 @@ export function PoolPage() {
       push({
         tone: 'warn',
         title: '未配置 SSO→grok2api',
-        description: '请在设置「推送设置」开启 SSO→grok2api 允许/自动，并填写 grok2api 地址与账号'
+        description:
+          '请在设置「推送设置」开启 SSO→grok2api 允许/自动，并填写 grok2api 地址与账号'
       });
       return;
     }
-    if (targets.length > 100) {
-      push({ tone: 'warn', title: '单次最多 100 个', description: '请缩小选择范围后再试' });
-      return;
+    if (force) {
+      const ok = window.confirm(
+        '【强制重推 G2A】忽略已推标记，重新上传 ' + targets.length + ' 条。继续？'
+      );
+      if (!ok) return;
     }
+
+    const ac = new AbortController();
+    g2aAbortRef.current = ac;
+    setWebApiAbortSignal(ac.signal);
     setPushingG2a(true);
-    try {
-      const CHUNK = 8;
-      let ok = 0;
-      let failed = 0;
-      let skipped = 0;
-      let remoteUrl = '';
-      for (let i = 0; i < targets.length; i += CHUNK) {
-        const chunk = targets.slice(i, i + CHUNK);
-        const r = await window.api.pushSsoToGrok2api({
-          items: chunk.map((a) => ({ sso: a.sso, email: a.email, id: a.id })),
-          concurrency: 1
-        });
-        ok += r.ok || 0;
-        failed += r.failed || 0;
-        skipped += r.skipped || 0;
-        if (r.remoteUrl) remoteUrl = r.remoteUrl;
+    setG2aProg({
+      total: targets.length,
+      done: 0,
+      ok: 0,
+      failed: 0,
+      skipped: 0,
+      running: true,
+      current: targets[0]?.email || ''
+    });
+
+    let okN = 0;
+    let failedN = 0;
+    let skippedN = 0;
+    let cancelled = false;
+    let remoteUrl = '';
+    const reasonCounts: Record<string, number> = {};
+    const failedTargets: { sso: string; email?: string; id?: string }[] = [];
+    const failedByReason: Record<string, { sso: string; email?: string; id?: string }[]> = {};
+    const ssoByEmail = new Map(
+      targets.map((t) => [String(t.email || '').toLowerCase(), t] as const)
+    );
+    let doneN = 0;
+
+    const applyItem = (x: {
+      ok?: boolean;
+      skipped?: boolean;
+      error?: string;
+      email?: string;
+      id?: string;
+      mode?: string;
+      failReason?: string;
+    }) => {
+      doneN += 1;
+      if (x.skipped && x.ok) {
+        skippedN += 1;
+        okN += 1;
+      } else if (x.ok) {
+        okN += 1;
+      } else {
+        failedN += 1;
+        const fr = x.failReason || x.mode || 'unknown';
+        reasonCounts[fr] = (reasonCounts[fr] || 0) + 1;
+        const em = String(x.email || '').toLowerCase();
+        const t =
+          (x.id && targets.find((a) => a.id === x.id)) ||
+          (em && ssoByEmail.get(em)) ||
+          null;
+        const sso = t?.sso || '';
+        if (sso) {
+          const row = { sso, email: x.email || t?.email, id: x.id || t?.id };
+          failedTargets.push(row);
+          if (!failedByReason[fr]) failedByReason[fr] = [];
+          failedByReason[fr].push(row);
+        }
       }
-      push({
-        tone: failed > 0 ? 'warn' : 'ok',
-        title: '推送 G2A 完成',
-        description: `成功 ${ok} · 失败 ${failed}${skipped ? ` · 跳过 ${skipped}` : ''}${
-          remoteUrl ? ` · ${remoteUrl}` : ''
-        }`
+      const reasonSummary = Object.entries(reasonCounts)
+        .map(([k, v]) => k + ':' + v)
+        .join(' ');
+      setG2aProg({
+        total: targets.length,
+        done: doneN,
+        ok: okN,
+        failed: failedN,
+        skipped: skippedN,
+        current: x.email || x.id,
+        running: doneN < targets.length && !ac.signal.aborted,
+        failReasonSummary: reasonSummary || undefined,
+        failReasons: { ...reasonCounts }
       });
+    };
+
+    try {
+      const streamFn = window.api.pushSsoToGrok2apiStream;
+      const items = targets.map((a) => ({ sso: a.sso, email: a.email, id: a.id }));
+      const concurrency = Math.min(3, items.length);
+      if (typeof streamFn === 'function') {
+        try {
+          const r = await streamFn({ items, concurrency, force }, (item) => {
+            if (ac.signal.aborted) return;
+            applyItem(item);
+          });
+          if (r.remoteUrl) remoteUrl = r.remoteUrl;
+          if (r.cancelled || ac.signal.aborted) cancelled = true;
+          if (doneN === 0 && Array.isArray(r.results)) {
+            for (const x of r.results) applyItem(x);
+          }
+        } catch (err) {
+          if (
+            (err instanceof Error && err.name === 'AbortError') ||
+            ac.signal.aborted
+          ) {
+            cancelled = true;
+          } else {
+            console.warn('[g2a] stream failed, fallback chunk', err);
+            const CHUNK = 8;
+            for (let i = 0; i < targets.length; i += CHUNK) {
+              if (ac.signal.aborted) {
+                cancelled = true;
+                break;
+              }
+              const chunk = targets.slice(i, i + CHUNK);
+              const r = await window.api.pushSsoToGrok2api({
+                items: chunk.map((a) => ({ sso: a.sso, email: a.email, id: a.id })),
+                concurrency: Math.min(3, chunk.length),
+                force
+              });
+              if (r.remoteUrl) remoteUrl = r.remoteUrl;
+              for (const x of r.results || []) applyItem(x);
+            }
+          }
+        }
+      } else {
+        const CHUNK = 8;
+        for (let i = 0; i < targets.length; i += CHUNK) {
+          if (ac.signal.aborted) {
+            cancelled = true;
+            break;
+          }
+          const chunk = targets.slice(i, i + CHUNK);
+          const r = await window.api.pushSsoToGrok2api({
+            items: chunk.map((a) => ({ sso: a.sso, email: a.email, id: a.id })),
+            concurrency: Math.min(3, chunk.length),
+            force
+          });
+          if (r.remoteUrl) remoteUrl = r.remoteUrl;
+          for (const x of r.results || []) applyItem(x);
+        }
+      }
+
+      lastG2aFailedRef.current = failedTargets;
+      lastG2aFailedByReasonRef.current = failedByReason;
+
+      if (cancelled || ac.signal.aborted) {
+        push({
+          tone: 'warn',
+          title: force ? '强制重推 G2A 已取消' : '推送 G2A 已取消',
+          description:
+            '已处理 ' +
+            doneN +
+            '/' +
+            targets.length +
+            ' · 成功 ' +
+            okN +
+            ' · 失败 ' +
+            failedN
+        });
+      } else {
+        push({
+          tone: failedN > 0 ? 'warn' : 'ok',
+          title: force ? '强制重推 G2A 完成' : '推送 G2A 完成',
+          description:
+            '成功 ' +
+            okN +
+            ' · 失败 ' +
+            failedN +
+            (skippedN ? ' · 跳过 ' + skippedN : '') +
+            (remoteUrl ? ' · ' + remoteUrl : '') +
+            (failedTargets.length ? ' · 可点原因复检' : '')
+        });
+      }
     } catch (err) {
-      push({
-        tone: 'danger',
-        title: '推送 G2A 失败',
-        description: err instanceof Error ? err.message : String(err)
-      });
+      if (
+        (err instanceof Error && err.name === 'AbortError') ||
+        ac.signal.aborted
+      ) {
+        push({ tone: 'warn', title: '推送 G2A 已取消' });
+      } else {
+        push({
+          tone: 'danger',
+          title: '推送 G2A 失败',
+          description: err instanceof Error ? err.message : String(err)
+        });
+      }
     } finally {
+      g2aAbortRef.current = null;
+      setWebApiAbortSignal(null);
       setPushingG2a(false);
+      setG2aProg((p) => (p ? { ...p, running: false } : p));
+      const keepMs = failedTargets.length > 0 ? 120000 : 8000;
+      window.setTimeout(() => {
+        setG2aProg((p) => (p && !p.running ? null : p));
+      }, keepMs);
     }
+  };
+
+  // 长按强制 G2A
+  const g2aHoldRef = useRef<{ timer: ReturnType<typeof setTimeout> | null; armed: boolean }>({
+    timer: null,
+    armed: false
+  });
+  const onG2aPointerDown = () => {
+    if (!g2aReady || (busy && !pushingG2a)) return;
+    g2aHoldRef.current.armed = false;
+    if (g2aHoldRef.current.timer) clearTimeout(g2aHoldRef.current.timer);
+    g2aHoldRef.current.timer = setTimeout(() => {
+      g2aHoldRef.current.armed = true;
+      void pushG2aFromSso(selected.size > 0 ? 'page' : 'filter', { force: true });
+    }, 600);
+  };
+  const onG2aPointerUp = () => {
+    if (g2aHoldRef.current.timer) {
+      clearTimeout(g2aHoldRef.current.timer);
+      g2aHoldRef.current.timer = null;
+    }
+    if (g2aHoldRef.current.armed) {
+      g2aHoldRef.current.armed = false;
+      return;
+    }
+    if (pushingG2a) {
+      cancelG2a();
+      return;
+    }
+    void pushG2aFromSso(selected.size > 0 ? 'page' : 'filter', { force: false });
+  };
+  const onG2aPointerLeave = () => {
+    if (g2aHoldRef.current.timer) {
+      clearTimeout(g2aHoldRef.current.timer);
+      g2aHoldRef.current.timer = null;
+    }
+    g2aHoldRef.current.armed = false;
   };
 
   const picked = accounts.filter((a) => selected.has(a.id));
@@ -1807,7 +2080,7 @@ export function PoolPage() {
     verifyProg && verifyProg.total > 0
       ? Math.min(100, Math.round((verifyProg.done / verifyProg.total) * 100))
       : 0;
-  const busy = verifying || minting || deleting || importing || pushingG2a;
+  const busy = verifying || minting || deleting || importing || pushingG2a || !!g2aProg?.running;
   const hasActiveFilter =
     authFilter !== 'all' ||
     aliveFilter !== 'all' ||
@@ -1957,6 +2230,80 @@ export function PoolPage() {
           ) : null}
         </div>
       )}
+      {g2aProg && (
+        <div className="rounded-[16px] border border-sky-500/30 bg-sky-500/5 px-4 py-3 shadow-[var(--ios-shadow)]">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-[13px] font-semibold tracking-tight">
+                {g2aProg.running ? '推送 G2A 进行中' : '推送 G2A 已完成'}
+              </p>
+              <p className="mt-0.5 truncate text-[12px] text-muted-foreground">
+                {g2aProg.done}/{g2aProg.total}
+                {g2aProg.current ? ' · 当前 ' + g2aProg.current : ''}
+                {' · 成功 ' + g2aProg.ok + ' · 失败 ' + g2aProg.failed}
+                {g2aProg.skipped ? ' · 跳过 ' + g2aProg.skipped : ''}
+                {g2aProg.failReasonSummary ? ' · 原因 ' + g2aProg.failReasonSummary : ''}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              {g2aProg.running ? (
+                <Button size="sm" variant="secondary" onClick={cancelG2a} title="取消剩余推送">
+                  取消
+                </Button>
+              ) : null}
+              <span className="chip tabular-nums">
+                {g2aProg.total > 0
+                  ? Math.min(100, Math.round((g2aProg.done / g2aProg.total) * 100))
+                  : 0}
+                %
+              </span>
+            </div>
+          </div>
+          <div className="mt-2 h-2 overflow-hidden rounded-full bg-muted">
+            <div
+              className={
+                'h-full rounded-full transition-all duration-300 ' +
+                (g2aProg.running ? 'bg-sky-500' : 'bg-emerald-500')
+              }
+              style={{
+                width:
+                  (g2aProg.total > 0
+                    ? Math.min(100, Math.round((g2aProg.done / g2aProg.total) * 100))
+                    : 0) + '%'
+              }}
+            />
+          </div>
+          {!g2aProg.running &&
+          g2aProg.failReasons &&
+          Object.keys(g2aProg.failReasons).length > 0 ? (
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              <span className="text-[10px] font-semibold tracking-wide text-muted-foreground">
+                点原因复检
+              </span>
+              {Object.entries(g2aProg.failReasons)
+                .sort((a, b) => b[1] - a[1])
+                .map(([reason, n]) => (
+                  <button
+                    key={reason}
+                    type="button"
+                    className="chip cursor-pointer border border-border/70 bg-background/80 text-[11px] hover:border-primary hover:text-primary"
+                    title={'仅复检 G2A 原因 ' + reason + '（' + n + '）'}
+                    onClick={() => {
+                      if (pushingG2a) return;
+                      void pushG2aFromSso(selected.size > 0 ? 'page' : 'filter', {
+                        recheck: 'fail_reason',
+                        failReason: reason
+                      });
+                    }}
+                  >
+                    {reason}:{n}
+                  </button>
+                ))}
+            </div>
+          ) : null}
+        </div>
+      )}
+
 
       <div className="ios-group">
         <div className="space-y-2.5 border-b border-border/70 px-4 py-3">
@@ -2283,6 +2630,46 @@ export function PoolPage() {
                 title="仅补签尚未转 Auth 的 SSO"
               >
                 仅未转Auth
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={busy && !pushingG2a}
+                onClick={() => {
+                  if (pushingG2a) cancelG2a();
+                  else void pushG2aFromSso(selected.size > 0 ? 'page' : 'filter', { recheck: 'failed' });
+                }}
+                title="仅复检上次 G2A 推送失败"
+              >
+                G2A仅失败
+              </Button>
+              <Button
+                size="sm"
+                variant={pushingG2a ? 'danger' : 'secondary'}
+                disabled={(busy && !pushingG2a) || (!g2aReady && !pushingG2a)}
+                onPointerDown={(e) => {
+                  if (pushingG2a) return;
+                  if (e.button !== 0) return;
+                  onG2aPointerDown();
+                }}
+                onPointerUp={() => {
+                  if (pushingG2a) {
+                    cancelG2a();
+                    return;
+                  }
+                  onG2aPointerUp();
+                }}
+                onPointerLeave={onG2aPointerLeave}
+                onPointerCancel={onG2aPointerLeave}
+                title={
+                  pushingG2a
+                    ? '取消推送 G2A'
+                    : g2aReady
+                      ? '推送 SSO→grok2api · 长按约 0.6 秒强制重推'
+                      : '请在设置开启 SSO→grok2api 并填写连接'
+                }
+              >
+                {pushingG2a ? '取消G2A' : '推送 G2A'}
               </Button>
             </div>
             <div className="flex flex-wrap items-center gap-1.5">

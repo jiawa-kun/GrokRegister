@@ -837,16 +837,71 @@ app.post('/api/accounts/push-grok2api', asyncHandler(async (req: Request, res: R
     const body = (req.body ?? {}) as {
       items?: { sso: string; email?: string; id?: string }[];
       concurrency?: number;
+      force?: boolean;
     };
     res.json(
       await pushSsoToGrok2apiBatch({
         items: body.items || [],
-        concurrency: body.concurrency
+        concurrency: body.concurrency,
+        force: body.force
       })
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
+  }
+}));
+
+/** 号池 SSO→G2A NDJSON 流 */
+app.post('/api/accounts/push-grok2api-stream', asyncHandler(async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    items?: { sso: string; email?: string; id?: string }[];
+    concurrency?: number;
+    force?: boolean;
+  };
+  res.status(200);
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  const resAny = res as Response & { flushHeaders?: () => void };
+  if (typeof resAny.flushHeaders === 'function') resAny.flushHeaders();
+  const writeLine = (obj: unknown) => {
+    if (res.writableEnded) return;
+    res.write(JSON.stringify(obj) + String.fromCharCode(10));
+  };
+  let aborted = false;
+  const markAbort = () => {
+    aborted = true;
+  };
+  req.on('close', markAbort);
+  req.on('aborted', markAbort);
+  try {
+    const items = Array.isArray(body.items) ? body.items : [];
+    writeLine({ type: 'start', total: items.length });
+    const result = await pushSsoToGrok2apiBatch({
+      items,
+      concurrency: body.concurrency,
+      force: body.force,
+      isAborted: () => aborted || res.writableEnded,
+      onItem: (item) => {
+        writeLine({ type: 'item', ...item });
+      }
+    });
+    writeLine({
+      type: 'done',
+      total: result.total,
+      ok: result.ok,
+      failed: result.failed,
+      skipped: result.skipped,
+      cancelled: result.cancelled,
+      failReasons: result.failReasons,
+      remoteUrl: result.remoteUrl
+    });
+    res.end();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    writeLine({ type: 'error', error: message });
+    res.end();
   }
 }));
 
@@ -1036,6 +1091,7 @@ app.post('/api/cpa-auth/push-remote', asyncHandler(async (req: Request, res: Res
       filenames?: string[];
       paths?: string[];
       concurrency?: number;
+      force?: boolean;
     };
     res.json(await pushCpaAuthRemoteBatch(body));
   } catch (err) {
@@ -1051,11 +1107,126 @@ app.post('/api/cpa-auth/push-sub2api', asyncHandler(async (req: Request, res: Re
       filenames?: string[];
       paths?: string[];
       concurrency?: number;
+      force?: boolean;
     };
     res.json(await pushSub2apiAuthRemoteBatch(body));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
+  }
+}));
+
+/** 批量推送 CPA NDJSON 流：每完成一条 type=item，结束 type=done */
+app.post('/api/cpa-auth/push-remote-stream', asyncHandler(async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    filenames?: string[];
+    paths?: string[];
+    concurrency?: number;
+    force?: boolean;
+  };
+  res.status(200);
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  const resAny = res as Response & { flushHeaders?: () => void };
+  if (typeof resAny.flushHeaders === 'function') resAny.flushHeaders();
+  const writeLine = (obj: unknown) => {
+    if (res.writableEnded) return;
+    res.write(JSON.stringify(obj) + String.fromCharCode(10));
+  };
+  let aborted = false;
+  const markAbort = () => {
+    aborted = true;
+  };
+  req.on('close', markAbort);
+  req.on('aborted', markAbort);
+  try {
+    const names = Array.isArray(body.filenames) ? body.filenames : [];
+    const paths = Array.isArray(body.paths) ? body.paths : [];
+    const total =
+      names.filter((f) => String(f || '').trim()).length +
+      paths.filter((p) => String(p || '').trim()).length;
+    writeLine({ type: 'start', total });
+    const result = await pushCpaAuthRemoteBatch({
+      ...body,
+      isAborted: () => aborted || res.writableEnded,
+      onItem: (item) => {
+        writeLine({ type: 'item', ...item });
+      }
+    });
+    writeLine({
+      type: 'done',
+      total: result.total,
+      ok: result.ok,
+      failed: result.failed,
+      skipped: result.skipped,
+      cancelled: result.cancelled,
+      modeCounts: result.modeCounts,
+      failReasons: result.failReasons,
+      remoteUrl: result.remoteUrl
+    });
+    res.end();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    writeLine({ type: 'error', error: message });
+    res.end();
+  }
+}));
+
+/** 批量推送 S2A NDJSON 流 */
+app.post('/api/cpa-auth/push-sub2api-stream', asyncHandler(async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    filenames?: string[];
+    paths?: string[];
+    concurrency?: number;
+    force?: boolean;
+  };
+  res.status(200);
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  const resAny = res as Response & { flushHeaders?: () => void };
+  if (typeof resAny.flushHeaders === 'function') resAny.flushHeaders();
+  const writeLine = (obj: unknown) => {
+    if (res.writableEnded) return;
+    res.write(JSON.stringify(obj) + String.fromCharCode(10));
+  };
+  let aborted = false;
+  const markAbort = () => {
+    aborted = true;
+  };
+  req.on('close', markAbort);
+  req.on('aborted', markAbort);
+  try {
+    const names = Array.isArray(body.filenames) ? body.filenames : [];
+    const paths = Array.isArray(body.paths) ? body.paths : [];
+    const total =
+      names.filter((f) => String(f || '').trim()).length +
+      paths.filter((p) => String(p || '').trim()).length;
+    writeLine({ type: 'start', total });
+    const result = await pushSub2apiAuthRemoteBatch({
+      ...body,
+      isAborted: () => aborted || res.writableEnded,
+      onItem: (item) => {
+        writeLine({ type: 'item', ...item });
+      }
+    });
+    writeLine({
+      type: 'done',
+      total: result.total,
+      ok: result.ok,
+      failed: result.failed,
+      skipped: result.skipped,
+      cancelled: result.cancelled,
+      modeCounts: result.modeCounts,
+      failReasons: result.failReasons,
+      remoteUrl: result.remoteUrl
+    });
+    res.end();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    writeLine({ type: 'error', error: message });
+    res.end();
   }
 }));
 

@@ -505,13 +505,16 @@ export interface RendererApi {
   pushSsoToGrok2api(input: {
     items: { sso: string; email?: string; id?: string }[];
     concurrency?: number;
+    force?: boolean;
   }): Promise<{
     total: number;
     ok: number;
     failed: number;
     skipped: number;
+    cancelled?: boolean;
     remoteConfigured?: boolean;
     remoteUrl?: string;
+    failReasons?: Record<string, number>;
     results?: {
       ok: boolean;
       skipped?: boolean;
@@ -519,6 +522,41 @@ export interface RendererApi {
       email?: string;
       id?: string;
       mode?: string;
+      failReason?: string;
+    }[];
+  }>;
+  pushSsoToGrok2apiStream?(
+    input: {
+      items: { sso: string; email?: string; id?: string }[];
+      concurrency?: number;
+      force?: boolean;
+    },
+    onItem: (item: {
+      ok: boolean;
+      skipped?: boolean;
+      error?: string;
+      email?: string;
+      id?: string;
+      mode?: string;
+      failReason?: string;
+    }) => void
+  ): Promise<{
+    total: number;
+    ok: number;
+    failed: number;
+    skipped: number;
+    cancelled?: boolean;
+    remoteConfigured?: boolean;
+    remoteUrl?: string;
+    failReasons?: Record<string, number>;
+    results: {
+      ok: boolean;
+      skipped?: boolean;
+      error?: string;
+      email?: string;
+      id?: string;
+      mode?: string;
+      failReason?: string;
     }[];
   }>;
 
@@ -685,6 +723,28 @@ export interface RendererApi {
       remoteConfigured?: boolean;
       remoteUrl?: string;
       modeCounts?: Record<string, number>;
+      failReasons?: Record<string, number>;
+      skipped?: number;
+      cancelled?: boolean;
+    }
+  >;
+  /** CPA 推送 NDJSON 流 */
+  pushCpaAuthRemoteStream?(
+    input: {
+      filenames?: string[];
+      paths?: string[];
+      concurrency?: number;
+      force?: boolean;
+    },
+    onItem: (item: CpaAuthBatchResultItem) => void
+  ): Promise<
+    CpaAuthBatchResult & {
+      remoteConfigured?: boolean;
+      remoteUrl?: string;
+      modeCounts?: Record<string, number>;
+      failReasons?: Record<string, number>;
+      skipped?: number;
+      cancelled?: boolean;
     }
   >;
   /** 批量推送已有 auth 到 sub2api（先转官方格式再 POST）；force=true 忽略 already_pushed */
@@ -698,6 +758,28 @@ export interface RendererApi {
       remoteConfigured?: boolean;
       remoteUrl?: string;
       modeCounts?: Record<string, number>;
+      failReasons?: Record<string, number>;
+      skipped?: number;
+      cancelled?: boolean;
+    }
+  >;
+  /** S2A 推送 NDJSON 流 */
+  pushSub2apiAuthRemoteStream?(
+    input: {
+      filenames?: string[];
+      paths?: string[];
+      concurrency?: number;
+      force?: boolean;
+    },
+    onItem: (item: CpaAuthBatchResultItem) => void
+  ): Promise<
+    CpaAuthBatchResult & {
+      remoteConfigured?: boolean;
+      remoteUrl?: string;
+      modeCounts?: Record<string, number>;
+      failReasons?: Record<string, number>;
+      skipped?: number;
+      cancelled?: boolean;
     }
   >;
   /** 批量删除 CPA auth 文件 */

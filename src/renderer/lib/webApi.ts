@@ -15,6 +15,110 @@ export function setWebApiAbortSignal(signal: AbortSignal | null): void {
   activeAbortSignal = signal;
 }
 
+async function readPushNdjsonStream(
+  path: string,
+  body: unknown,
+  onItem: (item: import('@shared/ipc').CpaAuthBatchResultItem) => void
+): Promise<{
+  total: number;
+  ok: number;
+  failed: number;
+  skipped?: number;
+  cancelled?: boolean;
+  remoteUrl?: string;
+  modeCounts?: Record<string, number>;
+  failReasons?: Record<string, number>;
+  results: import('@shared/ipc').CpaAuthBatchResultItem[];
+}> {
+  const signal =
+    activeAbortSignal && !activeAbortSignal.aborted ? activeAbortSignal : undefined;
+  const res = await fetch(path, {
+    method: 'POST',
+    credentials: 'include',
+    headers: buildHeaders(body),
+    body: JSON.stringify(body),
+    signal
+  });
+  if (!res.ok) {
+    let detail = '';
+    try {
+      detail = await res.text();
+    } catch {
+      /* ignore */
+    }
+    throw new Error('POST ' + path + ' → HTTP ' + res.status + ': ' + detail.slice(0, 200));
+  }
+  if (!res.body) throw new Error('响应无 body');
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  const results: import('@shared/ipc').CpaAuthBatchResultItem[] = [];
+  let summary: {
+    total: number;
+    ok: number;
+    failed: number;
+    skipped?: number;
+    cancelled?: boolean;
+    remoteUrl?: string;
+    modeCounts?: Record<string, number>;
+    failReasons?: Record<string, number>;
+    results: import('@shared/ipc').CpaAuthBatchResultItem[];
+  } | null = null;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const parts = buf.split('\n');
+    buf = parts.pop() || '';
+    for (const line of parts) {
+      const t = line.trim();
+      if (!t) continue;
+      let msg: Record<string, unknown>;
+      try {
+        msg = JSON.parse(t) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (msg.type === 'item') {
+        const item = { ...msg } as unknown as import('@shared/ipc').CpaAuthBatchResultItem & {
+          type?: string;
+        };
+        delete (item as { type?: string }).type;
+        results.push(item);
+        onItem(item);
+      } else if (msg.type === 'done') {
+        summary = {
+          total: Number(msg.total) || results.length,
+          ok: Number(msg.ok) || 0,
+          failed: Number(msg.failed) || 0,
+          skipped: Number(msg.skipped) || 0,
+          cancelled: Boolean(msg.cancelled),
+          remoteUrl: msg.remoteUrl ? String(msg.remoteUrl) : undefined,
+          modeCounts:
+            msg.modeCounts && typeof msg.modeCounts === 'object'
+              ? (msg.modeCounts as Record<string, number>)
+              : undefined,
+          failReasons:
+            msg.failReasons && typeof msg.failReasons === 'object'
+              ? (msg.failReasons as Record<string, number>)
+              : undefined,
+          results
+        };
+      } else if (msg.type === 'error') {
+        throw new Error(String(msg.error || '推送流失败'));
+      }
+    }
+  }
+  if (summary) return summary;
+  const ok = results.filter((r) => r.ok).length;
+  return {
+    total: results.length,
+    ok,
+    failed: results.length - ok,
+    results
+  };
+}
+
 async function http<T>(method: string, path: string, body?: unknown): Promise<T> {
   // 已 abort 的 signal 勿再挂上，否则设置页测活等会整批“秒失败”
   const signal =
@@ -306,6 +410,31 @@ const webApi: RendererApi = {
       writable: false
     });
     return list as typeof list & { emailsFilled?: number };
+  },
+  pushSsoToGrok2apiStream: async (input, onItem) => {
+    const r = await readPushNdjsonStream(
+      '/api/accounts/push-grok2api-stream',
+      input,
+      onItem as (item: import('@shared/ipc').CpaAuthBatchResultItem) => void
+    );
+    return {
+      total: r.total,
+      ok: r.ok,
+      failed: r.failed,
+      skipped: Number(r.skipped) || 0,
+      cancelled: r.cancelled,
+      remoteUrl: r.remoteUrl,
+      failReasons: r.failReasons,
+      results: (r.results || []).map((x) => ({
+        ok: !!x.ok,
+        skipped: x.skipped,
+        error: x.error,
+        email: x.email,
+        id: (x as { id?: string }).id,
+        mode: x.mode,
+        failReason: x.failReason
+      }))
+    };
   },
   pushSsoToGrok2api: (input) =>
     http('POST', '/api/accounts/push-grok2api', input),
@@ -602,7 +731,11 @@ const webApi: RendererApi = {
   },
   reloginCpaAuth: (input) => http('POST', '/api/cpa-auth/relogin', input),
   pushCpaAuthRemote: (input) => http('POST', '/api/cpa-auth/push-remote', input),
+  pushCpaAuthRemoteStream: (input, onItem) =>
+    readPushNdjsonStream('/api/cpa-auth/push-remote-stream', input, onItem),
   pushSub2apiAuthRemote: (input) => http('POST', '/api/cpa-auth/push-sub2api', input),
+  pushSub2apiAuthRemoteStream: (input, onItem) =>
+    readPushNdjsonStream('/api/cpa-auth/push-sub2api-stream', input, onItem),
   deleteCpaAuth: (input) => http('POST', '/api/cpa-auth/delete', input),
   exportCpaAuth: (input) => http('POST', '/api/cpa-auth/export', input),
   backfillCpaAuthSso: (input) =>

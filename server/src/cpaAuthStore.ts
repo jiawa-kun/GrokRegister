@@ -17,6 +17,7 @@ import type { ReloginStage } from '@shared/runEvents.js';
 import {
   getPythonJobPool,
   classifyAuthFailReason,
+  classifyPushFailReason,
   summarizeFailReasons
 } from './pythonJobPool.js';
 import {
@@ -1528,15 +1529,19 @@ export async function pushCpaAuthRemoteBatch(input: {
   concurrency?: number;
   /** true：忽略 already_pushed，强制重新上传 */
   force?: boolean;
+  onItem?: (item: CpaAuthBatchResultItem) => void | Promise<void>;
+  isAborted?: () => boolean;
 }): Promise<{
   total: number;
   ok: number;
   failed: number;
   skipped?: number;
+  cancelled?: boolean;
   remoteConfigured: boolean;
   remoteUrl?: string;
   /** mode 分布：uploaded / already_pushed / http_error / … */
   modeCounts?: Record<string, number>;
+  failReasons?: Record<string, number>;
   results: CpaAuthBatchResultItem[];
 }> {
   const settings = await loadSettings();
@@ -1586,13 +1591,28 @@ export async function pushCpaAuthRemoteBatch(input: {
   // 批次开始时快照侧车标签，用于 already_pushed 跳过（force 时忽略）
   const pushTagsSnapshot = await loadAccountTagsAsync();
 
+  const emit = async (item: CpaAuthBatchResultItem) => {
+    if (!item.ok && !item.failReason) {
+      item.failReason = classifyPushFailReason(item);
+    }
+    results.push(item);
+    if (input.onItem) {
+      try {
+        await input.onItem(item);
+      } catch {
+        /* ignore client callback errors */
+      }
+    }
+  };
+
   async function worker() {
     while (idx < unique.length) {
+      if (input.isAborted?.()) break;
       const i = idx++;
       const job = unique[i];
       try {
         if (!existsSync(job.path)) {
-          results.push({
+          await emit({
             filename: job.filename,
             ok: false,
             remoteOk: false,
@@ -1607,7 +1627,7 @@ export async function pushCpaAuthRemoteBatch(input: {
         try {
           data = JSON.parse(raw) as Record<string, unknown>;
         } catch {
-          results.push({
+          await emit({
             filename: job.filename,
             ok: false,
             remoteOk: false,
@@ -1626,7 +1646,7 @@ export async function pushCpaAuthRemoteBatch(input: {
         if (!force) {
           const tag = lookupNsfwTag(pushTagsSnapshot, { email, sso });
           if (isPushOkFromTag(tag, 'auth_cpa')) {
-            results.push({
+            await emit({
               filename: job.filename,
               email,
               ok: true,
@@ -1664,7 +1684,7 @@ export async function pushCpaAuthRemoteBatch(input: {
           } catch {
             /* ignore */
           }
-          results.push({
+          await emit({
             filename: job.filename,
             email,
             ok: false,
@@ -1680,7 +1700,7 @@ export async function pushCpaAuthRemoteBatch(input: {
           } catch {
             /* ignore */
           }
-          results.push({
+          await emit({
             filename: job.filename,
             email,
             ok: true,
@@ -1697,7 +1717,7 @@ export async function pushCpaAuthRemoteBatch(input: {
         } catch {
           /* ignore */
         }
-        results.push({
+        await emit({
           filename: job.filename,
           ok: false,
           remoteOk: false,
@@ -1717,18 +1737,25 @@ export async function pushCpaAuthRemoteBatch(input: {
     const m = r.mode || (r.ok ? (r.skipped ? 'already_pushed' : 'uploaded') : 'error');
     modeCounts[m] = (modeCounts[m] || 0) + 1;
   }
+  for (const r of results) {
+    if (!r.ok && !r.failReason) r.failReason = classifyPushFailReason(r);
+  }
+  const failReasons = summarizeFailReasons(results);
+  const cancelled = Boolean(input.isAborted?.());
   console.log(
     `[cpa-auth] push-remote total=${results.length} ok=${ok} skipped=${skipped} ` +
-      `failed=${results.length - ok} force=${force} modes=${JSON.stringify(modeCounts)}`
+      `failed=${results.length - ok} force=${force} cancelled=${cancelled} modes=${JSON.stringify(modeCounts)}`
   );
   return {
     total: results.length,
     ok,
     failed: results.length - ok,
     skipped,
+    cancelled,
     remoteConfigured: true,
     remoteUrl: base,
     modeCounts,
+    failReasons,
     results
   };
 }
@@ -1744,14 +1771,18 @@ export async function pushSub2apiAuthRemoteBatch(input: {
   concurrency?: number;
   /** true：忽略 already_pushed，强制重新上传 */
   force?: boolean;
+  onItem?: (item: CpaAuthBatchResultItem) => void | Promise<void>;
+  isAborted?: () => boolean;
 }): Promise<{
   total: number;
   ok: number;
   failed: number;
   skipped?: number;
+  cancelled?: boolean;
   remoteConfigured: boolean;
   remoteUrl?: string;
   modeCounts?: Record<string, number>;
+  failReasons?: Record<string, number>;
   results: CpaAuthBatchResultItem[];
 }> {
   const settings = await loadSettings();
@@ -1824,6 +1855,21 @@ export async function pushSub2apiAuthRemoteBatch(input: {
   const results: CpaAuthBatchResultItem[] = [];
   let idx = 0;
   const pushTagsSnapshot = await loadAccountTagsAsync();
+
+  /* S2A_EMIT */
+  const emit = async (item: CpaAuthBatchResultItem) => {
+    if (!item.ok && !item.failReason) {
+      item.failReason = classifyPushFailReason(item);
+    }
+    results.push(item);
+    if (input.onItem) {
+      try {
+        await input.onItem(item);
+      } catch {
+        /* ignore */
+      }
+    }
+  };
 
   function normalizeExpiresAt(raw: unknown): string {
     if (raw == null || raw === '') return '';
@@ -1917,11 +1963,12 @@ export async function pushSub2apiAuthRemoteBatch(input: {
 
   async function worker() {
     while (idx < unique.length) {
+      if (input.isAborted?.()) break;
       const i = idx++;
       const job = unique[i];
       try {
         if (!existsSync(job.path)) {
-          results.push({
+          await emit({
             filename: job.filename,
             ok: false,
             remoteOk: false,
@@ -1936,7 +1983,7 @@ export async function pushSub2apiAuthRemoteBatch(input: {
         try {
           data = JSON.parse(raw) as Record<string, unknown>;
         } catch {
-          results.push({
+          await emit({
             filename: job.filename,
             ok: false,
             remoteOk: false,
@@ -1951,7 +1998,7 @@ export async function pushSub2apiAuthRemoteBatch(input: {
         if (!force) {
           const tag = lookupNsfwTag(pushTagsSnapshot, { email: emailEarly, sso: ssoEarly });
           if (isPushOkFromTag(tag, 'auth_sub2api')) {
-            results.push({
+            await emit({
               filename: job.filename,
               email: emailEarly,
               ok: true,
@@ -1968,7 +2015,7 @@ export async function pushSub2apiAuthRemoteBatch(input: {
           body = cpaToSub2CreateBody(data, resolvedGroupIds);
         } catch (convErr) {
           const msg = convErr instanceof Error ? convErr.message : String(convErr);
-          results.push({
+          await emit({
             filename: job.filename,
             email: String(data.email || ''),
             ok: false,
@@ -2063,7 +2110,7 @@ export async function pushSub2apiAuthRemoteBatch(input: {
           } catch {
             /* ignore */
           }
-          results.push({
+          await emit({
             filename: job.filename,
             email,
             ok: false,
@@ -2083,7 +2130,7 @@ export async function pushSub2apiAuthRemoteBatch(input: {
           } catch {
             /* ignore */
           }
-          results.push({
+          await emit({
             filename: job.filename,
             email,
             ok: true,
@@ -2099,7 +2146,7 @@ export async function pushSub2apiAuthRemoteBatch(input: {
         } catch {
           /* ignore */
         }
-        results.push({
+        await emit({
           filename: job.filename,
           ok: false,
           remoteOk: false,
@@ -2119,18 +2166,25 @@ export async function pushSub2apiAuthRemoteBatch(input: {
     const m = r.mode || (r.ok ? (r.skipped ? 'already_pushed' : 'uploaded') : 'error');
     modeCounts[m] = (modeCounts[m] || 0) + 1;
   }
+  for (const r of results) {
+    if (!r.ok && !r.failReason) r.failReason = classifyPushFailReason(r);
+  }
+  const failReasons = summarizeFailReasons(results);
+  const cancelled = Boolean(input.isAborted?.());
   console.log(
     `[cpa-auth] push-sub2api total=${results.length} ok=${ok} skipped=${skipped} ` +
-      `failed=${results.length - ok} force=${force} modes=${JSON.stringify(modeCounts)}`
+      `failed=${results.length - ok} force=${force} cancelled=${cancelled} modes=${JSON.stringify(modeCounts)}`
   );
   return {
     total: results.length,
     ok,
     failed: results.length - ok,
     skipped,
+    cancelled,
     remoteConfigured: true,
     remoteUrl: base,
     modeCounts,
+    failReasons,
     results
   };
 }

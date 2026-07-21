@@ -283,6 +283,12 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   const lastResignFailedRef = useRef<string[]>([]);
   /** 上次重签按 failReason 分组的文件名（点原因 chip 复检） */
   const lastResignFailedByReasonRef = useRef<Record<string, string[]>>({});
+  /** 上次推送 CPA 失败文件名 */
+  const lastPushCpaFailedRef = useRef<string[]>([]);
+  const lastPushCpaByReasonRef = useRef<Record<string, string[]>>({});
+  /** 上次推送 S2A 失败文件名 */
+  const lastPushS2aFailedRef = useRef<string[]>([]);
+  const lastPushS2aByReasonRef = useRef<Record<string, string[]>>({});
 
   type BatchKind =
     | 'resign'
@@ -1926,19 +1932,109 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     }
   };
 
-  const pushRemoteBatch = async (opts?: { force?: boolean }) => {
-    const force = Boolean(opts?.force);
-    let filenames: string[] = [];
-    try {
-      const r = await resolveTargetNames({ limit: 500 });
-      filenames = r.names;
+  type PushRecheck = 'all' | 'failed' | 'unpushed' | 'push_fail' | 'fail_reason';
+
+  const resolvePushFilenames = async (
+    channel: 'cpa' | 's2a',
+    opts?: { recheck?: PushRecheck; failReason?: string }
+  ): Promise<string[]> => {
+    const recheck: PushRecheck = opts?.recheck || 'all';
+    const failReasonKey = String(opts?.failReason || '').trim();
+    if (recheck === 'failed') {
+      const list =
+        channel === 'cpa'
+          ? [...lastPushCpaFailedRef.current]
+          : [...lastPushS2aFailedRef.current];
+      if (list.length === 0) {
+        push({
+          tone: 'warn',
+          title: channel === 'cpa' ? '没有上次 CPA 推送失败目标' : '没有上次 S2A 推送失败目标',
+          description: '请先跑一轮推送'
+        });
+        return [];
+      }
+      return list;
+    }
+    if (recheck === 'fail_reason') {
+      const map =
+        channel === 'cpa'
+          ? lastPushCpaByReasonRef.current
+          : lastPushS2aByReasonRef.current;
+      const list = [...(map[failReasonKey] || [])];
+      if (!failReasonKey || list.length === 0) {
+        push({
+          tone: 'warn',
+          title: '没有该原因的推送失败目标',
+          description: failReasonKey
+            ? '原因 ' + failReasonKey + ' 无会话记忆'
+            : '未指定 failReason'
+        });
+        return [];
+      }
+      return list;
+    }
+    if (recheck === 'unpushed' || recheck === 'push_fail') {
+      const pushKey =
+        channel === 'cpa'
+          ? recheck === 'unpushed'
+            ? 'cpa_none'
+            : 'cpa_fail'
+          : recheck === 'unpushed'
+            ? 's2a_none'
+            : 's2a_fail';
+      const r = await resolveTargetNames({
+        limit: 500,
+        ignoreSelected: true,
+        query: authFilterQuery({ push: pushKey })
+      });
       if (r.truncated) {
         push({
           tone: 'warn',
-          title: `匹配 ${r.total} 条，本次推送 ${r.names.length}`,
+          title: '匹配 ' + r.total + ' 条，本次 ' + r.names.length,
           description: '推送单次上限 500'
         });
       }
+      return r.names;
+    }
+    const r = await resolveTargetNames({ limit: 500 });
+    if (r.truncated) {
+      push({
+        tone: 'warn',
+        title: '匹配 ' + r.total + ' 条，本次推送 ' + r.names.length,
+        description: '推送单次上限 500'
+      });
+    }
+    return r.names;
+  };
+
+  const runAuthPushBatch = async (
+    channel: 'cpa' | 's2a',
+    opts?: { force?: boolean; recheck?: PushRecheck; failReason?: string }
+  ) => {
+    const force = Boolean(opts?.force);
+    const recheck: PushRecheck = opts?.recheck || 'all';
+    const failReasonKey = String(opts?.failReason || '').trim();
+    const batchKind = channel === 'cpa' ? ('push' as const) : ('pushS2a' as const);
+    const labelBase = channel === 'cpa' ? 'CPA' : 'S2A';
+    const recheckHint =
+      recheck === 'failed'
+        ? '仅失败'
+        : recheck === 'fail_reason'
+          ? '仅原因:' + (failReasonKey || '?')
+          : recheck === 'unpushed'
+            ? '仅未推'
+            : recheck === 'push_fail'
+              ? '仅推送失败'
+              : '';
+    const label =
+      (force ? '强制重推 ' : '推送 ') + labelBase + (recheckHint ? '·' + recheckHint : '');
+
+    let filenames: string[] = [];
+    try {
+      filenames = await resolvePushFilenames(channel, {
+        recheck,
+        failReason: failReasonKey
+      });
     } catch (err) {
       push({
         tone: 'danger',
@@ -1948,10 +2044,10 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       return;
     }
     if (filenames.length === 0) {
-      push({ tone: 'warn', title: '没有可推送的文件' });
+      if (recheck === 'all') push({ tone: 'warn', title: '没有可推送的文件' });
       return;
     }
-    if (!remoteReady) {
+    if (channel === 'cpa' && !remoteReady) {
       push({
         tone: 'warn',
         title: '未配置远程 CPA',
@@ -1959,233 +2055,262 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       });
       return;
     }
-    if (force) {
-      const ok = window.confirm(
-        `【强制重推 CPA】将忽略「已推送」标记，重新上传 ${filenames.length} 条。\n\n` +
-          `成功/失败都会更新推送状态。\n\n继续？`
-      );
-      if (!ok) return;
-    }
-    const signal = beginBatch('push');
-    setProg({
-      kind: 'push',
-      total: filenames.length,
-      done: 0,
-      ok: 0,
-      failed: 0,
-      remoteOk: 0,
-      remoteFailed: 0,
-      running: true
-    });
-    try {
-      const CHUNK = 12;
-      let ok = 0;
-      let failed = 0;
-      let skipped = 0;
-      let remoteUrl = '';
-      let cancelled = false;
-      const modeCounts: Record<string, number> = {};
-      for (let i = 0; i < filenames.length; i += CHUNK) {
-        throwIfAborted(signal);
-        const chunk = filenames.slice(i, i + CHUNK);
-        setProg((p) => (p ? { ...p, current: chunk[0], running: true } : p));
-        try {
-          const r = await window.api.pushCpaAuthRemote({
-            filenames: chunk,
-            concurrency: Math.min(4, chunk.length),
-            force
-          });
-          ok += r.ok || 0;
-          failed += r.failed || 0;
-          skipped += Number(r.skipped || 0);
-          mergeModeCounts(modeCounts, r.modeCounts);
-          if (r.remoteUrl) remoteUrl = r.remoteUrl;
-        } catch (err) {
-          if (isAbortError(err) || signal.aborted) {
-            cancelled = true;
-            break;
-          }
-          throw err;
-        }
-        if (signal.aborted) {
-          cancelled = true;
-          break;
-        }
-        setProg({
-          kind: 'push',
-          total: filenames.length,
-          done: Math.min(i + chunk.length, filenames.length),
-          ok,
-          failed,
-          remoteOk: ok,
-          remoteFailed: failed,
-          running: i + chunk.length < filenames.length,
-          current: chunk[chunk.length - 1]
-        });
-      }
-      const modes = formatModeCounts(modeCounts);
-      const modesHint = modes ? ` · ${modes}` : '';
-      if (cancelled || signal.aborted) {
-        push({
-          tone: 'warn',
-          title: force ? '强制重推 CPA 已取消' : '推送 CPA 已取消',
-          description: `已处理 ${ok + failed}/${filenames.length} · 成功 ${ok} · 跳过 ${skipped} · 失败 ${failed}${modesHint}`
-        });
-      } else {
-        push({
-          tone: failed > 0 ? 'warn' : 'ok',
-          title: force ? '强制重推 CPA 完成' : '推送 CPA 完成',
-          description: `成功 ${ok} · 跳过 ${skipped} · 失败 ${failed}${modesHint}${remoteUrl ? ` · ${remoteUrl}` : ''}`
-        });
-      }
-      await reload();
-    } catch (err) {
-      if (isAbortError(err) || signal.aborted) {
-        push({ tone: 'warn', title: force ? '强制重推 CPA 已取消' : '推送 CPA 已取消' });
-      } else {
-        push({
-          tone: 'danger',
-          title: force ? '强制重推 CPA 失败' : '推送 CPA 失败',
-          description: err instanceof Error ? err.message : String(err)
-        });
-      }
-    } finally {
-      endBatch('push');
-      window.setTimeout(() => setProg(null), 3000);
-    }
-  };
-
-  const pushSub2apiBatch = async (opts?: { force?: boolean }) => {
-    const force = Boolean(opts?.force);
-    let filenames: string[] = [];
-    try {
-      const r = await resolveTargetNames({ limit: 500 });
-      filenames = r.names;
-      if (r.truncated) {
-        push({
-          tone: 'warn',
-          title: `匹配 ${r.total} 条，本次推送 ${r.names.length}`,
-          description: 'S2A 推送单次上限 500'
-        });
-      }
-    } catch (err) {
-      push({
-        tone: 'danger',
-        title: '加载筛选失败',
-        description: err instanceof Error ? err.message : String(err)
-      });
-      return;
-    }
-    if (filenames.length === 0) {
-      push({ tone: 'warn', title: '没有可推送的文件' });
-      return;
-    }
-    if (!sub2RemoteReady) {
+    if (channel === 's2a' && !sub2RemoteReady) {
       push({
         tone: 'warn',
-        title: '未配置 S2A 推送',
-        description: '请在设置「推送设置」开启 Auth→sub2api 并填写地址与 Admin Token'
+        title: '未配置 sub2api',
+        description: '请在设置开启 Auth→sub2api 并填写地址与 Token'
       });
       return;
     }
     if (force) {
       const ok = window.confirm(
-        `【强制重推 S2A】将忽略「已推送」标记，重新上传 ${filenames.length} 条。\n\n` +
-          `成功/失败都会更新推送状态。\n\n继续？`
+        '【强制重推 ' +
+          labelBase +
+          '】将忽略「已推送」标记，重新上传 ' +
+          filenames.length +
+          ' 条。\n\n成功/失败都会更新推送状态。\n\n继续？'
       );
       if (!ok) return;
     }
-    const signal = beginBatch('pushS2a');
+
+    const signal = beginBatch(batchKind);
     setProg({
-      kind: 'pushS2a',
+      kind: batchKind,
       total: filenames.length,
       done: 0,
       ok: 0,
       failed: 0,
       remoteOk: 0,
       remoteFailed: 0,
-      running: true
+      running: true,
+      modeSummary: recheckHint || undefined
     });
+
+    let ok = 0;
+    let failed = 0;
+    let skipped = 0;
+    let cancelled = false;
+    let remoteUrl = '';
+    const modeCounts: Record<string, number> = {};
+    const reasonCounts: Record<string, number> = {};
+    const failedNames: string[] = [];
+    const failedByReason: Record<string, string[]> = {};
+    const allResults: {
+      ok?: boolean;
+      skipped?: boolean;
+      filename?: string;
+      mode?: string;
+      failReason?: string;
+    }[] = [];
+
+    const applyItem = (x: {
+      ok?: boolean;
+      skipped?: boolean;
+      filename?: string;
+      mode?: string;
+      failReason?: string;
+      error?: string;
+    }) => {
+      allResults.push(x);
+      if (x.skipped) {
+        skipped += 1;
+        if (x.ok) ok += 1;
+      } else if (x.ok) {
+        ok += 1;
+      } else {
+        failed += 1;
+        const fr = x.failReason || x.mode || 'unknown';
+        reasonCounts[fr] = (reasonCounts[fr] || 0) + 1;
+        if (x.filename) {
+          failedNames.push(x.filename);
+          if (!failedByReason[fr]) failedByReason[fr] = [];
+          failedByReason[fr].push(x.filename);
+        }
+      }
+      const m = x.mode || (x.ok ? (x.skipped ? 'already_pushed' : 'uploaded') : 'error');
+      modeCounts[m] = (modeCounts[m] || 0) + 1;
+      const reasonSummary = Object.entries(reasonCounts)
+        .map(([k, v]) => k + ':' + v)
+        .join(' ');
+      setProg({
+        kind: batchKind,
+        total: filenames.length,
+        done: allResults.length,
+        ok,
+        failed,
+        remoteOk: ok,
+        remoteFailed: failed,
+        running: allResults.length < filenames.length && !signal.aborted,
+        current: x.filename || x.mode,
+        modeSummary: Object.entries(modeCounts)
+          .map(([k, v]) => k + ':' + v)
+          .join(' '),
+        failReasonSummary: reasonSummary || undefined,
+        failReasons: { ...reasonCounts }
+      });
+    };
+
     try {
-      const CHUNK = 12;
-      let ok = 0;
-      let failed = 0;
-      let skipped = 0;
-      let remoteUrl = '';
-      let cancelled = false;
-      const modeCounts: Record<string, number> = {};
-      for (let i = 0; i < filenames.length; i += CHUNK) {
-        throwIfAborted(signal);
-        const chunk = filenames.slice(i, i + CHUNK);
-        setProg((p) => (p ? { ...p, current: chunk[0], running: true } : p));
+      const streamFn =
+        channel === 'cpa'
+          ? window.api.pushCpaAuthRemoteStream
+          : window.api.pushSub2apiAuthRemoteStream;
+      const batchFn =
+        channel === 'cpa' ? window.api.pushCpaAuthRemote : window.api.pushSub2apiAuthRemote;
+      const concurrency = Math.min(4, filenames.length);
+
+      if (typeof streamFn === 'function') {
         try {
-          const r = await window.api.pushSub2apiAuthRemote({
+          const r = await streamFn(
+            { filenames, concurrency, force },
+            (item) => {
+              if (signal.aborted) return;
+              applyItem(item);
+            }
+          );
+          if (r.remoteUrl) remoteUrl = r.remoteUrl;
+          if (r.cancelled || signal.aborted) cancelled = true;
+          // 若 stream 只在 done 汇总且 item 未逐条回调完整，以结果为准
+          if (allResults.length === 0 && Array.isArray(r.results)) {
+            for (const x of r.results) applyItem(x);
+          }
+        } catch (err) {
+          if (isAbortError(err) || signal.aborted) {
+            cancelled = true;
+          } else {
+            console.warn('[' + batchKind + '] stream failed, fallback chunk', err);
+            const CHUNK = 12;
+            for (let i = 0; i < filenames.length; i += CHUNK) {
+              throwIfAborted(signal);
+              const chunk = filenames.slice(i, i + CHUNK);
+              const r = await batchFn({
+                filenames: chunk,
+                concurrency: Math.min(4, chunk.length),
+                force
+              });
+              if (r.remoteUrl) remoteUrl = r.remoteUrl;
+              for (const x of r.results || []) applyItem(x);
+              if (signal.aborted) {
+                cancelled = true;
+                break;
+              }
+            }
+          }
+        }
+      } else {
+        const CHUNK = 12;
+        for (let i = 0; i < filenames.length; i += CHUNK) {
+          throwIfAborted(signal);
+          const chunk = filenames.slice(i, i + CHUNK);
+          const r = await batchFn({
             filenames: chunk,
             concurrency: Math.min(4, chunk.length),
             force
           });
-          ok += r.ok || 0;
-          failed += r.failed || 0;
-          skipped += Number(r.skipped || 0);
-          mergeModeCounts(modeCounts, r.modeCounts);
           if (r.remoteUrl) remoteUrl = r.remoteUrl;
-        } catch (err) {
-          if (isAbortError(err) || signal.aborted) {
+          for (const x of r.results || []) applyItem(x);
+          if (signal.aborted) {
             cancelled = true;
             break;
           }
-          throw err;
         }
-        if (signal.aborted) {
-          cancelled = true;
-          break;
-        }
-        setProg({
-          kind: 'pushS2a',
-          total: filenames.length,
-          done: Math.min(i + chunk.length, filenames.length),
-          ok,
-          failed,
-          remoteOk: ok,
-          remoteFailed: failed,
-          running: i + chunk.length < filenames.length,
-          current: chunk[chunk.length - 1]
-        });
       }
+
+      if (channel === 'cpa') {
+        lastPushCpaFailedRef.current = failedNames;
+        lastPushCpaByReasonRef.current = failedByReason;
+      } else {
+        lastPushS2aFailedRef.current = failedNames;
+        lastPushS2aByReasonRef.current = failedByReason;
+      }
+
       const modes = formatModeCounts(modeCounts);
-      const modesHint = modes ? ` · ${modes}` : '';
+      const modesHint = modes ? ' · ' + modes : '';
+      const reasonHint =
+        Object.keys(reasonCounts).length > 0
+          ? ' · 原因 ' +
+            Object.entries(reasonCounts)
+              .map(([k, v]) => k + ':' + v)
+              .join(' ')
+          : '';
       if (cancelled || signal.aborted) {
         push({
           tone: 'warn',
-          title: force ? '强制重推 S2A 已取消' : '推送 S2A 已取消',
-          description: `已处理 ${ok + failed}/${filenames.length} · 成功 ${ok} · 跳过 ${skipped} · 失败 ${failed}${modesHint}`
+          title: label + '已取消',
+          description:
+            '已处理 ' +
+            allResults.length +
+            '/' +
+            filenames.length +
+            ' · 成功 ' +
+            ok +
+            ' · 跳过 ' +
+            skipped +
+            ' · 失败 ' +
+            failed +
+            modesHint +
+            reasonHint
         });
       } else {
         push({
           tone: failed > 0 ? 'warn' : 'ok',
-          title: force ? '强制重推 S2A 完成' : '推送 S2A 完成',
-          description: `成功 ${ok} · 跳过 ${skipped} · 失败 ${failed}${modesHint}${remoteUrl ? ` · ${remoteUrl}` : ''}（已转 grok 格式）`
+          title: label + '完成',
+          description:
+            '成功 ' +
+            ok +
+            ' · 跳过 ' +
+            skipped +
+            ' · 失败 ' +
+            failed +
+            modesHint +
+            reasonHint +
+            (remoteUrl ? ' · ' + remoteUrl : '') +
+            (failedNames.length ? ' · 可点原因复检' : '')
         });
       }
       await reload();
     } catch (err) {
       if (isAbortError(err) || signal.aborted) {
-        push({ tone: 'warn', title: force ? '强制重推 S2A 已取消' : '推送 S2A 已取消' });
+        push({ tone: 'warn', title: label + '已取消' });
       } else {
         push({
           tone: 'danger',
-          title: force ? '强制重推 S2A 失败' : '推送 S2A 失败',
+          title: label + '失败',
           description: err instanceof Error ? err.message : String(err)
         });
       }
     } finally {
-      endBatch('pushS2a');
-      window.setTimeout(() => setProg(null), 3000);
+      endBatch(batchKind);
+      setProg((p) =>
+        p && (p.kind === 'push' || p.kind === 'pushS2a')
+          ? { ...p, running: false }
+          : p
+      );
+      // P6：有失败原因时保留进度条便于点 chip，否则 8s 后清
+      const keepMs =
+        Object.keys(reasonCounts).length > 0 || failedNames.length > 0 ? 120000 : 8000;
+      window.setTimeout(() => {
+        setProg((p) =>
+          p && !p.running && (p.kind === 'push' || p.kind === 'pushS2a') ? null : p
+        );
+      }, keepMs);
     }
   };
 
-  /** 长按「推送 CPA / S2A」约 650ms → force 重推 */
-  const pushHoldRef = useRef<{
+  const pushRemoteBatch = async (opts?: {
+    force?: boolean;
+    recheck?: PushRecheck;
+    failReason?: string;
+  }) => runAuthPushBatch('cpa', opts);
+
+  const pushSub2apiBatch = async (opts?: {
+    force?: boolean;
+    recheck?: PushRecheck;
+    failReason?: string;
+  }) => runAuthPushBatch('s2a', opts);
+
+    const pushHoldRef = useRef<{
     timer: ReturnType<typeof setTimeout> | null;
     fired: boolean;
     kind: 'push' | 'pushS2a' | null;
@@ -3162,7 +3287,22 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                     title={'仅复检失败原因 ' + reason + '（' + n + '）'}
                     onClick={() => {
                       if (busy) return;
-                      void resignBatch('cli', { recheck: 'fail_reason', failReason: reason });
+                      if (prog.kind === 'push') {
+                        void pushRemoteBatch({
+                          recheck: 'fail_reason',
+                          failReason: reason
+                        });
+                      } else if (prog.kind === 'pushS2a') {
+                        void pushSub2apiBatch({
+                          recheck: 'fail_reason',
+                          failReason: reason
+                        });
+                      } else {
+                        void resignBatch('cli', {
+                          recheck: 'fail_reason',
+                          failReason: reason
+                        });
+                      }
                     }}
                   >
                     {reason}:{n}
@@ -3642,7 +3782,80 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 )}
                 {batchBusy === 'export' ? '取消' : '导出'}
               </Button>
+              
               <Button
+                size="sm"
+                variant="secondary"
+                disabled={(Boolean(busy) && batchBusy !== 'push') || !remoteReady}
+                onClick={() => {
+                  if (batchBusy === 'push') cancelBatch('push');
+                  else void pushRemoteBatch({ recheck: 'unpushed' });
+                }}
+                title="仅推送 CPA 状态为未推的 Auth"
+              >
+                CPA未推
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={(Boolean(busy) && batchBusy !== 'push') || !remoteReady}
+                onClick={() => {
+                  if (batchBusy === 'push') cancelBatch('push');
+                  else void pushRemoteBatch({ recheck: 'push_fail' });
+                }}
+                title="仅推送 CPA 状态为失败的 Auth"
+              >
+                CPA失败
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={(Boolean(busy) && batchBusy !== 'push') || !remoteReady}
+                onClick={() => {
+                  if (batchBusy === 'push') cancelBatch('push');
+                  else void pushRemoteBatch({ recheck: 'failed' });
+                }}
+                title="仅复检上次 CPA 推送失败（会话记忆）"
+              >
+                CPA仅失败
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={(Boolean(busy) && batchBusy !== 'pushS2a') || !sub2RemoteReady}
+                onClick={() => {
+                  if (batchBusy === 'pushS2a') cancelBatch('pushS2a');
+                  else void pushSub2apiBatch({ recheck: 'unpushed' });
+                }}
+                title="仅推送 S2A 未推"
+              >
+                S2A未推
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={(Boolean(busy) && batchBusy !== 'pushS2a') || !sub2RemoteReady}
+                onClick={() => {
+                  if (batchBusy === 'pushS2a') cancelBatch('pushS2a');
+                  else void pushSub2apiBatch({ recheck: 'push_fail' });
+                }}
+                title="仅推送 S2A 失败状态"
+              >
+                S2A失败
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={(Boolean(busy) && batchBusy !== 'pushS2a') || !sub2RemoteReady}
+                onClick={() => {
+                  if (batchBusy === 'pushS2a') cancelBatch('pushS2a');
+                  else void pushSub2apiBatch({ recheck: 'failed' });
+                }}
+                title="仅复检上次 S2A 推送失败"
+              >
+                S2A仅失败
+              </Button>
+<Button
                 size="sm"
                 className="min-w-[5rem] justify-center tabular-nums"
                 disabled={

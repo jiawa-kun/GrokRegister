@@ -511,6 +511,59 @@ export function classifyAuthFailReason(input: {
   return 'unknown';
 }
 
+export function classifyPushFailReason(input: {
+  ok?: boolean;
+  skipped?: boolean;
+  error?: string;
+  mode?: string;
+  remoteError?: string;
+}): string | undefined {
+  if (input.ok && !input.skipped) return undefined;
+  const err = String(input.error || input.remoteError || '').toLowerCase();
+  const mode = String(input.mode || '').toLowerCase();
+  if (input.skipped || mode === 'already_pushed') return 'already_pushed';
+  if (mode === 'missing_file') return 'missing_file';
+  if (mode === 'invalid_json') return 'invalid_json';
+  if (mode === 'convert_error') return 'convert_error';
+  if (mode === 'http_error') return 'http_error';
+  if (mode === 'biz_error') return 'biz_error';
+  if (mode === 'auth_error') return 'auth_error';
+  if (
+    err.includes('timeout') ||
+    err.includes('etimedout') ||
+    err.includes('timed out') ||
+    err.includes('aborted')
+  ) {
+    return 'timeout';
+  }
+  if (
+    err.includes('econn') ||
+    err.includes('network') ||
+    err.includes('socket') ||
+    err.includes('proxy') ||
+    err.includes('enotfound') ||
+    err.includes('econnreset')
+  ) {
+    return 'network';
+  }
+  if (
+    err.includes('401') ||
+    err.includes('403') ||
+    err.includes('unauthorized') ||
+    err.includes('forbidden') ||
+    err.includes('invalid token') ||
+    err.includes('admin')
+  ) {
+    return 'auth_error';
+  }
+  if (err.includes('429') || err.includes('rate limit') || err.includes('too many')) {
+    return 'rate_limit';
+  }
+  if (err.includes('http ')) return 'http_error';
+  if (mode === 'error' || err) return mode && mode !== 'error' ? mode : 'push_error';
+  return 'unknown';
+}
+
 export function summarizeFailReasons(
   items: Array<{ failReason?: string; ok?: boolean }>
 ): Record<string, number> {
