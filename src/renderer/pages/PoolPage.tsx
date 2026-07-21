@@ -139,6 +139,7 @@ type MintProgress = {
   banned: number;
   current?: string;
   running: boolean;
+  failReasonSummary?: string;
 };
 
 /** SSO 批量验活进度 */
@@ -1463,17 +1464,23 @@ export function PoolPage() {
     let cancelled = false;
     const allResults: CpaAuthBatchResultItem[] = [];
     const failedTargets: { sso: string; email?: string }[] = [];
+    const reasonCounts: Record<string, number> = {};
     const ssoByEmail = new Map(
       targets.map((t) => [String(t.email || '').toLowerCase(), t.sso] as const)
     );
-        const applyItem = (x: CpaAuthBatchResultItem) => {
+
+    const applyItem = (x: CpaAuthBatchResultItem) => {
       allResults.push(x);
       if (x.skipped) {
         skipped += 1;
+        const fr = x.failReason || x.verdict || 'skipped';
+        reasonCounts[fr] = (reasonCounts[fr] || 0) + 1;
       } else if (x.ok) {
         ok += 1;
       } else {
         failed += 1;
+        const fr = x.failReason || 'unknown';
+        reasonCounts[fr] = (reasonCounts[fr] || 0) + 1;
         const em = String(x.email || '').toLowerCase();
         const sso =
           (em && ssoByEmail.get(em)) ||
@@ -1485,6 +1492,9 @@ export function PoolPage() {
       if (x.probeAction === 'dead' || x.probeDeleted) probeDead += 1;
       if (x.probeAction === 'ok') probeOk += 1;
       if (x.ok && x.xai === false) noXai += 1;
+      const reasonSummary = Object.entries(reasonCounts)
+        .map(([k, v]) => k + ':' + v)
+        .join(' ');
       setMintProg({
         total: targets.length,
         done: allResults.length,
@@ -1493,12 +1503,13 @@ export function PoolPage() {
         skipped,
         banned,
         current: x.email || x.filename || '',
-        running: allResults.length < targets.length && !ac.signal.aborted
+        running: allResults.length < targets.length && !ac.signal.aborted,
+        failReasonSummary: reasonSummary || undefined
       });
     };
 
     try {
-      const streamFn = window.api.mintCpaAuthFromSsoStream;
+    const streamFn = window.api.mintCpaAuthFromSsoStream;
       const items = targets.map((a) => ({ sso: a.sso, email: a.email }));
       if (typeof streamFn === 'function') {
         try {
@@ -1575,6 +1586,12 @@ export function PoolPage() {
             (remoteErrSample ? '（' + remoteErrSample.slice(0, 80) + '）' : '')
           : '',
         failedTargets.length ? '可点「仅失败」复检' : '',
+        Object.keys(reasonCounts).length
+          ? '原因 ' +
+            Object.entries(reasonCounts)
+              .map(([k, v]) => k + ':' + v)
+              .join(' ')
+          : '',
         cancelled ? '已取消' : ''
       ].filter(Boolean);
       push({
@@ -1844,6 +1861,7 @@ export function PoolPage() {
                 {` · 成功 ${mintProg.ok} · 失败 ${mintProg.failed}`}
                 {mintProg.skipped ? ` · 跳过 ${mintProg.skipped}` : ''}
                 {mintProg.banned ? ` · 封禁 ${mintProg.banned}` : ''}
+                {mintProg.failReasonSummary ? ` · 原因 ${mintProg.failReasonSummary}` : ''}
               </p>
             </div>
             <div className="flex items-center gap-2">

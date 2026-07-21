@@ -946,6 +946,8 @@ app.post('/api/cpa-auth/resign-stream', asyncHandler(async (req: Request, res: R
       failed: result.failed,
       remoteOk: result.remoteOk,
       remoteFailed: result.remoteFailed,
+      ssoFromPool: result.ssoFromPool,
+      failReasons: result.failReasons,
       cancelled: result.cancelled
     });
     res.end();
@@ -1065,6 +1067,7 @@ app.post('/api/cpa-auth/mint-stream', asyncHandler(async (req: Request, res: Res
       botFlagSkipped: result.botFlagSkipped,
       remoteOk: result.remoteOk,
       remoteFailed: result.remoteFailed,
+      failReasons: result.failReasons,
       cancelled: result.cancelled
     });
     res.end();

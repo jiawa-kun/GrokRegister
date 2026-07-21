@@ -111,6 +111,10 @@ type TaskProgress = {
   stageMsg?: string;
   /** 批量 mode 统计摘要 */
   modeSummary?: string;
+  /** 从号池补 SSO 次数 */
+  ssoFromPool?: number;
+  /** 失败原因摘要 */
+  failReasonSummary?: string;
 };
 
 const PAGE_SIZE_KEY = 'gra-auth-page-size';
@@ -1559,15 +1563,19 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       let noXai = 0;
       let remoteOkN = 0;
       let remoteFailedN = 0;
+      let ssoFromPoolN = 0;
       let cancelled = false;
       const failedNames: string[] = [];
       const modeCounts: Record<string, number> = {};
+      const reasonCounts: Record<string, number> = {};
       const allResults: {
         mode?: string;
         ok?: boolean;
         filename?: string;
         xai?: boolean;
         remoteOk?: boolean | null;
+        ssoFromPool?: boolean;
+        failReason?: string;
       }[] = [];
 
       const applyItem = (x: {
@@ -1577,18 +1585,26 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
         xai?: boolean;
         remoteOk?: boolean | null;
         error?: string;
+        ssoFromPool?: boolean;
+        failReason?: string;
       }) => {
         allResults.push(x);
         if (x.ok) ok += 1;
         else {
           failed += 1;
           if (x.filename) failedNames.push(x.filename);
+          const fr = x.failReason || 'unknown';
+          reasonCounts[fr] = (reasonCounts[fr] || 0) + 1;
         }
         if (x.ok && x.xai === false) noXai += 1;
         if (x.remoteOk === true) remoteOkN += 1;
         if (x.remoteOk === false) remoteFailedN += 1;
+        if (x.ssoFromPool) ssoFromPoolN += 1;
         const m = x.mode || (x.ok ? 'ok' : 'error');
         modeCounts[m] = (modeCounts[m] || 0) + 1;
+        const reasonSummary = Object.entries(reasonCounts)
+          .map(([k, v]) => k + ':' + v)
+          .join(' ');
         setProg({
           kind: 'resign',
           total: filenames.length,
@@ -1597,11 +1613,13 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
           failed,
           remoteOk: remoteOkN,
           remoteFailed: remoteFailedN,
+          ssoFromPool: ssoFromPoolN,
           running: allResults.length < filenames.length && !signal.aborted,
           current: x.filename || x.mode,
           modeSummary: Object.entries(modeCounts)
             .map(([k, v]) => k + ':' + v)
-            .join(' ')
+            .join(' '),
+          failReasonSummary: reasonSummary || undefined
         });
       };
 
@@ -1706,8 +1724,15 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
             ' · 失败 ' +
             failed +
             (noXai ? ' · 无 xai ' + noXai : '') +
+            (ssoFromPoolN ? ' · 号池补SSO ' + ssoFromPoolN : '') +
             remotePart +
             (modePart ? ' · ' + modePart : '') +
+            (Object.keys(reasonCounts).length
+              ? ' · 失败原因 ' +
+                Object.entries(reasonCounts)
+                  .map(([k, v]) => k + ':' + v)
+                  .join(' ')
+              : '') +
             (failedNames.length ? ' · 可点「仅失败」复检' : '')
         });
       }
@@ -3019,6 +3044,8 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                   ? ` · ${prog.stageMsg}`
                   : ''}
                 {prog.modeSummary ? ` · ${prog.modeSummary}` : ''}
+                {prog.ssoFromPool ? ` · 号池补SSO ${prog.ssoFromPool}` : ''}
+                {prog.failReasonSummary ? ` · 原因 ${prog.failReasonSummary}` : ''}
                 {` · 成功 ${prog.ok} · 失败 ${prog.failed}`}
                 {prog.dead != null ? ` · 死号 ${prog.dead}` : ''}
                 {prog.deleted != null ? ` · 已删 ${prog.deleted}` : ''}

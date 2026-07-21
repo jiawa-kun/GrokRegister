@@ -397,6 +397,11 @@ const webApi: RendererApi = {
             failed: Number(msg.failed) || 0,
             remoteOk: Number(msg.remoteOk) || 0,
             remoteFailed: Number(msg.remoteFailed) || 0,
+            ssoFromPool: Number(msg.ssoFromPool) || 0,
+            failReasons:
+              msg.failReasons && typeof msg.failReasons === 'object'
+                ? (msg.failReasons as Record<string, number>)
+                : undefined,
             results
           };
         } else if (msg.type === 'error') {
@@ -479,6 +484,10 @@ const webApi: RendererApi = {
             banned: Number(msg.banned) || 0,
             remoteOk: Number(msg.remoteOk) || 0,
             remoteFailed: Number(msg.remoteFailed) || 0,
+            failReasons:
+              msg.failReasons && typeof msg.failReasons === 'object'
+                ? (msg.failReasons as Record<string, number>)
+                : undefined,
             results
           };
         } else if (msg.type === 'error') {

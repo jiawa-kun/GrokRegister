@@ -15,6 +15,11 @@ import { proxiedRequest, requestWithProxyFallback, errorMessage } from './httpCl
 import { broadcastAppEvent } from './appEvents.js';
 import type { ReloginStage } from '@shared/runEvents.js';
 import {
+  getPythonJobPool,
+  classifyAuthFailReason,
+  summarizeFailReasons
+} from './pythonJobPool.js';
+import {
   loadAccountTagsAsync,
   lookupNsfwTag,
   zdrStatusFromTag,
@@ -190,6 +195,10 @@ export interface CpaAuthBatchResultItem {
   remoteOk?: boolean | null;
   remoteError?: string;
   remoteName?: string;
+  /** 重签时从号池按 email 补了 SSO */
+  ssoFromPool?: boolean;
+  /** 失败原因：timeout|rate_limit|no_sso|no_refresh|refresh_dead|sso_dead|banned|bot_flag|network|probe_dead|python_error|unknown */
+  failReason?: string;
 }
 
 function parseRemoteField(raw: unknown): {
@@ -1285,13 +1294,30 @@ print(json.dumps(r, ensure_ascii=False))
 `.trim();
 
   const proxy = resolveHttpProxy(settings, 'cpaAuth');
-  const r = await runPythonJson(runtime.pythonPath, runtime.registerDir, code, [
-    resolved,
-    proxy,
-    resolvedSso,
-    pushRemote ? '1' : '0',
-    baseUrlTarget
-  ]);
+  let r: Record<string, unknown>;
+  try {
+    const pool = getPythonJobPool(runtime.pythonPath, runtime.registerDir, 3);
+    r = await pool.run({
+      op: 'resign',
+      path: resolved,
+      sso: resolvedSso,
+      proxy,
+      pushRemote,
+      baseUrlTarget
+    });
+  } catch (poolErr) {
+    console.warn(
+      '[cpa-auth] resign pool failed, fallback spawn:',
+      poolErr instanceof Error ? poolErr.message : poolErr
+    );
+    r = await runPythonJson(runtime.pythonPath, runtime.registerDir, code, [
+      resolved,
+      proxy,
+      resolvedSso,
+      pushRemote ? '1' : '0',
+      baseUrlTarget
+    ]);
+  }
 
   const outPath = String(r.path || resolved);
   const flags = await readXaiAfter(outPath);
@@ -1334,6 +1360,8 @@ export async function resignCpaAuthBatch(input: {
   failed: number;
   remoteOk?: number;
   remoteFailed?: number;
+  ssoFromPool?: number;
+  failReasons?: Record<string, number>;
   cancelled?: boolean;
   results: CpaAuthBatchResultItem[];
 }> {
@@ -1365,6 +1393,9 @@ export async function resignCpaAuthBatch(input: {
   const gapMs = concurrency >= 3 ? 180 : concurrency === 2 ? 80 : 0;
 
   const emitItem = async (item: CpaAuthBatchResultItem) => {
+    if (!item.ok && !item.failReason) {
+      item.failReason = classifyAuthFailReason(item);
+    }
     results.push(item);
     if (input.onItem) {
       try {
@@ -1390,20 +1421,25 @@ export async function resignCpaAuthBatch(input: {
           r.probe && typeof r.probe === 'object'
             ? (r.probe as Record<string, unknown>)
             : null;
+        const itemOk = r.ok !== false && !r.error;
+        const probeHttp = probeObj
+          ? Number(probeObj.http_status || 0) || undefined
+          : undefined;
+        const probeAction = probeObj ? String(probeObj.action || '') : undefined;
+        const errStr = r.error ? String(r.error) : undefined;
+        const modeStr = r.mode ? String(r.mode) : undefined;
         await emitItem({
           filename: String(r.filename || job.filename || ''),
           email: String(r.email || ''),
-          ok: r.ok !== false && !r.error,
-          error: r.error ? String(r.error) : undefined,
-          mode: r.mode ? String(r.mode) : undefined,
+          ok: itemOk,
+          error: errStr,
+          mode: modeStr,
           path: r.path ? String(r.path) : undefined,
           xai: Boolean(r.xai),
           xaiFilename: Boolean(r.xaiFilename),
           xaiType: Boolean(r.xaiType),
-          probeAction: probeObj ? String(probeObj.action || '') : undefined,
-          probeHttp: probeObj
-            ? Number(probeObj.http_status || 0) || undefined
-            : undefined,
+          probeAction,
+          probeHttp,
           probeDeleted: Boolean(r.deleted) || Boolean(probeObj?.deleted),
           remoteOk:
             typeof r.remoteOk === 'boolean'
@@ -1412,13 +1448,25 @@ export async function resignCpaAuthBatch(input: {
                 ? null
                 : undefined,
           remoteError: r.remoteError ? String(r.remoteError) : undefined,
-          remoteName: r.remoteName ? String(r.remoteName) : undefined
+          remoteName: r.remoteName ? String(r.remoteName) : undefined,
+          ssoFromPool: r.ssoFromPool === true,
+          failReason: itemOk
+            ? undefined
+            : classifyAuthFailReason({
+                ok: itemOk,
+                error: errStr,
+                mode: modeStr,
+                probeHttp,
+                probeAction
+              })
         });
       } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
         await emitItem({
           filename: job.filename || basename(job.path || ''),
           ok: false,
-          error: err instanceof Error ? err.message : String(err)
+          error: errMsg,
+          failReason: classifyAuthFailReason({ ok: false, error: errMsg, mode: 'error' })
         });
       }
     }
@@ -1428,6 +1476,8 @@ export async function resignCpaAuthBatch(input: {
   const ok = results.filter((r) => r.ok).length;
   const remoteOk = results.filter((r) => r.remoteOk === true).length;
   const remoteFailed = results.filter((r) => r.remoteOk === false).length;
+  const ssoFromPool = results.filter((r) => r.ssoFromPool).length;
+  const failReasons = summarizeFailReasons(results);
   const modeCounts: Record<string, number> = {};
   for (const r of results) {
     const m = r.mode || (r.ok ? 'ok' : 'error');
@@ -1444,6 +1494,8 @@ export async function resignCpaAuthBatch(input: {
     failed: results.length - ok,
     remoteOk,
     remoteFailed,
+    ssoFromPool,
+    failReasons,
     cancelled,
     results
   };
@@ -2573,6 +2625,7 @@ export async function mintCpaAuthFromSso(input: {
   botFlagSkipped?: number;
   remoteOk?: number;
   remoteFailed?: number;
+  failReasons?: Record<string, number>;
   cancelled?: boolean;
   results: CpaAuthBatchResultItem[];
 }> {
@@ -2655,6 +2708,9 @@ print(json.dumps(r, ensure_ascii=False))
   let idx = 0;
 
   const emitItem = async (item: CpaAuthBatchResultItem) => {
+    if (!item.ok && !item.failReason) {
+      item.failReason = classifyAuthFailReason(item);
+    }
     results.push(item);
     if (input.onItem) {
       try {
@@ -2698,14 +2754,35 @@ print(json.dumps(r, ensure_ascii=False))
         continue;
       }
       try {
-        const r = await runPythonJson(runtime!.pythonPath, runtime!.registerDir, code, [
-          sso,
-          email,
-          resolveHttpProxy(settings, 'cpaAuth'),
-          dir,
-          doPrecheck ? '1' : '0',
-          deleteOnDead ? '1' : '0'
-        ]);
+        const proxyMint = resolveHttpProxy(settings, 'cpaAuth');
+        let r: Record<string, unknown>;
+        try {
+          const pool = getPythonJobPool(runtime!.pythonPath, runtime!.registerDir, concurrency);
+          r = await pool.run({
+            op: 'mint',
+            sso,
+            email,
+            proxy: proxyMint,
+            authDir: dir,
+            precheck: doPrecheck,
+            deleteOnDead,
+            mintMode
+          });
+        } catch (poolErr) {
+          console.warn(
+            '[cpa-auth] mint pool failed, fallback spawn:',
+            poolErr instanceof Error ? poolErr.message : poolErr
+          );
+          r = await runPythonJson(runtime!.pythonPath, runtime!.registerDir, code, [
+            sso,
+            email,
+            proxyMint,
+            dir,
+            doPrecheck ? '1' : '0',
+            deleteOnDead ? '1' : '0',
+            mintMode
+          ]);
+        }
         const skipped = Boolean(r.skipped) || String(r.mode || '').startsWith('skipped_');
         if (skipped) {
           await emitItem({
@@ -2789,6 +2866,10 @@ print(json.dumps(r, ensure_ascii=False))
   const remoteOkN = results.filter((r) => r.remoteOk === true).length;
   const remoteFailedN = results.filter((r) => r.remoteOk === false).length;
   const cancelled = Boolean(input.isAborted?.());
+  // 兜底分类
+  for (const it of results) {
+    if (!it.ok && !it.failReason) it.failReason = classifyAuthFailReason(it);
+  }
   return {
     total: results.length,
     ok,
@@ -2799,6 +2880,7 @@ print(json.dumps(r, ensure_ascii=False))
     botFlagSkipped,
     remoteOk: remoteOkN,
     remoteFailed: remoteFailedN,
+    failReasons: summarizeFailReasons(results),
     cancelled,
     results
   };

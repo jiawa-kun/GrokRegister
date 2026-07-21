@@ -240,6 +240,10 @@ export interface CpaAuthBatchResultItem {
   remoteOk?: boolean | null;
   remoteError?: string;
   remoteName?: string;
+  /** 重签时从号池按 email 补了 SSO */
+  ssoFromPool?: boolean;
+  /** 失败原因细分 */
+  failReason?: string;
 }
 
 export interface CpaAuthBatchResult {
@@ -265,6 +269,10 @@ export interface CpaAuthBatchResult {
   ssoDeleted?: number;
   /** 推送 mode 分布：uploaded / already_pushed / http_error / … */
   modeCounts?: Record<string, number>;
+  /** 从号池补 SSO 次数 */
+  ssoFromPool?: number;
+  /** 失败原因计数 */
+  failReasons?: Record<string, number>;
   results: CpaAuthBatchResultItem[];
 }
 
