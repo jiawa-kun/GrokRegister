@@ -74,8 +74,10 @@ export interface SsoCheckItem {
 /** SSO 验活结果 */
 export interface SsoCheckResult {
   id: string;
-  /** 是否存活（grok get-user 返回 200） */
-  alive: boolean;
+  /**
+   * 是否存活：true=200 存活；false=仅 401/403 失效；null=未知(网络/超时/429/其它)。
+   */
+  alive: boolean | null;
   /** HTTP 状态码，0 表示请求异常 */
   status: number;
   email?: string;
@@ -563,6 +565,11 @@ export interface RendererApi {
     paths?: string[];
     concurrency?: number;
     deleteOnDead?: boolean;
+    /**
+     * 是否在 401/403 时走密码重登深检（默认 false；快扫不重登）。
+     * true 时走 Python 恢复路径，并发会降到 1～2。
+     */
+    recoverOnAuthError?: boolean;
   }): Promise<CpaAuthBatchResult>;
   /**
    * 密码重登激活：浏览器登录 → mint → 随机英文消息 → 二次测活。

@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { AccountRecord } from '@shared/runEvents';
 import type { SsoCheckResult } from '@shared/ipc';
+import { ssoCheckVerdict } from '@shared/ssoCheckVerdict';
 
 const SSO_CHECK_STORAGE_KEY = 'gra-pool-sso-check-v1';
 
@@ -20,6 +21,7 @@ export type AccountListFacets = {
   unchecked: number;
   alive: number;
   dead: number;
+  unknown?: number;
   authConverted?: number;
   authUnconverted?: number;
 };
@@ -33,7 +35,7 @@ function loadSsoMapFromStorage(): Map<string, SsoCheckResult> {
     const map = new Map<string, SsoCheckResult>();
     for (const [id, r] of Object.entries(parsed)) {
       if (!id || !r || typeof r !== 'object') continue;
-      if (typeof r.alive !== 'boolean') continue;
+      if (!(r.alive === true || r.alive === false || r.alive === null)) continue;
       map.set(id, {
         id: String(r.id || id),
         alive: r.alive,
@@ -71,7 +73,7 @@ function persistSsoMap(map: Map<string, SsoCheckResult>) {
 /** 从账号记录上的 ssoCheck 字段构建结果（服务端落盘） */
 function resultFromAccount(a: AccountRecord): SsoCheckResult | null {
   const c = a.ssoCheck;
-  if (!c || typeof c.alive !== 'boolean') return null;
+  if (!c || !(c.alive === true || c.alive === false || c.alive === null)) return null;
   return {
     id: a.id,
     alive: c.alive,
@@ -124,7 +126,7 @@ function mergeSsoMaps(
 }
 
 function emptyFacets(): AccountListFacets {
-  return { all: 0, hasSso: 0, noSso: 0, unchecked: 0, alive: 0, dead: 0 };
+  return { all: 0, hasSso: 0, noSso: 0, unchecked: 0, alive: 0, dead: 0, unknown: 0 };
 }
 
 interface AccountsState {
@@ -187,12 +189,14 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       let unchecked = 0;
       let alive = 0;
       let dead = 0;
+      let unknown = 0;
       for (const a of accounts) {
         if (String(a.sso || '').trim()) hasSso++;
-        const c = a.ssoCheck;
-        if (!c || typeof c.alive !== 'boolean') unchecked++;
-        else if (c.alive) alive++;
-        else dead++;
+        const v = ssoCheckVerdict(a.ssoCheck);
+        if (v === 'unchecked') unchecked++;
+        else if (v === 'alive') alive++;
+        else if (v === 'dead') dead++;
+        else if (v === 'unknown') unknown++;
       }
       set({
         accounts,
@@ -208,7 +212,8 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
           noSso: accounts.length - hasSso,
           unchecked,
           alive,
-          dead
+          dead,
+          unknown
         },
         lastQuery: null,
         fullListMode: true
@@ -256,6 +261,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
         unchecked: 0,
         alive: 0,
         dead: 0,
+        unknown: 0,
         authConverted: 0,
         authUnconverted: 0
       };

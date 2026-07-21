@@ -955,6 +955,7 @@ app.post('/api/cpa-auth/probe-batch', asyncHandler(async (req: Request, res: Res
       paths?: string[];
       concurrency?: number;
       deleteOnDead?: boolean;
+      recoverOnAuthError?: boolean;
     };
     const result = await probeCpaAuthBatch(body);
     // 可能删死号 auth 文件
@@ -1058,7 +1059,7 @@ app.post('/api/sso/check', asyncHandler(async (req: Request, res: Response) => {
   const CONCURRENCY = 5;
   const results: Array<{
     id: string;
-    alive: boolean;
+    alive: boolean | null;
     status: number;
     checkedAt: string;
     email?: string;

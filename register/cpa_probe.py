@@ -512,8 +512,6 @@ def probe_and_cleanup(
                 "error": rec.get("error"),
                 "trigger_http": http_status,
             }
-            r["recovered_403"] = True
-            r["recovered_auth"] = True
             r["recover_http"] = http_status
             # 用二次测活结果覆盖
             second = rec.get("second_probe") if isinstance(rec.get("second_probe"), dict) else rec
@@ -531,6 +529,10 @@ def probe_and_cleanup(
                 r["action"] = "ok"
                 r["ok"] = True
                 r["alive"] = True
+            # 仅恢复成功才标 recovered_*（尝试失败不算已恢复）
+            recovered_ok = bool(rec.get("ok")) or r.get("action") == "ok"
+            r["recovered_403"] = recovered_ok
+            r["recovered_auth"] = recovered_ok
             if rec.get("email"):
                 r["email"] = rec.get("email")
         except Exception as e:

@@ -15,6 +15,7 @@ import { useToastStore } from '@renderer/store/toastStore';
 import { cn } from '@renderer/lib/cn';
 import { fmtBeijing } from '@renderer/lib/time';
 import type { MailCodeResult, SsoCheckResult } from '@shared/ipc';
+import { ssoCheckVerdict } from '@shared/ssoCheckVerdict';
 import type { AccountRecord } from '@shared/runEvents';
 
 export function AccountDetailDrawer({
@@ -119,13 +120,13 @@ export function AccountDetailDrawer({
             title: '已补全邮箱',
             description: `${fromGrok}（已写入号池；可回 Auth 按 email 回填 sso）`
           });
-        } else if (hadNoEmail && result.alive && !fromGrok) {
+        } else if (hadNoEmail && result.alive === true && !fromGrok) {
           push({
             tone: 'warn',
             title: '验活存活但未返回邮箱',
             description: '无法自动补全，Auth 无邮箱文件仍需重 mint 或手补 sso'
           });
-        } else if (hadNoEmail && !result.alive) {
+        } else if (hadNoEmail && result.alive !== true) {
           push({
             tone: 'warn',
             title: result.error ? '检查异常' : '已失效',
@@ -272,19 +273,23 @@ export function AccountDetailDrawer({
               <div
                 className={cn(
                   'inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[12px] font-medium',
-                  ssoResult.alive ? 'bg-ok/12 text-ok' : 'bg-danger/12 text-danger'
+                  ssoCheckVerdict(ssoResult) === 'alive'
+                ? 'bg-ok/12 text-ok'
+                : ssoCheckVerdict(ssoResult) === 'unknown'
+                  ? 'bg-amber-500/12 text-amber-700 dark:text-amber-400'
+                  : 'bg-danger/12 text-danger'
                 )}
               >
-                {ssoResult.alive ? (
+                {ssoCheckVerdict(ssoResult) === 'alive' ? (
                   <ShieldCheck className="h-3.5 w-3.5" />
                 ) : (
                   <ShieldX className="h-3.5 w-3.5" />
                 )}
-                {ssoResult.alive ? '存活' : ssoResult.error ? '检查异常' : '已失效'}
+                {ssoCheckVerdict(ssoResult) === 'alive' ? '存活' : ssoCheckVerdict(ssoResult) === 'unknown' ? (ssoResult.error ? '检查异常' : '未知') : '已失效'}
                 <span className="opacity-60">HTTP {ssoResult.status}</span>
               </div>
 
-              {ssoResult.alive && (
+              {ssoResult.alive === true && (
                 <div className="space-y-1.5 rounded-[12px] bg-card p-3 text-[12px]">
                   <KV
                     label="grok 邮箱"
@@ -299,7 +304,7 @@ export function AccountDetailDrawer({
                       号池邮箱已补全为 {ssoResult.email}
                     </div>
                   )}
-                  {openedWithoutEmail && ssoResult.alive && !ssoResult.email && (
+                  {openedWithoutEmail && ssoResult.alive === true && !ssoResult.email && (
                     <div className="rounded-md bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-700 dark:text-amber-400">
                       存活但未返回邮箱，无法自动补全
                     </div>

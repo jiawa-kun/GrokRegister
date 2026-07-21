@@ -8,6 +8,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { loadSettings, dataDir, isSecretPlaceholder } from './settingsStore.js';
 import { resolveHttpProxy } from './resolveHttpProxy.js';
+import { probeCpaAuthFileNode } from './cpaProbe.js';
 import { resolveRegisterRuntime } from './bot/registerRuntime.js';
 import { readBotFlagFromAuthRecord, readBotFlagFromToken } from './jwtBotFlag.js';
 import { proxiedRequest, requestWithProxyFallback, errorMessage } from './httpClient.js';
@@ -2908,15 +2909,22 @@ print(json.dumps(r, ensure_ascii=False))
 }
 
 /**
- * 批量 CPA 测活（cehuo /responses）。
- * 默认对 401/402/403 删除文件（deleteOnDead=true）。
+ * 批量 CPA 测活（/responses）。
+ * - 默认快扫：Node 直连 HTTP，不 spawn Python，不密码重登
+ * - recoverOnAuthError=true：Python 深检（401/403 可密码重登），并发降至 1～2
+ * - 默认不删死号；仅 settings/入参显式 true 才删
  */
 export async function probeCpaAuthBatch(input: {
   filenames?: string[];
   paths?: string[];
   concurrency?: number;
-  /** 未传时读 settings.cpaProbeDeleteOnDead，默认 true */
+  /** 未传时读 settings.cpaProbeDeleteOnDead，默认 false */
   deleteOnDead?: boolean;
+  /**
+   * 401/403 时是否密码重登深检。默认 false（快扫）。
+   * true 时走 Python probe_and_cleanup(recover_on_403=true)。
+   */
+  recoverOnAuthError?: boolean;
 }): Promise<{
   total: number;
   ok: number;
@@ -2941,32 +2949,35 @@ export async function probeCpaAuthBatch(input: {
   if (jobs.length > 200) throw new Error('单次批量测活最多 200 个');
 
   const settings = await loadSettings();
-  // 默认不删死号；仅显式 true 才删
   const deleteOnDead =
     input.deleteOnDead !== undefined
       ? input.deleteOnDead === true
       : settings.cpaProbeDeleteOnDead === true;
+  const recoverOnAuthError = input.recoverOnAuthError === true;
   const dir = resolveAuthDir(settings.authDir);
-  const runtime = resolveRegisterRuntime(settings);
-  if (!runtime) throw new Error('未找到注册脚本目录，无法调用 Python 测活');
+  const proxy = resolveHttpProxy(settings, 'cpaAuth');
 
-  // 预载号池 email→password，403 时密码重登二次测活
+  // 深检才需要 Python + 号池密码；快扫纯 Node
+  let runtime: ReturnType<typeof resolveRegisterRuntime> = null;
   let passwordByEmail = new Map<string, string>();
-  try {
-    const { listAccountsLite } = await import('./accountStore.js');
-    const accounts = await listAccountsLite();
-    for (const a of accounts) {
-      const em = String(a.email || '')
-        .trim()
-        .toLowerCase();
-      const pw = String(a.password || '').trim();
-      if (em && pw && !passwordByEmail.has(em)) passwordByEmail.set(em, pw);
+  let pyCode = '';
+  if (recoverOnAuthError) {
+    runtime = resolveRegisterRuntime(settings);
+    if (!runtime) throw new Error('未找到注册脚本目录，无法调用 Python 深检测活');
+    try {
+      const { listAccountsLite } = await import('./accountStore.js');
+      const accounts = await listAccountsLite();
+      for (const a of accounts) {
+        const em = String(a.email || '')
+          .trim()
+          .toLowerCase();
+        const pw = String(a.password || '').trim();
+        if (em && pw && !passwordByEmail.has(em)) passwordByEmail.set(em, pw);
+      }
+    } catch {
+      passwordByEmail = new Map();
     }
-  } catch {
-    passwordByEmail = new Map();
-  }
-
-  const code = `
+    pyCode = `
 import json, sys
 sys.path.insert(0, ${JSON.stringify(runtime.registerDir)})
 from cpa_probe import probe_and_cleanup
@@ -2985,9 +2996,14 @@ r = probe_and_cleanup(
 )
 print(json.dumps(r, ensure_ascii=False))
 `.trim();
+  }
 
-  // 403 恢复含浏览器登录，并发降为 1，避免多开 Chromium
-  const concurrency = Math.min(2, Math.max(1, Number(input.concurrency) || 1));
+  // 快扫：允许更高并发；深检（含浏览器）：1～2
+  const requested = Math.max(1, Math.floor(Number(input.concurrency) || 1));
+  const concurrency = recoverOnAuthError
+    ? Math.min(2, requested)
+    : Math.min(12, Math.max(1, requested || 6));
+
   const results: CpaAuthBatchResultItem[] = [];
   let idx = 0;
 
@@ -3009,7 +3025,6 @@ print(json.dumps(r, ensure_ascii=False))
         assertInsideAuthDir(resolved, dir);
         if (!existsSync(resolved)) throw new Error(`文件不存在: ${resolved}`);
 
-        // 从 auth 文件读 email，再查号池密码
         let emailHint = '';
         try {
           const raw = await fsp.readFile(resolved, 'utf-8');
@@ -3018,14 +3033,48 @@ print(json.dumps(r, ensure_ascii=False))
         } catch {
           /* ignore */
         }
+
+        if (!recoverOnAuthError) {
+          const r = await probeCpaAuthFileNode(resolved, { proxy });
+          const action = String(r.action || 'error');
+          const httpStatus = Number(r.http_status || 0) || undefined;
+          let deleted = false;
+          if (action === 'dead' && deleteOnDead && existsSync(resolved)) {
+            try {
+              await fsp.unlink(resolved);
+              deleted = true;
+            } catch {
+              /* ignore */
+            }
+          }
+          if (!deleted && action && existsSync(resolved)) {
+            await persistProbeOnAuthFile(resolved, action, httpStatus);
+          }
+          results.push({
+            filename: basename(resolved),
+            email: String(r.email || emailHint || ''),
+            ok: action === 'ok',
+            error: r.error
+              ? String(r.error)
+              : action === 'dead'
+                ? `HTTP ${httpStatus || '?'}`
+                : undefined,
+            mode: 'cpa_probe',
+            path: deleted ? undefined : resolved,
+            probeAction: action || undefined,
+            probeHttp: httpStatus,
+            probeDeleted: deleted
+          });
+          continue;
+        }
+
         const pw =
           passwordByEmail.get(emailHint.toLowerCase()) ||
           passwordByEmail.get(emailHint) ||
           '';
-
-        const r = await runPythonJson(runtime!.pythonPath, runtime!.registerDir, code, [
+        const r = await runPythonJson(runtime!.pythonPath, runtime!.registerDir, pyCode, [
           resolved,
-          resolveHttpProxy(settings, 'cpaAuth'),
+          proxy,
           deleteOnDead ? '1' : '0',
           emailHint,
           pw
@@ -3034,10 +3083,8 @@ print(json.dumps(r, ensure_ascii=False))
         const httpStatus = Number(r.http_status || 0) || undefined;
         const deleted = Boolean(r.deleted);
         const isOk = action === 'ok';
-        const recovered =
-          Boolean(r.recovered_403) || Boolean(r.recovered_auth);
+        const recovered = Boolean(r.recovered_403) || Boolean(r.recovered_auth);
         const recoverHttp = Number(r.recover_http || 0) || httpStatus;
-        // 未删文件时 Node 兜底持久化测活标签
         if (!deleted && action && existsSync(resolved)) {
           await persistProbeOnAuthFile(resolved, action, httpStatus);
         }
@@ -3050,8 +3097,7 @@ print(json.dumps(r, ensure_ascii=False))
             : action === 'dead'
               ? `HTTP ${httpStatus || '?'}`
               : undefined,
-          // 401/403 密码重登二次测活
-          mode: recovered ? 'cpa_probe_auth_recover' : 'cpa_probe',
+          mode: recovered ? 'cpa_probe_auth_recover' : 'cpa_probe_deep',
           path: deleted ? undefined : resolved,
           probeAction: action || undefined,
           probeHttp: httpStatus,
@@ -3072,7 +3118,6 @@ print(json.dumps(r, ensure_ascii=False))
 
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
 
-  // 可选：死号删 Auth 后同步删号池同邮箱 SSO（默认关）
   let ssoDeleted = 0;
   if (settings.cpaProbeDeleteSsoOnDead === true) {
     const emails = [

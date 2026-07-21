@@ -22,13 +22,29 @@ def _sso_hash(sso: str) -> str:
 
 
 def _alive_from_check(sso_check: Any) -> Optional[int]:
+    """Map ssoCheck → SQLite alive column.
+
+    1 = alive, 0 = dead(401/403 only), 2 = unknown, None = unchecked.
+    Legacy rows with alive=false but non-401/403 status reclassified as unknown(2).
+    """
     if not isinstance(sso_check, dict):
         return None
+    if "alive" not in sso_check and not sso_check.get("checkedAt"):
+        return None
     v = sso_check.get("alive")
+    try:
+        status = int(sso_check.get("status") or 0)
+    except Exception:
+        status = 0
     if v is True:
         return 1
     if v is False:
-        return 0
+        if status in (401, 403):
+            return 0
+        # 历史网络/超时假死 → 未知
+        return 2
+    if v is None:
+        return 2
     return None
 
 
@@ -258,7 +274,25 @@ def _build_where(
     elif alive_mode == "alive":
         clauses.append("alive = 1")
     elif alive_mode == "dead":
-        clauses.append("alive = 0")
+        # 仅明确 401/403；兼容旧库 alive=0 但 status 非 401/403
+        clauses.append(
+            "("
+            "alive = 0 AND ("
+            "CAST(json_extract(sso_check_json, '$.status') AS INTEGER) IN (401, 403)"
+            ")"
+            ")"
+        )
+    elif alive_mode == "unknown":
+        clauses.append(
+            "("
+            "alive = 2 OR ("
+            "alive = 0 AND ("
+            "json_extract(sso_check_json, '$.status') IS NULL OR "
+            "CAST(json_extract(sso_check_json, '$.status') AS INTEGER) NOT IN (401, 403)"
+            ")"
+            ")"
+            ")"
+        )
 
     auth_mode = str(auth or "all").strip().lower()
     emails = [str(e).strip().lower() for e in (auth_emails or []) if str(e).strip()]
@@ -337,7 +371,16 @@ def query_page(
               COALESCE(SUM(has_sso), 0) AS has_sso,
               COALESCE(SUM(CASE WHEN alive IS NULL THEN 1 ELSE 0 END), 0) AS unchecked,
               COALESCE(SUM(CASE WHEN alive = 1 THEN 1 ELSE 0 END), 0) AS alive_n,
-              COALESCE(SUM(CASE WHEN alive = 0 THEN 1 ELSE 0 END), 0) AS dead_n
+              COALESCE(SUM(CASE
+                WHEN alive = 0 AND CAST(json_extract(sso_check_json, '$.status') AS INTEGER) IN (401, 403)
+                THEN 1 ELSE 0 END), 0) AS dead_n,
+              COALESCE(SUM(CASE
+                WHEN alive = 2 THEN 1
+                WHEN alive = 0 AND (
+                  json_extract(sso_check_json, '$.status') IS NULL
+                  OR CAST(json_extract(sso_check_json, '$.status') AS INTEGER) NOT IN (401, 403)
+                ) THEN 1
+                ELSE 0 END), 0) AS unknown_n
             FROM accounts
             """
         ).fetchone()
@@ -346,6 +389,7 @@ def query_page(
         unchecked = int(fac["unchecked"] or 0)
         alive_n = int(fac["alive_n"] or 0)
         dead_n = int(fac["dead_n"] or 0)
+        unknown_n = int(fac["unknown_n"] or 0)
 
         emails = [str(e).strip().lower() for e in (auth_emails or []) if str(e).strip()]
         hashes = [str(h).strip().lower() for h in (auth_hashes or []) if str(h).strip()]
@@ -402,6 +446,7 @@ def query_page(
             "unchecked": unchecked,
             "alive": alive_n,
             "dead": dead_n,
+            "unknown": unknown_n,
             "authConverted": auth_converted,
             "authUnconverted": max(0, all_n - auth_converted),
         },

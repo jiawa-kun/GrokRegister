@@ -10,6 +10,7 @@ import { promises as fsp, existsSync, readdirSync, readFileSync, statSync } from
 import { join, resolve, basename } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import type { AccountRecord, AccountSsoCheck } from '@shared/runEvents';
+import { ssoCheckVerdict } from '@shared/ssoCheckVerdict';
 import { dataDir } from './settingsStore.js';
 import {
   decryptSecretString,
@@ -52,8 +53,9 @@ function ssoDir(): string {
 function isAccountSsoCheck(v: unknown): v is AccountSsoCheck {
   if (!v || typeof v !== 'object') return false;
   const o = v as Record<string, unknown>;
+  const aliveOk = o.alive === true || o.alive === false || o.alive === null;
   return (
-    typeof o.alive === 'boolean' &&
+    aliveOk &&
     typeof o.status === 'number' &&
     typeof o.checkedAt === 'string'
   );
@@ -664,7 +666,7 @@ export type AccountListQuery = {
   q?: string;
   /** all | has_sso | no_sso */
   sso?: string;
-  /** all | unchecked | alive | dead */
+  /** all | unchecked | alive | dead | unknown */
   alive?: string;
   /** all | converted | unconverted — 与 Auth 目录 email/ssoHash 交叉 */
   auth?: string;
@@ -678,6 +680,8 @@ export type AccountListFacets = {
   unchecked: number;
   alive: number;
   dead: number;
+  /** 已验活但无法确认(网络/超时/429 等) */
+  unknown: number;
   /** Auth 已转 / 未转（基于 email 或 sso hash） */
   authConverted: number;
   authUnconverted: number;
@@ -1049,12 +1053,9 @@ function matchAccountQuery(
   if (ssoMode === 'no_sso' && hasSso) return false;
 
   const aliveMode = String(opts.alive || 'all').trim().toLowerCase();
-  if (aliveMode === 'unchecked') {
-    if (a.ssoCheck && typeof a.ssoCheck.alive === 'boolean') return false;
-  } else if (aliveMode === 'alive') {
-    if (!a.ssoCheck || a.ssoCheck.alive !== true) return false;
-  } else if (aliveMode === 'dead') {
-    if (!a.ssoCheck || a.ssoCheck.alive !== false) return false;
+  if (aliveMode === 'unchecked' || aliveMode === 'alive' || aliveMode === 'dead' || aliveMode === 'unknown') {
+    const v = ssoCheckVerdict(a.ssoCheck);
+    if (v !== aliveMode) return false;
   }
 
   const authMode = String(opts.auth || 'all').trim().toLowerCase();
@@ -1095,13 +1096,15 @@ function buildFacets(
   let unchecked = 0;
   let alive = 0;
   let dead = 0;
+  let unknown = 0;
   let authConverted = 0;
   for (const a of all) {
     if (String(a.sso || '').trim()) hasSso++;
-    const c = a.ssoCheck;
-    if (!c || typeof c.alive !== 'boolean') unchecked++;
-    else if (c.alive) alive++;
-    else dead++;
+    const v = ssoCheckVerdict(a.ssoCheck);
+    if (v === 'unchecked') unchecked++;
+    else if (v === 'alive') alive++;
+    else if (v === 'dead') dead++;
+    else if (v === 'unknown') unknown++;
     if (authIndex && ssoHashOf && isAuthConvertedAccount(a, authIndex, ssoHashOf)) {
       authConverted++;
     }
@@ -1113,6 +1116,7 @@ function buildFacets(
     unchecked,
     alive,
     dead,
+    unknown,
     authConverted,
     authUnconverted: Math.max(0, all.length - authConverted)
   };
@@ -1456,7 +1460,7 @@ export async function resyncAccountsFromDisk(): Promise<{ total: number; importe
 export async function applyAccountSsoChecks(
   results: Array<{
     id: string;
-    alive: boolean;
+    alive: boolean | null;
     status: number;
     checkedAt: string;
     email?: string;
@@ -1477,7 +1481,7 @@ export async function applyAccountSsoChecks(
     const byId = new Map<string, (typeof list)[number]>();
     for (const r of list) {
       const id = String(r?.id || '').trim();
-      if (!id || typeof r.alive !== 'boolean') continue;
+      if (!id || !(r.alive === true || r.alive === false || r.alive === null)) continue;
       byId.set(id, r);
     }
     if (byId.size === 0) return { updated: 0, emailsFilled: 0 };

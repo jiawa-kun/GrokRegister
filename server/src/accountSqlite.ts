@@ -333,6 +333,7 @@ export type SqliteQueryPage = {
     unchecked: number;
     alive: number;
     dead: number;
+    unknown: number;
     authConverted: number;
     authUnconverted: number;
   };
@@ -392,6 +393,7 @@ export async function sqliteQueryAccounts(opts: {
       unchecked: Number(facetsRaw.unchecked) || 0,
       alive: Number(facetsRaw.alive) || 0,
       dead: Number(facetsRaw.dead) || 0,
+      unknown: Number(facetsRaw.unknown) || 0,
       authConverted: Number(facetsRaw.authConverted) || 0,
       authUnconverted: Number(facetsRaw.authUnconverted) || 0
     }

@@ -1028,7 +1028,8 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       const r = await window.api.probeCpaAuthBatch({
         filenames: [item.filename],
         concurrency: 1,
-        deleteOnDead
+        deleteOnDead,
+        recoverOnAuthError: false
       });
       const one = r.results[0];
       if (one?.filename) {
@@ -1998,7 +1999,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   };
 
 
-  const probeBatch = async () => {
+  const probeBatch = async (opts?: { recoverOnAuthError?: boolean }) => {
     let filenames: string[] = [];
     try {
       const r = await resolveTargetNames({ limit: 500 });
@@ -2047,10 +2048,14 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
         const chunk = filenames.slice(i, i + CHUNK);
         setProg((p) => (p ? { ...p, current: chunk[0], running: true } : p));
         try {
+          const recoverOnAuthError = opts?.recoverOnAuthError === true;
           const r = await window.api.probeCpaAuthBatch({
             filenames: chunk,
-            concurrency: Math.min(6, chunk.length),
-            deleteOnDead
+            concurrency: recoverOnAuthError
+              ? Math.min(2, chunk.length)
+              : Math.min(8, chunk.length),
+            deleteOnDead,
+            recoverOnAuthError
           });
           ok += r.ok || 0;
           failed += r.failed || 0;
@@ -2093,13 +2098,13 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       if (cancelled || signal.aborted) {
         push({
           tone: 'warn',
-          title: '批量测活已取消',
+          title: opts?.recoverOnAuthError ? '批量深检已取消' : '批量测活已取消',
           description: `OK ${ok} · 死号 ${dead} · 已删 ${deleted}（部分完成）`
         });
       } else {
         push({
           tone: dead > 0 || failed > 0 ? 'warn' : 'ok',
-          title: '批量 CPA 测活完成',
+          title: opts?.recoverOnAuthError ? '批量深检测活完成' : '批量 CPA 测活完成',
           description:
             `OK ${ok} · 死号 ${dead} · 已删 Auth ${deleted}` +
             (ssoDeleted > 0 ? ` · 同步删 SSO ${ssoDeleted}` : '') +
@@ -3039,7 +3044,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                         : hasActiveFilter
                           ? `测活筛选 ${filteredTotalCount} 条`
                           : '测活全部') +
-                      (deleteOnDead ? ' · 401/402/403 将删除' : ' · 死号仅标记不删')
+                      (deleteOnDead ? ' · 401/402/403 将删除' : ' · 死号仅标记不删') + ' · 快扫不重登'
                 }
               >
                 {batchBusy === 'probe' ? (
@@ -3048,6 +3053,28 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                   <Activity className="h-3.5 w-3.5" />
                 )}
                 {batchBusy === 'probe' ? '取消' : '测活'}
+              </Button>
+              <Button
+                size="sm"
+                className="min-w-[5rem] justify-center tabular-nums"
+                {...batchBtnProps('probe', () => void probeBatch({ recoverOnAuthError: true }))}
+                variant={batchBusy === 'probe' ? 'danger' : 'secondary'}
+                disabled={
+                  (Boolean(busy) && batchBusy !== 'probe') ||
+                  (batchBusy !== 'probe' && filteredTotalCount === 0)
+                }
+                title={
+                  batchBusy === 'probe'
+                    ? '取消深检批量任务'
+                    : '深检：401/403 可密码重登（慢，并发低）'
+                }
+              >
+                {batchBusy === 'probe' ? (
+                  <Ban className="h-3.5 w-3.5" />
+                ) : (
+                  <KeyRound className="h-3.5 w-3.5" />
+                )}
+                {batchBusy === 'probe' ? '取消' : '深检'}
               </Button>
               <Button
                 size="sm"

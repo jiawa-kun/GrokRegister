@@ -48,6 +48,7 @@ import { buildSsoHashMap } from '@renderer/lib/ssoHash';
 import { fmtBeijing, fmtBeijingTime } from '@renderer/lib/time';
 import type { AccountRecord } from '@shared/runEvents';
 import type { CpaAuthBatchResultItem, SsoCheckResult } from '@shared/ipc';
+import { ssoCheckVerdict } from '@shared/ssoCheckVerdict';
 
 const PAGE_SIZE_KEY = 'gra-pool-page-size';
 const AUTH_FILTER_KEY = 'gra-pool-auth-filter';
@@ -58,7 +59,7 @@ const MINT_CHUNK = 5;
 /** Auth 转换筛选 */
 type AuthFilter = 'all' | 'unconverted' | 'converted';
 /** 验活状态筛选 */
-type AliveFilter = 'all' | 'unchecked' | 'alive' | 'dead';
+type AliveFilter = 'all' | 'unchecked' | 'alive' | 'dead' | 'unknown';
 /** 是否含 SSO 筛选（分页/列表基于此） */
 type SsoFilter = 'all' | 'has_sso' | 'no_sso';
 
@@ -77,13 +78,13 @@ function loadAuthFilter(): AuthFilter {
 function loadAliveFilter(): AliveFilter {
   const fromUrl = oneOf(
     getQuery('alive'),
-    ['all', 'unchecked', 'alive', 'dead'] as const,
+    ['all', 'unchecked', 'alive', 'dead', 'unknown'] as const,
     '' as AliveFilter | ''
   );
   if (fromUrl) return fromUrl;
   try {
     const v = localStorage.getItem(ALIVE_FILTER_KEY);
-    if (v === 'unchecked' || v === 'alive' || v === 'dead' || v === 'all') return v;
+    if (v === 'unchecked' || v === 'alive' || v === 'dead' || v === 'unknown' || v === 'all') return v;
   } catch {
     /* ignore */
   }
@@ -529,10 +530,10 @@ export function PoolPage() {
     return null;
   };
 
-  const aliveStatusOf = (a: AccountRecord): 'unchecked' | 'alive' | 'dead' => {
+  const aliveStatusOf = (a: AccountRecord): 'unchecked' | 'alive' | 'dead' | 'unknown' => {
     const r = ssoMap.get(a.id);
-    if (!r) return 'unchecked';
-    return r.alive ? 'alive' : 'dead';
+    if (!r) return ssoCheckVerdict(a.ssoCheck);
+    return ssoCheckVerdict({ alive: r.alive, status: r.status });
   };
 
   // 服务端分页：accounts 已是当前页（含 auth 筛选）
@@ -545,6 +546,7 @@ export function PoolPage() {
   const uncheckedCount = facets.unchecked;
   const aliveOnlyCount = facets.alive;
   const deadOnlyCount = facets.dead;
+  const unknownOnlyCount = (facets as { unknown?: number }).unknown ?? 0;
 
   // 始终服务端分页（Auth 也已服务端筛选）
   const serverPaged = !fullListMode;
@@ -906,7 +908,9 @@ export function PoolPage() {
       } catch {
         /* applySsoResults 已写内存 */
       }
-      const alive = results.filter((r) => r.alive).length;
+      const alive = results.filter((r) => r.alive === true).length;
+      const deadN = results.filter((r) => r.alive === false).length;
+      const unknownN = results.filter((r) => r.alive === null).length;
       const emailsFilled =
         typeof (results as { emailsFilled?: number }).emailsFilled === 'number'
           ? (results as { emailsFilled?: number }).emailsFilled!
@@ -932,7 +936,7 @@ export function PoolPage() {
       push({
         tone: 'ok',
         title: '验活完成',
-        description: `存活 ${alive} / ${results.length}${scopeHint}（已写入账号库 + 本机缓存）${emailHint}`
+        description: `存活 ${alive} · 失效 ${deadN} · 未知 ${unknownN} / ${results.length}${scopeHint}（已写入账号库 + 本机缓存）${emailHint}`
       });
     } catch (err) {
       push({ tone: 'danger', title: '批量验活失败', description: String(err) });
@@ -1414,7 +1418,8 @@ export function PoolPage() {
                 { id: 'all', label: '全部', count: poolTotal, title: '不限制验活状态' },
                 { id: 'unchecked', label: 'None', count: uncheckedCount, title: '尚未验活', tone: 'muted' },
                 { id: 'alive', label: 'Live', count: aliveOnlyCount, title: '验活存活', tone: 'ok' },
-                { id: 'dead', label: 'Dead', count: deadOnlyCount, title: '验活失效', tone: 'danger' }
+                { id: 'dead', label: 'Dead', count: deadOnlyCount, title: '验活失效(401/403)', tone: 'danger' },
+                { id: 'unknown', label: 'Unkn', count: unknownOnlyCount, title: '验活未知(网络/超时/429等)', tone: 'muted' }
               ]}
             />
           </FilterBar>
@@ -2106,7 +2111,8 @@ function SsoBadge({ result }: { result?: SsoCheckResult }) {
     );
   }
   const when = result.checkedAt ? ` · ${fmtBeijing(result.checkedAt)}` : '';
-  if (result.alive) {
+  const verdict = ssoCheckVerdict({ alive: result.alive, status: result.status });
+  if (verdict === 'alive') {
     return (
       <span
         className="inline-flex h-5 shrink-0 items-center rounded-full bg-emerald-500/15 px-2 text-[10px] font-medium leading-none text-emerald-600 dark:text-emerald-400"
@@ -2116,10 +2122,20 @@ function SsoBadge({ result }: { result?: SsoCheckResult }) {
       </span>
     );
   }
+  if (verdict === 'unknown') {
+    return (
+      <span
+        className="inline-flex h-5 shrink-0 items-center rounded-full bg-amber-500/15 px-2 text-[10px] font-medium leading-none text-amber-700 dark:text-amber-400"
+        title={(result.error || 'Unkn · 未知(网络/超时/429等)') + when}
+      >
+        Unkn
+      </span>
+    );
+  }
   return (
     <span
       className="inline-flex h-5 shrink-0 items-center rounded-full bg-destructive/15 px-2 text-[10px] font-medium leading-none text-destructive"
-      title={(result.error || 'Dead · 失效') + when}
+      title={(result.error || 'Dead · 失效(401/403)') + when}
     >
       Dead
     </span>

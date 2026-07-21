@@ -38,7 +38,8 @@ export interface RunStatus {
 
 /** 号池 SSO 验活快照（落盘在 accounts.json，跨设备/清浏览器缓存仍可恢复） */
 export interface AccountSsoCheck {
-  alive: boolean;
+  /** true=存活；false=失效(仅 401/403)；null=未知(网络/超时/429 等) */
+  alive: boolean | null;
   status: number;
   checkedAt: string;
   email?: string;
