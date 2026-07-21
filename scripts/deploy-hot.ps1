@@ -148,8 +148,8 @@ docker exec $( $ContainerName ) sh -c 'set -e
 '
 rm -f $( $remoteTar )
 $restartBlock
-# Prefer curl health (no node -e / case / complex quoting)
-code=`$(docker exec $( $ContainerName ) curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 http://127.0.0.1:6657/ || echo 0)
+# Health: node classic function() (container may lack curl; avoid => for bash/ssh)
+code=`$(docker exec $( $ContainerName ) node -e "require('http').get('http://127.0.0.1:6657/',function(r){process.stdout.write(String(r.statusCode));process.exit(0)}).on('error',function(){process.stdout.write('0');process.exit(0)})" 2>/dev/null || echo 0)
 echo "health_http=`$code"
 docker ps --filter name=$( $ContainerName ) --format '{{.Names}} {{.Status}}'
 echo "HOT_DEPLOY_OK build=$stamp"
