@@ -55,6 +55,8 @@ const AUTH_FILTER_KEY = 'gra-pool-auth-filter';
 const ALIVE_FILTER_KEY = 'gra-pool-alive-filter';
 const SSO_FILTER_KEY = 'gra-pool-sso-filter';
 const MINT_CHUNK = 5;
+/** SSO 验活分块：每块请求服务端（服务端内并发 5） */
+const VERIFY_CHUNK = 25;
 
 /** Auth 转换筛选 */
 type AuthFilter = 'all' | 'unconverted' | 'converted';
@@ -138,6 +140,21 @@ type MintProgress = {
   running: boolean;
 };
 
+/** SSO 批量验活进度 */
+type VerifyProgress = {
+  total: number;
+  done: number;
+  alive: number;
+  dead: number;
+  unknown: number;
+  current?: string;
+  running: boolean;
+  /** all=当前筛选；unchecked/unknown/dead=智能复检 */
+  recheck: 'all' | 'unchecked' | 'unknown' | 'dead';
+};
+
+type VerifyRecheck = VerifyProgress['recheck'];
+
 export function PoolPage() {
   const accounts = useAccountsStore((s) => s.accounts);
   const loading = useAccountsStore((s) => s.loading);
@@ -164,6 +181,8 @@ export function PoolPage() {
     return loadStoredPageSize(PAGE_SIZE_KEY, DEFAULT_PAGE_SIZE);
   });
   const [verifying, setVerifying] = useState(false);
+  const [verifyProg, setVerifyProg] = useState<VerifyProgress | null>(null);
+  const verifyAbortRef = useRef<AbortController | null>(null);
   const [pushingG2a, setPushingG2a] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -777,6 +796,8 @@ export function PoolPage() {
     scope?: 'page' | 'filter';
     requireSso?: boolean;
     limit?: number;
+    /** 覆盖验活筛选：unchecked | unknown | dead | alive */
+    aliveOverride?: string;
   }): Promise<{
     targets: ActionTarget[];
     scope: 'selected' | 'page' | 'filter' | 'local';
@@ -847,8 +868,13 @@ export function PoolPage() {
         const targets = await hydrateTargets(list);
         return { targets, scope: 'page', total: targets.length, truncated: false };
       }
+      const fq = filterQuery();
       const r = await api.matchAccounts({
-        ...filterQuery(),
+        ...fq,
+        alive:
+          opts?.aliveOverride && opts.aliveOverride !== 'all'
+            ? opts.aliveOverride
+            : fq.alive,
         limit,
         requireSso
       });
@@ -879,72 +905,219 @@ export function PoolPage() {
     };
   };
 
-  const verifyBatch = async (scope: 'page' | 'filter' = 'filter') => {
+  const cancelVerify = () => {
+    verifyAbortRef.current?.abort();
+  };
+
+  const targetVerdict = (row: { id: string }): ReturnType<typeof ssoCheckVerdict> => {
+    const fromMap = ssoMap.get(row.id);
+    if (fromMap) return ssoCheckVerdict(fromMap);
+    const acc = accounts.find((a) => a.id === row.id);
+    return ssoCheckVerdict(acc?.ssoCheck);
+  };
+
+  const verifyBatch = async (
+    scope: 'page' | 'filter' = 'filter',
+    opts?: { recheck?: VerifyRecheck }
+  ) => {
+    // 进行中再点主按钮 = 取消
+    if (verifying) {
+      cancelVerify();
+      return;
+    }
+
+    const recheck: VerifyRecheck = opts?.recheck || 'all';
+    const ac = new AbortController();
+    verifyAbortRef.current = ac;
     setVerifying(true);
+    setVerifyProg({
+      total: 0,
+      done: 0,
+      alive: 0,
+      dead: 0,
+      unknown: 0,
+      running: true,
+      recheck
+    });
+
     try {
       const { targets, truncated, total, scope: used } = await resolveActionTargets({
         scope: selected.size > 0 ? 'page' : scope,
         requireSso: true,
-        limit: 500
+        limit: 500,
+        aliveOverride: recheck === 'all' ? undefined : recheck
       });
-      if (targets.length === 0) {
-        push({ tone: 'warn', title: '没有可验活的账号' });
+
+      let list = targets;
+      // 已选 / 本页 / 本地列表：客户端按 recheck 再筛
+      if (
+        recheck !== 'all' &&
+        (selected.size > 0 || used === 'page' || used === 'selected' || used === 'local')
+      ) {
+        list = targets.filter((a) => targetVerdict(a) === recheck);
+      }
+
+      if (list.length === 0) {
+        const tip =
+          recheck === 'unchecked'
+            ? '没有未验活的账号'
+            : recheck === 'unknown'
+              ? '没有验活未知的账号'
+              : recheck === 'dead'
+                ? '没有验活失效的账号'
+                : '没有可验活的账号';
+        push({ tone: 'warn', title: tip });
+        setVerifyProg(null);
         return;
       }
-      if (truncated) {
+      if (truncated && recheck === 'all') {
         push({
           tone: 'warn',
-          title: `匹配 ${total} 条，本次只验前 ${targets.length}`,
+          title: `匹配 ${total} 条，本次只验前 ${list.length}`,
           description: '可缩小筛选后再试'
         });
       }
-      const missingEmailBefore = targets.filter((a) => !String(a.email || '').trim()).length;
-      const results = await window.api.checkSso(
-        targets.map((a) => ({ id: a.id, sso: a.sso }))
-      );
-      applyResults(results);
+
+      const missingEmailBefore = list.filter((a) => !String(a.email || '').trim()).length;
+      setVerifyProg({
+        total: list.length,
+        done: 0,
+        alive: 0,
+        dead: 0,
+        unknown: 0,
+        running: true,
+        recheck,
+        current: list[0]?.email || list[0]?.id
+      });
+
+      let alive = 0;
+      let deadN = 0;
+      let unknownN = 0;
+      let emailsFilled = 0;
+      let cancelled = false;
+      const allResults: SsoCheckResult[] = [];
+
+      for (let i = 0; i < list.length; i += VERIFY_CHUNK) {
+        if (ac.signal.aborted) {
+          cancelled = true;
+          break;
+        }
+        const chunk = list.slice(i, i + VERIFY_CHUNK);
+        setVerifyProg((p) =>
+          p
+            ? {
+                ...p,
+                current: chunk[0]?.email || chunk[0]?.id,
+                running: true
+              }
+            : p
+        );
+        try {
+          const results = await window.api.checkSso(
+            chunk.map((a) => ({ id: a.id, sso: a.sso }))
+          );
+          applyResults(results);
+          allResults.push(...results);
+          for (const r of results) {
+            if (r.alive === true) alive++;
+            else if (r.alive === false) deadN++;
+            else unknownN++;
+          }
+          const filled =
+            typeof (results as { emailsFilled?: number }).emailsFilled === 'number'
+              ? (results as { emailsFilled?: number }).emailsFilled!
+              : results.filter((r) => {
+                  const before = chunk.find((x) => x.id === r.id);
+                  return (
+                    before &&
+                    !String(before.email || '').trim() &&
+                    Boolean(String(r.email || '').trim())
+                  );
+                }).length;
+          emailsFilled += filled;
+        } catch (err) {
+          if (ac.signal.aborted) {
+            cancelled = true;
+            break;
+          }
+          throw err;
+        }
+
+        const done = Math.min(i + chunk.length, list.length);
+        setVerifyProg({
+          total: list.length,
+          done,
+          alive,
+          dead: deadN,
+          unknown: unknownN,
+          running: done < list.length && !ac.signal.aborted,
+          recheck,
+          current: chunk[chunk.length - 1]?.email || chunk[chunk.length - 1]?.id
+        });
+        if (ac.signal.aborted) {
+          cancelled = true;
+          break;
+        }
+      }
+
       try {
         await fetchList();
       } catch {
         /* applySsoResults 已写内存 */
       }
-      const alive = results.filter((r) => r.alive === true).length;
-      const deadN = results.filter((r) => r.alive === false).length;
-      const unknownN = results.filter((r) => r.alive === null).length;
-      const emailsFilled =
-        typeof (results as { emailsFilled?: number }).emailsFilled === 'number'
-          ? (results as { emailsFilled?: number }).emailsFilled!
-          : results.filter((r) => {
-              const before = targets.find((t) => t.id === r.id);
-              return (
-                before &&
-                !String(before.email || '').trim() &&
-                Boolean(String(r.email || '').trim())
-              );
-            }).length;
+
       const emailHint =
         emailsFilled > 0
           ? ` · 补邮箱 ${emailsFilled}` +
             (missingEmailBefore > emailsFilled
               ? `（${missingEmailBefore - emailsFilled} 条验活未返回邮箱）`
               : '（便于 Auth 按 email 回填 sso）')
-          : missingEmailBefore > 0
+          : missingEmailBefore > 0 && allResults.length > 0
             ? ' · 无邮箱号未补全（验活未返回 email 或已失效）'
             : '';
       const scopeHint =
         used === 'filter' ? ' · 筛后全部' : used === 'page' ? ' · 本页' : used === 'selected' ? ' · 已选' : '';
-      push({
-        tone: 'ok',
-        title: '验活完成',
-        description: `存活 ${alive} · 失效 ${deadN} · 未知 ${unknownN} / ${results.length}${scopeHint}（已写入账号库 + 本机缓存）${emailHint}`
-      });
+      const recheckHint =
+        recheck === 'unchecked'
+          ? ' · 仅未验'
+          : recheck === 'unknown'
+            ? ' · 仅未知'
+            : recheck === 'dead'
+              ? ' · 仅失效'
+              : '';
+
+      if (cancelled) {
+        push({
+          tone: 'warn',
+          title: '验活已取消',
+          description: `已完成 ${allResults.length}/${list.length} · 存活 ${alive} · 失效 ${deadN} · 未知 ${unknownN}${scopeHint}${recheckHint}${emailHint}`
+        });
+        setVerifyProg((p) => (p ? { ...p, running: false } : p));
+      } else {
+        push({
+          tone: unknownN > 0 || deadN > 0 ? 'warn' : 'ok',
+          title: '验活完成',
+          description: `存活 ${alive} · 失效 ${deadN} · 未知 ${unknownN} / ${allResults.length}${scopeHint}${recheckHint}（已写入账号库 + 本机缓存）${emailHint}`
+        });
+        setVerifyProg({
+          total: list.length,
+          done: list.length,
+          alive,
+          dead: deadN,
+          unknown: unknownN,
+          running: false,
+          recheck
+        });
+      }
+      window.setTimeout(() => setVerifyProg(null), 4000);
     } catch (err) {
       push({ tone: 'danger', title: '批量验活失败', description: String(err) });
+      setVerifyProg(null);
     } finally {
       setVerifying(false);
+      verifyAbortRef.current = null;
     }
   };
-
   const deleteSelected = async () => {
     const ids = [...selected];
     if (ids.length === 0) {
@@ -1241,6 +1414,10 @@ export function PoolPage() {
     };
   }, [openId, accounts]);
   const minting = !!mintProg?.running;
+  const verifyPct =
+    verifyProg && verifyProg.total > 0
+      ? Math.min(100, Math.round((verifyProg.done / verifyProg.total) * 100))
+      : 0;
   const busy = verifying || minting || deleting || importing || pushingG2a;
   const hasActiveFilter =
     authFilter !== 'all' ||
@@ -1285,6 +1462,47 @@ export function PoolPage() {
         </div>
       ) : null}
 
+
+      {verifyProg && (
+        <div className="rounded-[16px] border border-sky-500/30 bg-sky-500/5 px-4 py-3 shadow-[var(--ios-shadow)]">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-[13px] font-semibold tracking-tight">
+                {verifyProg.running ? 'SSO 验活进行中' : 'SSO 验活已完成'}
+                {verifyProg.recheck === 'unchecked'
+                  ? ' · 仅未验'
+                  : verifyProg.recheck === 'unknown'
+                    ? ' · 仅未知'
+                    : verifyProg.recheck === 'dead'
+                      ? ' · 仅失效'
+                      : ''}
+              </p>
+              <p className="mt-0.5 truncate text-[12px] text-muted-foreground">
+                {verifyProg.done}/{verifyProg.total}
+                {verifyProg.current ? ` · 当前 ${verifyProg.current}` : ''}
+                {` · 存活 ${verifyProg.alive} · 失效 ${verifyProg.dead} · 未知 ${verifyProg.unknown}`}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              {verifyProg.running ? (
+                <Button size="sm" variant="secondary" onClick={cancelVerify} title="取消剩余分块">
+                  取消
+                </Button>
+              ) : null}
+              <span className="chip tabular-nums">{verifyPct}%</span>
+            </div>
+          </div>
+          <div className="mt-2 h-2 overflow-hidden rounded-full bg-muted">
+            <div
+              className={cn(
+                'h-full rounded-full transition-all duration-300',
+                verifyProg.running ? 'bg-sky-500' : 'bg-emerald-500'
+              )}
+              style={{ width: `${verifyPct}%` }}
+            />
+          </div>
+        </div>
+      )}
       {mintProg && (
         <div className="rounded-[16px] border border-primary/30 bg-primary/5 px-4 py-3 shadow-[var(--ios-shadow)]">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1466,24 +1684,32 @@ export function PoolPage() {
               <span className="mr-0.5 hidden text-[10px] font-semibold tracking-wide text-primary sm:inline">业务</span>
               <Button
                 size="sm"
-                onClick={() => void verifyBatch(selected.size > 0 ? 'page' : 'filter')}
+                variant={verifying ? 'danger' : 'primary'}
+                onClick={() =>
+                  verifying
+                    ? cancelVerify()
+                    : void verifyBatch(selected.size > 0 ? 'page' : 'filter')
+                }
                 disabled={
-                  busy ||
-                  (serverPaged
-                    ? totalForPager === 0 && pageAccounts.length === 0
-                    : filteredAccounts.length === 0)
+                  (!verifying && busy) ||
+                  (!verifying &&
+                    (serverPaged
+                      ? totalForPager === 0 && pageAccounts.length === 0
+                      : filteredAccounts.length === 0))
                 }
                 title={
-                  selected.size > 0
-                    ? '验活已选'
-                    : serverPaged
-                      ? '验活当前筛选下全部匹配（服务端，最多 500）'
-                      : '验活当前列表'
+                  verifying
+                    ? '取消剩余验活分块'
+                    : selected.size > 0
+                      ? '验活已选（分块进度，可取消）'
+                      : serverPaged
+                        ? '验活当前筛选下全部匹配（最多 500，分块进度）'
+                        : '验活当前列表（分块进度，可取消）'
                 }
               >
                 <ShieldCheck className={cn('h-3.5 w-3.5', verifying && 'animate-pulse')} />
                 {verifying
-                  ? '验活中…'
+                  ? `取消 ${verifyProg?.done ?? 0}/${verifyProg?.total ?? 0}`
                   : selected.size > 0
                     ? `验活(${selected.size})`
                     : serverPaged
@@ -1500,11 +1726,44 @@ export function PoolPage() {
                   size="sm"
                   onClick={() => void verifyBatch('page')}
                   disabled={busy || pageAccounts.length === 0}
-                  title="仅验活当前页"
+                  title="仅验活当前页（分块进度）"
                 >
                   验活本页
                 </Button>
               ) : null}
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() =>
+                  void verifyBatch(selected.size > 0 ? 'page' : 'filter', { recheck: 'unchecked' })
+                }
+                disabled={busy}
+                title="仅验尚未验活的账号（None）"
+              >
+                仅未验{uncheckedCount > 0 ? `(${uncheckedCount})` : ''}
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() =>
+                  void verifyBatch(selected.size > 0 ? 'page' : 'filter', { recheck: 'unknown' })
+                }
+                disabled={busy}
+                title="仅复检验活未知（网络/超时/429 等）"
+              >
+                复检Unkn{unknownOnlyCount > 0 ? `(${unknownOnlyCount})` : ''}
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() =>
+                  void verifyBatch(selected.size > 0 ? 'page' : 'filter', { recheck: 'dead' })
+                }
+                disabled={busy}
+                title="仅复检验活失效（401/403）"
+              >
+                复检Dead{deadOnlyCount > 0 ? `(${deadOnlyCount})` : ''}
+              </Button>
               <Button
                 variant="secondary"
                 size="sm"
