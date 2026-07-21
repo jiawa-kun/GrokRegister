@@ -148,8 +148,16 @@ docker exec $( $ContainerName ) sh -c 'set -e
 '
 rm -f $( $remoteTar )
 $restartBlock
-code=`$(docker exec $( $ContainerName ) node -e "require('http').get('http://127.0.0.1:6657/',r=>{console.log(r.statusCode);process.exit(0)}).on('error',()=>{console.log(0);process.exit(0)})" 2>/dev/null || echo 0)
+# Prefer curl (no JS arrow-fn / quoting pitfalls under bash+ssh)
+code=`$(docker exec $( $ContainerName ) sh -c "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 http://127.0.0.1:6657/ 2>/dev/null || wget -q -O /dev/null --server-response http://127.0.0.1:6657/ 2>&1 | awk '/HTTP\//{print `$2; exit}' || echo 0")
+# normalize empty/non-numeric
+case "`$code" in
+  ''|*[!0-9]*) code=0 ;;
+esac
 echo "health_http=`$code"
+if [ "`$code" != "200" ] && [ "`$code" != "301" ] && [ "`$code" != "302" ] && [ "`$code" != "304" ]; then
+  echo "WARN: health check returned `$code (container may still be starting)"
+fi
 docker ps --filter name=$( $ContainerName ) --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
 echo "HOT_DEPLOY_OK build=$stamp"
 "@

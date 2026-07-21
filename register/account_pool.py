@@ -496,6 +496,7 @@ def query_match(
             "password": rec["password"],
             "sso": rec["sso"],
             "createdAt": rec["createdAt"],
+            "ssoCheck": rec.get("ssoCheck"),
         }
         for rec in (_row_to_record(r) for r in rows)
     ]

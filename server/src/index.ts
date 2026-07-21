@@ -71,6 +71,7 @@ import {
 } from './singboxManager.js';
 import { proxiedRequest, requestWithProxyFallback, errorMessage, isTransportError, looksLikeCloudflareChallenge } from './httpClient.js';
 import { checkSso } from './ssoCheck.js';
+import { mapPoolAdaptive } from './asyncPoolAdaptive.js';
 import {
   authBootstrapInfo,
   changeCredentials,
@@ -968,6 +969,62 @@ app.post('/api/cpa-auth/probe-batch', asyncHandler(async (req: Request, res: Res
   }
 }));
 
+/** 批量 CPA 测活 NDJSON 流：每完成一条推一行 type=item，结束 type=done */
+app.post('/api/cpa-auth/probe-batch-stream', asyncHandler(async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    filenames?: string[];
+    paths?: string[];
+    concurrency?: number;
+    deleteOnDead?: boolean;
+    recoverOnAuthError?: boolean;
+  };
+  res.status(200);
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  // flush headers early if available
+  const resAny = res as Response & { flushHeaders?: () => void };
+  if (typeof resAny.flushHeaders === 'function') resAny.flushHeaders();
+
+  const writeLine = (obj: unknown) => {
+    if (res.writableEnded) return;
+    res.write(JSON.stringify(obj) + '\n');
+  };
+
+  try {
+    const names = Array.isArray(body.filenames) ? body.filenames : [];
+    const paths = Array.isArray(body.paths) ? body.paths : [];
+    const total =
+      names.filter((f) => String(f || '').trim()).length +
+      paths.filter((p) => String(p || '').trim()).length;
+    writeLine({ type: 'start', total });
+
+    const result = await probeCpaAuthBatch({
+      ...body,
+      onItem: (item) => {
+        writeLine({ type: 'item', ...item });
+      }
+    });
+    invalidateAuthIndexCache();
+    invalidateCpaAuthListCache();
+    writeLine({
+      type: 'done',
+      total: result.total,
+      ok: result.ok,
+      failed: result.failed,
+      dead: result.dead,
+      deleted: result.deleted,
+      keep: result.keep,
+      ssoDeleted: result.ssoDeleted
+    });
+    res.end();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    writeLine({ type: 'error', error: message });
+    res.end();
+  }
+}));
+
 /**
  * 手动重登激活：密码登录 → mint 覆盖 → 随机英文消息 → 二次测活。
  * 浏览器登录通常 30～120s，前端勿当「秒失败」。
@@ -1085,10 +1142,15 @@ app.post('/api/sso/check', asyncHandler(async (req: Request, res: Response) => {
     botFlagSource?: number | string | null;
     isBotFlag1?: boolean;
   }> = [];
-  for (let i = 0; i < items.length; i += CONCURRENCY) {
-    const batch = items.slice(i, i + CONCURRENCY) as { id: string; sso: string }[];
-    const settled = await Promise.all(
-      batch.map(async (item) => {
+  type SsoCheckRow = (typeof results)[number];
+  const settled = await mapPoolAdaptive<{ id: string; sso: string }, SsoCheckRow>(
+    items as { id: string; sso: string }[],
+    {
+      concurrency: CONCURRENCY,
+      minConcurrency: 1,
+      rateLimitBackoffMs: 500,
+      isRateLimited: (r) => r.status === 429,
+      worker: async (item) => {
         const outcome = await checkSso(item.sso, {
           proxy,
           timeoutMs,
@@ -1096,10 +1158,10 @@ app.post('/api/sso/check', asyncHandler(async (req: Request, res: Response) => {
           proxyFallback
         });
         return { id: item.id, ...outcome, checkedAt: new Date().toISOString() };
-      })
-    );
-    results.push(...settled);
-  }
+      }
+    }
+  );
+  results.push(...settled);
   // 落盘到号池 accounts.json，跨设备/清浏览器缓存仍可恢复；无邮箱时按验活结果补 email
   let emailsFilled = 0;
   try {

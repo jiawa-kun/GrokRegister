@@ -2035,9 +2035,8 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       running: true
     });
     try {
-      // 小分块：每块结束立刻 merge 行级徽章；深检更小
+      // 优先 NDJSON 流式：每完成一条立刻刷新行徽章；失败则回退分块
       const recoverOnAuthError = opts?.recoverOnAuthError === true;
-      const CHUNK = recoverOnAuthError ? 4 : 6;
       let ok = 0;
       let failed = 0;
       let dead = 0;
@@ -2049,19 +2048,59 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
         return (it?.email || fn).trim() || fn;
       };
       let cancelled = false;
-      for (let i = 0; i < filenames.length; i += CHUNK) {
-        throwIfAborted(signal);
-        const chunk = filenames.slice(i, i + CHUNK);
+      let deletedCount = 0;
+
+      const applyOne = (x: {
+        filename?: string;
+        ok?: boolean;
+        probeAction?: string;
+        probeHttp?: number;
+        probeDeleted?: boolean;
+        email?: string;
+      }) => {
+        if (!x.filename) return;
+        const http = Number(x.probeHttp || 0) || undefined;
+        const row = {
+          action: x.probeAction || (x.ok ? 'ok' : 'error'),
+          http
+        };
+        nextProbe[x.filename] = row;
+        setProbeMap((m) => ({ ...m, [x.filename!]: row }));
+        if (x.probeDeleted) deletedCount += 1;
+        const done = Object.keys(nextProbe).length;
+        const okN = Object.values(nextProbe).filter((v) => v.action === 'ok').length;
+        const deadN = Object.values(nextProbe).filter((v) => v.action === 'dead').length;
         setProg((p) =>
           p
             ? {
                 ...p,
-                current: labelOf(chunk[0]),
-                running: true
+                done,
+                ok: okN,
+                failed: done - okN,
+                dead: deadN,
+                deleted: deletedCount,
+                running: true,
+                current: x.email || labelOf(x.filename!)
               }
             : p
         );
-        try {
+      };
+
+      const recount = () => {
+        ok = Object.values(nextProbe).filter((v) => v.action === 'ok').length;
+        dead = Object.values(nextProbe).filter((v) => v.action === 'dead').length;
+        failed = Object.keys(nextProbe).length - ok;
+        deleted = deletedCount;
+      };
+
+      const runChunked = async (list: string[]) => {
+        const CHUNK = recoverOnAuthError ? 4 : 6;
+        for (let i = 0; i < list.length; i += CHUNK) {
+          throwIfAborted(signal);
+          const chunk = list.slice(i, i + CHUNK);
+          setProg((p) =>
+            p ? { ...p, current: labelOf(chunk[0]), running: true } : p
+          );
           const r = await window.api.probeCpaAuthBatch({
             filenames: chunk,
             concurrency: recoverOnAuthError
@@ -2070,50 +2109,69 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
             deleteOnDead,
             recoverOnAuthError
           });
-          ok += r.ok || 0;
-          failed += r.failed || 0;
-          dead += r.dead || 0;
-          deleted += r.deleted || 0;
           ssoDeleted += r.ssoDeleted || 0;
-          const chunkProbe: Record<string, { action: string; http?: number }> = {};
-          for (const x of r.results) {
-            if (x.filename) {
-              const http = Number(x.probeHttp || 0) || undefined;
-              const row = {
-                action: x.probeAction || (x.ok ? 'ok' : 'error'),
-                http
-              };
-              nextProbe[x.filename] = row;
-              chunkProbe[x.filename] = row;
-            }
-          }
-          // 仅合并本块，行徽章尽快刷新
-          if (Object.keys(chunkProbe).length > 0) {
-            setProbeMap((m) => ({ ...m, ...chunkProbe }));
-          }
-        } catch (err) {
-          if (isAbortError(err) || signal.aborted) {
+          for (const x of r.results) applyOne(x);
+          if (signal.aborted) {
             cancelled = true;
             break;
           }
-          throw err;
         }
-        if (signal.aborted) {
-          cancelled = true;
-          break;
+        recount();
+      };
+
+      const streamFn = window.api.probeCpaAuthBatchStream;
+      if (typeof streamFn === 'function') {
+        try {
+          throwIfAborted(signal);
+          setProg((p) =>
+            p
+              ? { ...p, current: labelOf(filenames[0]), running: true }
+              : p
+          );
+          const r = await streamFn(
+            {
+              filenames,
+              concurrency: recoverOnAuthError
+                ? Math.min(2, filenames.length)
+                : Math.min(6, filenames.length),
+              deleteOnDead,
+              recoverOnAuthError
+            },
+            (item) => {
+              if (!signal.aborted) applyOne(item);
+            }
+          );
+          ssoDeleted = r.ssoDeleted || 0;
+          ok = r.ok || 0;
+          failed = r.failed || 0;
+          dead = r.dead || 0;
+          deleted = r.deleted || 0;
+          deletedCount = deleted;
+          for (const x of r.results || []) {
+            if (!x.filename) continue;
+            const http = Number(x.probeHttp || 0) || undefined;
+            nextProbe[x.filename] = {
+              action: x.probeAction || (x.ok ? 'ok' : 'error'),
+              http
+            };
+          }
+          setProbeMap((m) => ({ ...m, ...nextProbe }));
+        } catch (err) {
+          if (isAbortError(err) || signal.aborted) {
+            cancelled = true;
+            recount();
+          } else {
+            const doneSet = new Set(Object.keys(nextProbe));
+            const remain = filenames.filter((f) => !doneSet.has(f));
+            if (remain.length > 0) await runChunked(remain);
+            else recount();
+          }
         }
-        setProg({
-          kind: 'probe',
-          total: filenames.length,
-          done: Math.min(i + chunk.length, filenames.length),
-          ok,
-          failed,
-          dead,
-          deleted,
-          running: i + chunk.length < filenames.length,
-          current: labelOf(chunk[chunk.length - 1])
-        });
+      } else {
+        await runChunked(filenames);
       }
+
+      if (signal.aborted) cancelled = true;
       if (cancelled || signal.aborted) {
         push({
           tone: 'warn',

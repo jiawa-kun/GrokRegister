@@ -2925,6 +2925,8 @@ export async function probeCpaAuthBatch(input: {
    * true 时走 Python probe_and_cleanup(recover_on_403=true)。
    */
   recoverOnAuthError?: boolean;
+  /** 每完成一条即回调（NDJSON 流式测活） */
+  onItem?: (item: CpaAuthBatchResultItem) => void | Promise<void>;
 }): Promise<{
   total: number;
   ok: number;
@@ -3006,6 +3008,16 @@ print(json.dumps(r, ensure_ascii=False))
 
   const results: CpaAuthBatchResultItem[] = [];
   let idx = 0;
+  const emitItem = async (item: CpaAuthBatchResultItem) => {
+    results.push(item);
+    if (input.onItem) {
+      try {
+        await input.onItem(item);
+      } catch {
+        /* 流写失败不阻断测活 */
+      }
+    }
+  };
 
   async function worker() {
     while (idx < jobs.length) {
@@ -3050,7 +3062,7 @@ print(json.dumps(r, ensure_ascii=False))
           if (!deleted && action && existsSync(resolved)) {
             await persistProbeOnAuthFile(resolved, action, httpStatus);
           }
-          results.push({
+          await emitItem({
             filename: basename(resolved),
             email: String(r.email || emailHint || ''),
             ok: action === 'ok',
@@ -3088,7 +3100,7 @@ print(json.dumps(r, ensure_ascii=False))
         if (!deleted && action && existsSync(resolved)) {
           await persistProbeOnAuthFile(resolved, action, httpStatus);
         }
-        results.push({
+        await emitItem({
           filename: basename(resolved),
           email: String(r.email || emailHint || ''),
           ok: isOk,
@@ -3105,7 +3117,7 @@ print(json.dumps(r, ensure_ascii=False))
           ...(recovered ? { recoverHttp } : {})
         });
       } catch (err) {
-        results.push({
+        await emitItem({
           filename: job.filename || basename(job.path || resolved || ''),
           ok: false,
           mode: 'cpa_probe_error',

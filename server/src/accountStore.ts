@@ -1224,6 +1224,8 @@ export type AccountMatchItem = {
   password: string;
   sso: string;
   createdAt: string;
+  /** 落盘验活快照（导出 CSV 用） */
+  ssoCheck?: import('@shared/runEvents').AccountSsoCheck;
 };
 
 export type AccountMatchResult = {
@@ -1267,12 +1269,17 @@ export async function matchAccounts(opts: AccountMatchQuery = {}): Promise<Accou
               sso: a.sso,
               createdAt: a.createdAt
             });
+            const sc =
+              a.ssoCheck && typeof a.ssoCheck === 'object'
+                ? a.ssoCheck
+                : undefined;
             return {
               id: runtime.id,
               email: runtime.email,
               password: runtime.password,
               sso: runtime.sso,
-              createdAt: runtime.createdAt
+              createdAt: runtime.createdAt,
+              ...(sc ? { ssoCheck: sc } : {})
             };
           }),
           total: sqlMatch.total,
@@ -1308,7 +1315,8 @@ export async function matchAccounts(opts: AccountMatchQuery = {}): Promise<Accou
         email: String(a.email || ''),
         password: String(a.password || ''),
         sso: String(a.sso || ''),
-        createdAt: a.createdAt
+        createdAt: a.createdAt,
+        ...(a.ssoCheck ? { ssoCheck: a.ssoCheck } : {})
       })),
       total,
       returned: slice.length,

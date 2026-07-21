@@ -572,6 +572,20 @@ export interface RendererApi {
     recoverOnAuthError?: boolean;
   }): Promise<CpaAuthBatchResult>;
   /**
+   * 批量 CPA 测活 NDJSON 流：每完成一条 onItem，最终返回汇总。
+   * 不可用时前端可回退 probeCpaAuthBatch。
+   */
+  probeCpaAuthBatchStream?(
+    input: {
+      filenames?: string[];
+      paths?: string[];
+      concurrency?: number;
+      deleteOnDead?: boolean;
+      recoverOnAuthError?: boolean;
+    },
+    onItem: (item: CpaAuthBatchResultItem) => void
+  ): Promise<CpaAuthBatchResult>;
+  /**
    * 密码重登激活：浏览器登录 → mint → 随机英文消息 → 二次测活。
    * 单条通常 30～120s。
    */

@@ -346,6 +346,7 @@ export type SqliteMatchResult = {
     password: string;
     sso: string;
     createdAt: string;
+    ssoCheck?: import('@shared/runEvents').AccountSsoCheck;
   }[];
   total: number;
   returned: number;
@@ -428,12 +429,14 @@ export async function sqliteMatchAccounts(opts: {
     if (!it || typeof it !== 'object') continue;
     const o = it as Record<string, unknown>;
     if (typeof o.id !== 'string') continue;
+    const sc = o.ssoCheck && typeof o.ssoCheck === 'object' ? o.ssoCheck : undefined;
     items.push({
       id: o.id,
       email: String(o.email || ''),
       password: String(o.password || ''),
       sso: String(o.sso || ''),
-      createdAt: String(o.createdAt || '')
+      createdAt: String(o.createdAt || ''),
+      ...(sc ? { ssoCheck: sc as import('@shared/runEvents').AccountSsoCheck } : {})
     });
   }
   return {

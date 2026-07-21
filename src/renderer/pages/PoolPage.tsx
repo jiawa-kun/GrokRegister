@@ -735,6 +735,141 @@ export function PoolPage() {
     }
   };
 
+  /** 导出验活 CSV：email,password,sso,verdict,alive,status,checkedAt,error */
+  const exportSsoCheckCsv = async (scope: 'page' | 'filter' = 'filter') => {
+    try {
+      type Row = {
+        id: string;
+        email: string;
+        password: string;
+        sso: string;
+        ssoCheck?: import('@shared/runEvents').AccountSsoCheck;
+      };
+      let rows: Row[] = [];
+      let note = '';
+      if (selected.size > 0) {
+        rows = accounts
+          .filter((a) => selected.has(a.id))
+          .map((a) => ({
+            id: a.id,
+            email: a.email || '',
+            password: a.password || '',
+            sso: a.sso || '',
+            ssoCheck: a.ssoCheck
+          }));
+        note = '已选';
+      } else {
+        const r = await resolveActionTargets({
+          scope,
+          requireSso: false,
+          limit: 2000
+        });
+        const byId = new Map(accounts.map((a) => [a.id, a]));
+        rows = r.targets.map((t) => {
+          const full = byId.get(t.id);
+          return {
+            id: t.id,
+            email: t.email || full?.email || '',
+            password: t.password || full?.password || '',
+            sso: t.sso || full?.sso || '',
+            ssoCheck: t.ssoCheck || full?.ssoCheck
+          };
+        });
+        note =
+          r.scope === 'filter' ? '筛后全部' : r.scope === 'page' ? '本页' : r.scope;
+        if (r.truncated) {
+          push({
+            tone: 'warn',
+            title: `匹配 ${r.total} 条，本次导出前 ${r.targets.length}`,
+            description: '导出上限 2000'
+          });
+        }
+      }
+      if (rows.length === 0) {
+        push({ tone: 'warn', title: '没有可导出的验活记录' });
+        return;
+      }
+      const esc = (v: unknown) => {
+        const s = v == null ? '' : String(v);
+        if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+        return s;
+      };
+      const header = [
+        'email',
+        'password',
+        'sso',
+        'verdict',
+        'alive',
+        'status',
+        'checkedAt',
+        'error',
+        'botFlagSource',
+        'isBotFlag1'
+      ];
+      const lines = [header.join(',')];
+      let withCheck = 0;
+      for (const row of rows) {
+        const mem = ssoMap.get(row.id);
+        const check = mem
+          ? {
+              alive: mem.alive,
+              status: mem.status,
+              checkedAt: mem.checkedAt,
+              error: mem.error,
+              botFlagSource: mem.botFlagSource,
+              isBotFlag1: mem.isBotFlag1
+            }
+          : row.ssoCheck;
+        const verdict = ssoCheckVerdict(
+          check
+            ? { alive: check.alive, status: Number(check.status || 0) }
+            : null
+        );
+        if (check) withCheck += 1;
+        const aliveStr =
+          check?.alive === true
+            ? 'true'
+            : check?.alive === false
+              ? 'false'
+              : check
+                ? 'null'
+                : '';
+        lines.push(
+          [
+            esc(row.email),
+            esc(row.password),
+            esc(row.sso),
+            esc(verdict),
+            esc(aliveStr),
+            esc(check?.status ?? ''),
+            esc(check?.checkedAt ?? ''),
+            esc(check?.error ?? ''),
+            esc(check?.botFlagSource ?? ''),
+            esc(
+              check?.isBotFlag1 === true
+                ? 'true'
+                : check?.isBotFlag1 === false
+                  ? 'false'
+                  : ''
+            )
+          ].join(',')
+        );
+      }
+      download(`grok-sso-check-${stamp()}.csv`, lines.join('\n'));
+      push({
+        tone: 'ok',
+        title: '已导出验活 CSV',
+        description: `${rows.length} 条（含验活快照 ${withCheck}）${note ? ` · ${note}` : ''}`
+      });
+    } catch (err) {
+      push({
+        tone: 'danger',
+        title: '导出验活失败',
+        description: err instanceof Error ? err.message : String(err)
+      });
+    }
+  };
+
   const applyResults = (results: SsoCheckResult[]) => {
     applySsoResults(results);
   };
@@ -745,6 +880,7 @@ export function PoolPage() {
     password: string;
     sso: string;
     createdAt?: string;
+    ssoCheck?: import('@shared/runEvents').AccountSsoCheck;
   };
 
   const accountHasSso = (a: AccountRecord) =>
@@ -815,7 +951,8 @@ export function PoolPage() {
           email: a.email || '',
           password: a.password || '',
           sso: a.sso || '',
-          createdAt: a.createdAt
+          createdAt: a.createdAt,
+          ssoCheck: a.ssoCheck
         }));
       const targets = await hydrateTargets(list);
       return { targets, scope: 'selected', total: targets.length, truncated: false };
@@ -831,7 +968,8 @@ export function PoolPage() {
           email: a.email || '',
           password: a.password || '',
           sso: a.sso || '',
-          createdAt: a.createdAt
+          createdAt: a.createdAt,
+          ssoCheck: a.ssoCheck
         }));
       const targets = await hydrateTargets(list);
       return { targets, scope: 'page', total: targets.length, truncated: false };
