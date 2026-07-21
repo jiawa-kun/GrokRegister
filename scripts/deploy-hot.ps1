@@ -4,12 +4,14 @@ param(
     [string]$ContainerName = "grok-register-agent",
     [string]$IdentityFile,
     [switch]$RegisterOnly,
+    [switch]$WithRegister,
     [switch]$NoRestart
 )
 
 # Fast deploy: rsync/scp code into running container (no 500MB image upload).
-# - Default: register/ + server dist + web UI (out/renderer)
-# -RegisterOnly: only register/ (Python registration engine)
+# - Default (slim): server dist + web UI only
+# -WithRegister: also pack full register/ (Python engine)
+# -RegisterOnly: only register/ (no npm build)
 # Use full deploy-server.ps1 when Dockerfile/deps/entrypoint change.
 
 $ErrorActionPreference = "Stop"
@@ -75,9 +77,17 @@ try {
 
     Write-Step "pack payload"
     $payloadDir = Join-Path $work "payload"
-    New-Item -ItemType Directory -Force -Path (Join-Path $payloadDir "register") | Out-Null
-    Copy-Item -Path (Join-Path $repoRoot "register\*") -Destination (Join-Path $payloadDir "register") -Recurse -Force
-    Set-Content -LiteralPath (Join-Path $payloadDir "register\BUILD_ID") -Value $stamp -NoNewline
+    New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $payloadDir "BUILD_ID") -Value $stamp -NoNewline
+    $includeRegister = $RegisterOnly -or $WithRegister
+    if ($includeRegister) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $payloadDir "register") | Out-Null
+        Copy-Item -Path (Join-Path $repoRoot "register\*") -Destination (Join-Path $payloadDir "register") -Recurse -Force
+        Set-Content -LiteralPath (Join-Path $payloadDir "register\BUILD_ID") -Value $stamp -NoNewline
+        Write-Host "    include: register/ (Python engine)"
+    } else {
+        Write-Host "    slim: skip register/ (use -WithRegister to include)"
+    }
     if (-not $RegisterOnly) {
         New-Item -ItemType Directory -Force -Path (Join-Path $payloadDir "server\dist") | Out-Null
         New-Item -ItemType Directory -Force -Path (Join-Path $payloadDir "out") | Out-Null
@@ -89,6 +99,7 @@ try {
         }
         Copy-Item -Path (Join-Path $repoRoot "server\dist\*") -Destination (Join-Path $payloadDir "server\dist") -Recurse -Force
         Copy-Item -Path (Join-Path $repoRoot "out\*") -Destination (Join-Path $payloadDir "out") -Recurse -Force
+        Write-Host "    include: server/dist + out/"
     }
 
     $tarPath = Join-Path $work "gra-hot-$stamp.tar.gz"
@@ -143,6 +154,13 @@ docker exec $( $ContainerName ) sh -c 'set -e
   if [ -d gra-hot-extract/out ]; then
     rsync -a --delete gra-hot-extract/out/ /app/out/
   fi
+  if [ -f gra-hot-extract/BUILD_ID ]; then
+    mkdir -p /app/register
+    cp gra-hot-extract/BUILD_ID /app/register/BUILD_ID
+  elif [ -f gra-hot-extract/register/BUILD_ID ]; then
+    mkdir -p /app/register
+    cp gra-hot-extract/register/BUILD_ID /app/register/BUILD_ID
+  fi
   rm -rf /tmp/gra-hot.tar.gz /tmp/gra-hot-extract
   echo BUILD_ID=`$(cat /app/register/BUILD_ID 2>/dev/null || echo missing)
 '
@@ -159,6 +177,7 @@ echo "HOT_DEPLOY_OK build=$stamp"
     Write-Host ""
     Write-Host "Hot deployed build=$stamp"
     Write-Host "Full image deploy still: .\scripts\deploy-server.ps1"
+    Write-Host "Slim default (server+UI). With Python: .\scripts\deploy-hot.ps1 -WithRegister"
     Write-Host "Register only: .\scripts\deploy-hot.ps1 -RegisterOnly"
 }
 finally {

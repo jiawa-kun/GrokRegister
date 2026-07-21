@@ -70,8 +70,7 @@ import {
   syncSingBoxFromSettings
 } from './singboxManager.js';
 import { proxiedRequest, requestWithProxyFallback, errorMessage, isTransportError, looksLikeCloudflareChallenge } from './httpClient.js';
-import { checkSso } from './ssoCheck.js';
-import { mapPoolAdaptive } from './asyncPoolAdaptive.js';
+import { checkSso, runSsoCheckBatch } from './ssoCheck.js';
 import {
   authBootstrapInfo,
   changeCredentials,
@@ -988,7 +987,7 @@ app.post('/api/cpa-auth/probe-batch-stream', asyncHandler(async (req: Request, r
 
   const writeLine = (obj: unknown) => {
     if (res.writableEnded) return;
-    res.write(JSON.stringify(obj) + '\n');
+    res.write(JSON.stringify(obj) + String.fromCharCode(10));
   };
 
   try {
@@ -1102,17 +1101,10 @@ app.get('/api/mail/code', asyncHandler(async (req: Request, res: Response) => {
   res.json(result);
 }));
 
-app.post('/api/sso/check', asyncHandler(async (req: Request, res: Response) => {
-  const items = Array.isArray(req.body?.items) ? req.body.items : [];
-  if (items.length === 0) {
-    res.status(400).json({ error: '缺少待验活的 sso 列表' });
-    return;
-  }
-  const settings = await loadSettings();
-  // 号池验活：受 ssoCheckUseProxy + 总开关控制（原先无条件用 settings.proxy）
+function resolveSsoCheckRuntime(settings: Awaited<ReturnType<typeof loadSettings>>) {
   const proxy = resolveHttpProxy(settings, 'ssoCheck');
   const rawConc = Number(settings.ssoCheckConcurrency);
-  const CONCURRENCY = Math.min(
+  const concurrency = Math.min(
     20,
     Math.max(1, Number.isFinite(rawConc) ? Math.floor(rawConc) : 5)
   );
@@ -1127,42 +1119,18 @@ app.post('/api/sso/check', asyncHandler(async (req: Request, res: Response) => {
     return Math.min(Math.floor(n), 2);
   })();
   const proxyFallback = settings.ssoCheckProxyFallback === true;
-  const results: Array<{
-    id: string;
-    alive: boolean | null;
-    status: number;
-    checkedAt: string;
-    email?: string;
-    givenName?: string;
-    familyName?: string;
-    emailConfirmed?: boolean;
-    sessionTierId?: string;
-    createTime?: string;
-    error?: string;
-    botFlagSource?: number | string | null;
-    isBotFlag1?: boolean;
-  }> = [];
-  type SsoCheckRow = (typeof results)[number];
-  const settled = await mapPoolAdaptive<{ id: string; sso: string }, SsoCheckRow>(
-    items as { id: string; sso: string }[],
-    {
-      concurrency: CONCURRENCY,
-      minConcurrency: 1,
-      rateLimitBackoffMs: 500,
-      isRateLimited: (r) => r.status === 429,
-      worker: async (item) => {
-        const outcome = await checkSso(item.sso, {
-          proxy,
-          timeoutMs,
-          retry,
-          proxyFallback
-        });
-        return { id: item.id, ...outcome, checkedAt: new Date().toISOString() };
-      }
-    }
-  );
-  results.push(...settled);
-  // 落盘到号池 accounts.json，跨设备/清浏览器缓存仍可恢复；无邮箱时按验活结果补 email
+  return { proxy, concurrency, timeoutMs, retry, proxyFallback };
+}
+
+app.post('/api/sso/check', asyncHandler(async (req: Request, res: Response) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (items.length === 0) {
+    res.status(400).json({ error: '缺少待验活的 sso 列表' });
+    return;
+  }
+  const settings = await loadSettings();
+  const rt = resolveSsoCheckRuntime(settings);
+  const results = await runSsoCheckBatch(items as { id: string; sso: string }[], rt);
   let emailsFilled = 0;
   try {
     const persisted = await applyAccountSsoChecks(results);
@@ -1171,6 +1139,63 @@ app.post('/api/sso/check', asyncHandler(async (req: Request, res: Response) => {
     console.warn('[sso/check] persist ssoCheck failed:', err);
   }
   res.json({ results, emailsFilled });
+}));
+
+/** 号池 SSO 验活 NDJSON 流：每完成一条 type=item，结束 type=done */
+app.post('/api/sso/check-stream', asyncHandler(async (req: Request, res: Response) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (items.length === 0) {
+    res.status(400).json({ error: '缺少待验活的 sso 列表' });
+    return;
+  }
+  res.status(200);
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  const resAny = res as Response & { flushHeaders?: () => void };
+  if (typeof resAny.flushHeaders === 'function') resAny.flushHeaders();
+
+  const writeLine = (obj: unknown) => {
+    if (res.writableEnded) return;
+    res.write(JSON.stringify(obj) + String.fromCharCode(10));
+  };
+
+  try {
+    const settings = await loadSettings();
+    const rt = resolveSsoCheckRuntime(settings);
+    writeLine({ type: 'start', total: items.length, concurrency: rt.concurrency });
+    const results = await runSsoCheckBatch(items as { id: string; sso: string }[], {
+      ...rt,
+      onItem: (row) => {
+        writeLine({ type: 'item', ...row });
+      }
+    });
+    let emailsFilled = 0;
+    try {
+      const persisted = await applyAccountSsoChecks(results);
+      emailsFilled = persisted.emailsFilled ?? 0;
+    } catch (err) {
+      console.warn('[sso/check-stream] persist ssoCheck failed:', err);
+    }
+    const alive = results.filter((r) => r.alive === true).length;
+    const dead = results.filter((r) => r.alive === false).length;
+    const unknown = results.filter((r) => r.alive == null).length;
+    const rateLimited = results.filter((r) => r.status === 429).length;
+    writeLine({
+      type: 'done',
+      total: results.length,
+      alive,
+      dead,
+      unknown,
+      rateLimited,
+      emailsFilled
+    });
+    res.end();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    writeLine({ type: 'error', error: message });
+    res.end();
+  }
 }));
 
 app.post('/api/verify-code', asyncHandler(async (req, res) => {

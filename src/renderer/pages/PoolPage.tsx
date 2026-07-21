@@ -38,6 +38,7 @@ import { useSettingsStore } from '@renderer/store/settingsStore';
 import { useRunStore } from '@renderer/store/runStore';
 import { useToastStore } from '@renderer/store/toastStore';
 import { cn } from '@renderer/lib/cn';
+import { setWebApiAbortSignal } from '@renderer/lib/webApi';
 import {
   loadEmailPrivacyMask,
   maskEmail,
@@ -149,8 +150,8 @@ type VerifyProgress = {
   unknown: number;
   current?: string;
   running: boolean;
-  /** all=当前筛选；unchecked/unknown/dead=智能复检 */
-  recheck: 'all' | 'unchecked' | 'unknown' | 'dead';
+  /** all=当前筛选；unchecked/unknown/dead/rate_limit=智能复检 */
+  recheck: 'all' | 'unchecked' | 'unknown' | 'dead' | 'rate_limit';
 };
 
 type VerifyRecheck = VerifyProgress['recheck'];
@@ -566,6 +567,11 @@ export function PoolPage() {
   const aliveOnlyCount = facets.alive;
   const deadOnlyCount = facets.dead;
   const unknownOnlyCount = (facets as { unknown?: number }).unknown ?? 0;
+  const rateLimitedOnlyCount = accounts.filter((a) => {
+    const r = ssoMap.get(a.id);
+    const st = r ? Number(r.status) : Number(a.ssoCheck?.status || 0);
+    return st === 429;
+  }).length;
 
   // 始终服务端分页（Auth 也已服务端筛选）
   const serverPaged = !fullListMode;
@@ -1054,11 +1060,17 @@ export function PoolPage() {
     return ssoCheckVerdict(acc?.ssoCheck);
   };
 
+  const isRateLimitedAccount = (row: { id: string }) => {
+    const fromMap = ssoMap.get(row.id);
+    if (fromMap) return Number(fromMap.status) === 429;
+    const acc = accounts.find((a) => a.id === row.id);
+    return Number(acc?.ssoCheck?.status || 0) === 429;
+  };
+
   const verifyBatch = async (
     scope: 'page' | 'filter' = 'filter',
     opts?: { recheck?: VerifyRecheck }
   ) => {
-    // 进行中再点主按钮 = 取消
     if (verifying) {
       cancelVerify();
       return;
@@ -1067,6 +1079,7 @@ export function PoolPage() {
     const recheck: VerifyRecheck = opts?.recheck || 'all';
     const ac = new AbortController();
     verifyAbortRef.current = ac;
+    setWebApiAbortSignal(ac.signal);
     setVerifying(true);
     setVerifyProg({
       total: 0,
@@ -1079,16 +1092,24 @@ export function PoolPage() {
     });
 
     try {
+      const aliveOverride =
+        recheck === 'all'
+          ? undefined
+          : recheck === 'rate_limit'
+            ? 'unknown'
+            : recheck;
+
       const { targets, truncated, total, scope: used } = await resolveActionTargets({
         scope: selected.size > 0 ? 'page' : scope,
         requireSso: true,
         limit: 500,
-        aliveOverride: recheck === 'all' ? undefined : recheck
+        aliveOverride
       });
 
       let list = targets;
-      // 已选 / 本页 / 本地列表：客户端按 recheck 再筛
-      if (
+      if (recheck === 'rate_limit') {
+        list = targets.filter((a) => isRateLimitedAccount(a));
+      } else if (
         recheck !== 'all' &&
         (selected.size > 0 || used === 'page' || used === 'selected' || used === 'local')
       ) {
@@ -1103,7 +1124,9 @@ export function PoolPage() {
               ? '没有验活未知的账号'
               : recheck === 'dead'
                 ? '没有验活失效的账号'
-                : '没有可验活的账号';
+                : recheck === 'rate_limit'
+                  ? '没有 HTTP 429 限流账号'
+                  : '没有可验活的账号';
         push({ tone: 'warn', title: tip });
         setVerifyProg(null);
         return;
@@ -1135,67 +1158,99 @@ export function PoolPage() {
       let cancelled = false;
       const allResults: SsoCheckResult[] = [];
 
-      for (let i = 0; i < list.length; i += VERIFY_CHUNK) {
-        if (ac.signal.aborted) {
-          cancelled = true;
-          break;
-        }
-        const chunk = list.slice(i, i + VERIFY_CHUNK);
-        setVerifyProg((p) =>
-          p
-            ? {
-                ...p,
-                current: chunk[0]?.email || chunk[0]?.id,
-                running: true
-              }
-            : p
-        );
-        try {
+      const recountFrom = (rows: SsoCheckResult[]) => {
+        alive = rows.filter((r) => r.alive === true).length;
+        deadN = rows.filter((r) => r.alive === false).length;
+        unknownN = rows.filter((r) => r.alive == null).length;
+      };
+
+      const labelOf = (id: string, email?: string) =>
+        (email || list.find((x) => x.id === id)?.email || id).trim() || id;
+
+      const runChunked = async () => {
+        for (let i = 0; i < list.length; i += VERIFY_CHUNK) {
+          if (ac.signal.aborted) {
+            cancelled = true;
+            break;
+          }
+          const chunk = list.slice(i, i + VERIFY_CHUNK);
+          setVerifyProg((p) =>
+            p
+              ? {
+                  ...p,
+                  current: chunk[0]?.email || chunk[0]?.id,
+                  running: true
+                }
+              : p
+          );
           const results = await window.api.checkSso(
             chunk.map((a) => ({ id: a.id, sso: a.sso }))
           );
           applyResults(results);
           allResults.push(...results);
-          for (const r of results) {
-            if (r.alive === true) alive++;
-            else if (r.alive === false) deadN++;
-            else unknownN++;
-          }
+          recountFrom(allResults);
           const filled =
             typeof (results as { emailsFilled?: number }).emailsFilled === 'number'
               ? (results as { emailsFilled?: number }).emailsFilled!
-              : results.filter((r) => {
-                  const before = chunk.find((x) => x.id === r.id);
-                  return (
-                    before &&
-                    !String(before.email || '').trim() &&
-                    Boolean(String(r.email || '').trim())
-                  );
-                }).length;
+              : 0;
           emailsFilled += filled;
-        } catch (err) {
+          const done = Math.min(i + chunk.length, list.length);
+          setVerifyProg({
+            total: list.length,
+            done,
+            alive,
+            dead: deadN,
+            unknown: unknownN,
+            running: done < list.length && !ac.signal.aborted,
+            recheck,
+            current: chunk[chunk.length - 1]?.email || chunk[chunk.length - 1]?.id
+          });
           if (ac.signal.aborted) {
             cancelled = true;
             break;
           }
-          throw err;
         }
+      };
 
-        const done = Math.min(i + chunk.length, list.length);
-        setVerifyProg({
-          total: list.length,
-          done,
-          alive,
-          dead: deadN,
-          unknown: unknownN,
-          running: done < list.length && !ac.signal.aborted,
-          recheck,
-          current: chunk[chunk.length - 1]?.email || chunk[chunk.length - 1]?.id
-        });
-        if (ac.signal.aborted) {
-          cancelled = true;
-          break;
+      const streamFn = window.api.checkSsoStream;
+      if (typeof streamFn === 'function') {
+        try {
+          const results = await streamFn(
+            list.map((a) => ({ id: a.id, sso: a.sso })),
+            (r) => {
+              if (ac.signal.aborted) return;
+              applyResults([r]);
+              allResults.push(r);
+              recountFrom(allResults);
+              setVerifyProg({
+                total: list.length,
+                done: allResults.length,
+                alive,
+                dead: deadN,
+                unknown: unknownN,
+                running: allResults.length < list.length && !ac.signal.aborted,
+                recheck,
+                current: labelOf(r.id, r.email)
+              });
+            }
+          );
+          if (ac.signal.aborted) cancelled = true;
+          emailsFilled =
+            typeof (results as { emailsFilled?: number }).emailsFilled === 'number'
+              ? (results as { emailsFilled?: number }).emailsFilled!
+              : 0;
+          if (Array.isArray(results) && results.length > 0) {
+            allResults.length = 0;
+            allResults.push(...results);
+            applyResults(results);
+            recountFrom(allResults);
+          }
+        } catch (err) {
+          if (ac.signal.aborted) cancelled = true;
+          else await runChunked();
         }
+      } else {
+        await runChunked();
       }
 
       try {
@@ -1214,7 +1269,13 @@ export function PoolPage() {
             ? ' · 无邮箱号未补全（验活未返回 email 或已失效）'
             : '';
       const scopeHint =
-        used === 'filter' ? ' · 筛后全部' : used === 'page' ? ' · 本页' : used === 'selected' ? ' · 已选' : '';
+        used === 'filter'
+          ? ' · 筛后全部'
+          : used === 'page'
+            ? ' · 本页'
+            : used === 'selected'
+              ? ' · 已选'
+              : '';
       const recheckHint =
         recheck === 'unchecked'
           ? ' · 仅未验'
@@ -1222,7 +1283,9 @@ export function PoolPage() {
             ? ' · 仅未知'
             : recheck === 'dead'
               ? ' · 仅失效'
-              : '';
+              : recheck === 'rate_limit'
+                ? ' · 仅 429 限流'
+                : '';
 
       if (cancelled) {
         push({
@@ -1252,10 +1315,12 @@ export function PoolPage() {
       push({ tone: 'danger', title: '批量验活失败', description: String(err) });
       setVerifyProg(null);
     } finally {
+      setWebApiAbortSignal(null);
       setVerifying(false);
       verifyAbortRef.current = null;
     }
   };
+
   const deleteSelected = async () => {
     const ids = [...selected];
     if (ids.length === 0) {
@@ -1611,7 +1676,9 @@ export function PoolPage() {
                   ? ' · 仅未验'
                   : verifyProg.recheck === 'unknown'
                     ? ' · 仅未知'
-                    : verifyProg.recheck === 'dead'
+                    : verifyProg.recheck === 'rate_limit'
+                      ? ' · 仅 429'
+                      : verifyProg.recheck === 'dead'
                       ? ' · 仅失效'
                       : ''}
               </p>
@@ -1623,7 +1690,7 @@ export function PoolPage() {
             </div>
             <div className="flex items-center gap-2">
               {verifyProg.running ? (
-                <Button size="sm" variant="secondary" onClick={cancelVerify} title="取消剩余分块">
+                <Button size="sm" variant="secondary" onClick={cancelVerify} title="取消剩余验活">
                   取消
                 </Button>
               ) : null}
@@ -1890,6 +1957,19 @@ export function PoolPage() {
                 title="仅复检验活未知（网络/超时/429 等）"
               >
                 复检Unkn{unknownOnlyCount > 0 ? `(${unknownOnlyCount})` : ''}
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={busy && !verifying}
+                onClick={() =>
+                  void verifyBatch(selected.size > 0 ? 'page' : 'filter', {
+                    recheck: 'rate_limit'
+                  })
+                }
+                title="仅复检 HTTP 429 限流账号（从未知里筛 status=429）"
+              >
+                仅429{rateLimitedOnlyCount > 0 ? `(${rateLimitedOnlyCount})` : ''}
               </Button>
               <Button
                 variant="secondary"

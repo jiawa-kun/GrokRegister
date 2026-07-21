@@ -219,9 +219,87 @@ const webApi: RendererApi = {
       emailsFilled?: number;
     }>('POST', '/api/sso/check', { items });
     const list = r.results || [];
-    // 把 emailsFilled 挂到数组上，便于 toast（不破坏 map/filter）
     Object.defineProperty(list, 'emailsFilled', {
       value: r.emailsFilled ?? 0,
+      enumerable: false,
+      writable: false
+    });
+    return list as typeof list & { emailsFilled?: number };
+  },
+  checkSsoStream: async (items, onItem) => {
+    const signal =
+      activeAbortSignal && !activeAbortSignal.aborted ? activeAbortSignal : undefined;
+    const res = await fetch('/api/sso/check-stream', {
+      method: 'POST',
+      credentials: 'include',
+      headers: buildHeaders({ items }),
+      body: JSON.stringify({ items }),
+      signal
+    });
+    if (!res.ok) {
+      let detail = '';
+      try {
+        detail = await res.text();
+      } catch {
+        /* ignore */
+      }
+      if (detail.length > 240 || /<!DOCTYPE html/i.test(detail)) {
+        detail = detail.replace(/\s+/g, ' ').slice(0, 180) + '…';
+      }
+      throw new Error(
+        `POST /api/sso/check-stream → HTTP ${res.status}: ${detail}`
+      );
+    }
+    if (!res.body) {
+      const r = await http<{
+        results: import('@shared/ipc').SsoCheckResult[];
+        emailsFilled?: number;
+      }>('POST', '/api/sso/check', { items });
+      const list = r.results || [];
+      for (const it of list) onItem(it);
+      Object.defineProperty(list, 'emailsFilled', {
+        value: r.emailsFilled ?? 0,
+        enumerable: false,
+        writable: false
+      });
+      return list as typeof list & { emailsFilled?: number };
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    const list: import('@shared/ipc').SsoCheckResult[] = [];
+    let emailsFilled = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split('\n');
+      buf = parts.pop() || '';
+      for (const line of parts) {
+        const t = line.trim();
+        if (!t) continue;
+        let msg: Record<string, unknown>;
+        try {
+          msg = JSON.parse(t) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        if (msg.type === 'item') {
+          const item = { ...msg } as unknown as import('@shared/ipc').SsoCheckResult & {
+            type?: string;
+          };
+          delete (item as { type?: string }).type;
+          list.push(item);
+          onItem(item);
+        } else if (msg.type === 'done') {
+          emailsFilled = Number(msg.emailsFilled) || 0;
+        } else if (msg.type === 'error') {
+          throw new Error(String(msg.error || 'SSO 验活流失败'));
+        }
+      }
+    }
+    Object.defineProperty(list, 'emailsFilled', {
+      value: emailsFilled,
       enumerable: false,
       writable: false
     });

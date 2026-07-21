@@ -487,6 +487,14 @@ export interface RendererApi {
    * 返回 results；emailsFilled 为本次补全邮箱条数。
    */
   checkSso(items: SsoCheckItem[]): Promise<SsoCheckResult[] & { emailsFilled?: number }>;
+  /**
+   * SSO 验活 NDJSON 流：每完成一条 onItem，结束返回汇总。
+   * 不可用时前端可回退 checkSso。
+   */
+  checkSsoStream?(
+    items: SsoCheckItem[],
+    onItem: (item: SsoCheckResult) => void
+  ): Promise<SsoCheckResult[] & { emailsFilled?: number }>;
 
   // CPA auth（与登录 /api/auth 区分）
   listCpaAuth(): Promise<CpaAuthListResult>;

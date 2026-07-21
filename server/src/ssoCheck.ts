@@ -9,6 +9,7 @@
  */
 import { proxiedRequest } from './httpClient.js';
 import { readBotFlagFromToken } from './jwtBotFlag.js';
+import { mapPoolAdaptive } from './asyncPoolAdaptive.js';
 
 const GET_USER_URL = 'https://grok.com/rest/auth/get-user';
 const UA =
@@ -205,4 +206,50 @@ export async function checkSso(
   }
 
   return last;
+}
+
+/**
+ * 批量 SSO 验活（自适应并发）。可选 onItem 流式回调。
+ */
+export async function runSsoCheckBatch(
+  items: { id: string; sso: string }[],
+  opts: {
+    proxy?: string;
+    timeoutMs?: number;
+    retry?: number;
+    proxyFallback?: boolean;
+    concurrency?: number;
+    onItem?: (row: SsoCheckOutcome & { id: string; checkedAt: string }) => void | Promise<void>;
+  } = {}
+): Promise<Array<SsoCheckOutcome & { id: string; checkedAt: string }>> {
+  type Row = SsoCheckOutcome & { id: string; checkedAt: string };
+  const concurrency = Math.min(
+    20,
+    Math.max(1, Number.isFinite(Number(opts.concurrency)) ? Math.floor(Number(opts.concurrency)) : 5)
+  );
+  const timeoutMs = opts.timeoutMs;
+  const retry = opts.retry;
+  const proxy = opts.proxy;
+  const proxyFallback = opts.proxyFallback === true;
+
+  return mapPoolAdaptive<{ id: string; sso: string }, Row>(items, {
+    concurrency,
+    minConcurrency: 1,
+    rateLimitBackoffMs: 500,
+    isRateLimited: (r) => r.status === 429,
+    worker: async (item) => {
+      const outcome = await checkSso(item.sso, {
+        proxy,
+        timeoutMs,
+        retry,
+        proxyFallback
+      });
+      return { id: item.id, ...outcome, checkedAt: new Date().toISOString() };
+    },
+    onResult: opts.onItem
+      ? async (row) => {
+          await opts.onItem!(row);
+        }
+      : undefined
+  });
 }
