@@ -2510,8 +2510,8 @@ export async function mintCpaAuthFromSso(input: {
   await fsp.mkdir(dir, { recursive: true });
   const runtime = resolveRegisterRuntime(settings);
   if (!runtime) throw new Error('未找到注册脚本目录，无法调用 Python mint');
-  // mint 后 probe 死号是否删文件：跟随设置（默认 true）
-  const deleteOnDead = settings.cpaProbeDeleteOnDead !== false;
+  // mint 后 probe 死号是否删文件：仅当设置显式开启（默认 false，与测活路径一致）
+  const deleteOnDead = settings.cpaProbeDeleteOnDead === true;
 
   // 预检 + mint 合并为一次 Python 调用（check_sso_ban / sso2gropcpa 思路）
   // SSO→CPA mint 路径：pkce | device | auto（来自设置）

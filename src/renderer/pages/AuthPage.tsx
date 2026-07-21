@@ -2035,25 +2035,38 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       running: true
     });
     try {
-      const CHUNK = 12;
+      // 小分块：每块结束立刻 merge 行级徽章；深检更小
+      const recoverOnAuthError = opts?.recoverOnAuthError === true;
+      const CHUNK = recoverOnAuthError ? 4 : 6;
       let ok = 0;
       let failed = 0;
       let dead = 0;
       let deleted = 0;
       let ssoDeleted = 0;
       const nextProbe: Record<string, { action: string; http?: number }> = {};
+      const labelOf = (fn: string) => {
+        const it = items.find((x) => x.filename === fn);
+        return (it?.email || fn).trim() || fn;
+      };
       let cancelled = false;
       for (let i = 0; i < filenames.length; i += CHUNK) {
         throwIfAborted(signal);
         const chunk = filenames.slice(i, i + CHUNK);
-        setProg((p) => (p ? { ...p, current: chunk[0], running: true } : p));
+        setProg((p) =>
+          p
+            ? {
+                ...p,
+                current: labelOf(chunk[0]),
+                running: true
+              }
+            : p
+        );
         try {
-          const recoverOnAuthError = opts?.recoverOnAuthError === true;
           const r = await window.api.probeCpaAuthBatch({
             filenames: chunk,
             concurrency: recoverOnAuthError
               ? Math.min(2, chunk.length)
-              : Math.min(8, chunk.length),
+              : Math.min(6, chunk.length),
             deleteOnDead,
             recoverOnAuthError
           });
@@ -2062,16 +2075,22 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
           dead += r.dead || 0;
           deleted += r.deleted || 0;
           ssoDeleted += r.ssoDeleted || 0;
+          const chunkProbe: Record<string, { action: string; http?: number }> = {};
           for (const x of r.results) {
             if (x.filename) {
               const http = Number(x.probeHttp || 0) || undefined;
-              nextProbe[x.filename] = {
+              const row = {
                 action: x.probeAction || (x.ok ? 'ok' : 'error'),
                 http
               };
+              nextProbe[x.filename] = row;
+              chunkProbe[x.filename] = row;
             }
           }
-          setProbeMap((m) => ({ ...m, ...nextProbe }));
+          // 仅合并本块，行徽章尽快刷新
+          if (Object.keys(chunkProbe).length > 0) {
+            setProbeMap((m) => ({ ...m, ...chunkProbe }));
+          }
         } catch (err) {
           if (isAbortError(err) || signal.aborted) {
             cancelled = true;
@@ -2092,7 +2111,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
           dead,
           deleted,
           running: i + chunk.length < filenames.length,
-          current: chunk[chunk.length - 1]
+          current: labelOf(chunk[chunk.length - 1])
         });
       }
       if (cancelled || signal.aborted) {
@@ -3044,7 +3063,13 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                         : hasActiveFilter
                           ? `测活筛选 ${filteredTotalCount} 条`
                           : '测活全部') +
-                      (deleteOnDead ? ' · 401/402/403 将删除' : ' · 死号仅标记不删') + ' · 快扫不重登'
+                      ' · 快扫：只调 CPA 探测，不密码重登' +
+                      (deleteOnDead
+                        ? ' · 401/402/403 将删 Auth'
+                        : ' · 死号仅标记不删') +
+                      (settings?.autoResignOn401
+                        ? ' · 401 后可自动重签'
+                        : '')
                 }
               >
                 {batchBusy === 'probe' ? (
@@ -3066,7 +3091,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 title={
                   batchBusy === 'probe'
                     ? '取消深检批量任务'
-                    : '深检：401/403 可密码重登（慢，并发低）'
+                    : '深检 = 测活 + 遇 401/403 自动密码恢复（慢，并发低）；与「密码重登」全量手动恢复不同'
                 }
               >
                 {batchBusy === 'probe' ? (
@@ -3091,7 +3116,8 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                         ? `密码重登已选 ${selected.size} 条`
                         : hasActiveFilter
                           ? `密码重登筛选 ${filteredTotalCount} 条`
-                          : '批量密码重登') + ' · 串行并发 1（浏览器登录）'
+                          : '批量密码重登') +
+                      ' · 手动全量：密码登录→mint→激活消息→再测活 · 串行并发 1'
                 }
               >
                 {batchBusy === 'relogin' ? (

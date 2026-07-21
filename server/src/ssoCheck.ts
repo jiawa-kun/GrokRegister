@@ -4,6 +4,8 @@
  * - 401/403 = 失效
  * - 网络/超时/429/其它 HTTP = 未知（alive=null，不写死号）
  * 额外解码 JWT 中的 bot_flag_source（只读）。
+ *
+ * 可选：429/5xx/网络重试；代理失败后降级直连。
  */
 import { proxiedRequest } from './httpClient.js';
 import { readBotFlagFromToken } from './jwtBotFlag.js';
@@ -12,8 +14,8 @@ const GET_USER_URL = 'https://grok.com/rest/auth/get-user';
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-/** 验活请求超时（秒级；避免大批量长时间挂起） */
-const SSO_CHECK_TIMEOUT_MS = 12_000;
+/** 默认验活超时（毫秒） */
+const DEFAULT_TIMEOUT_MS = 12_000;
 
 export interface SsoCheckOutcome {
   /**
@@ -34,12 +36,56 @@ export interface SsoCheckOutcome {
   isBotFlag1?: boolean;
 }
 
-export async function checkSso(sso: string, proxy?: string): Promise<SsoCheckOutcome> {
-  const token = (sso || '').replace(/^sso=/, '').trim();
-  if (!token) return { alive: false, status: 0, error: '缺少 sso token' };
+export interface CheckSsoOptions {
+  /** HTTP 代理 URL；空则直连 */
+  proxy?: string;
+  /** 单次请求超时毫秒，默认 12000 */
+  timeoutMs?: number;
+  /**
+   * 对 429 / 5xx / 网络错误的额外重试次数（0～2）。
+   * 401/403/200 不重试。
+   */
+  retry?: number;
+  /**
+   * 代理请求后仍为「可重试未知」时，再试一次直连。
+   * 仅当 proxy 非空时生效。
+   */
+  proxyFallback?: boolean;
+}
 
-  const flag = readBotFlagFromToken(token);
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
+function clampRetry(n: unknown): number {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v < 0) return 0;
+  return Math.min(Math.floor(v), 2);
+}
+
+function clampTimeout(n: unknown): number {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v < 5000) return DEFAULT_TIMEOUT_MS;
+  return Math.min(Math.floor(v), 60_000);
+}
+
+/** 429 / 5xx / 网络(status=0) 可重试；确定存活/失效不重试 */
+function isRetryableOutcome(o: SsoCheckOutcome): boolean {
+  if (o.alive === true || o.alive === false) return false;
+  if (o.status === 0) return true;
+  if (o.status === 429) return true;
+  if (o.status >= 500) return true;
+  return false;
+}
+
+type BotFlag = ReturnType<typeof readBotFlagFromToken>;
+
+async function checkSsoOnce(
+  token: string,
+  flag: BotFlag,
+  proxy: string | undefined,
+  timeoutMs: number
+): Promise<SsoCheckOutcome> {
   try {
     const res = await proxiedRequest(GET_USER_URL, {
       headers: {
@@ -48,7 +94,7 @@ export async function checkSso(sso: string, proxy?: string): Promise<SsoCheckOut
         Accept: 'application/json'
       },
       proxy,
-      timeoutMs: SSO_CHECK_TIMEOUT_MS
+      timeoutMs
     });
 
     if (res.status === 200) {
@@ -103,4 +149,60 @@ export async function checkSso(sso: string, proxy?: string): Promise<SsoCheckOut
       isBotFlag1: flag.isBotFlag1
     };
   }
+}
+
+/**
+ * @param sso sso cookie 值（可带 sso= 前缀）
+ * @param opts 超时 / 重试 / 代理 / 代理失败降级直连
+ */
+export async function checkSso(
+  sso: string,
+  opts?: CheckSsoOptions | string
+): Promise<SsoCheckOutcome> {
+  // 兼容旧调用 checkSso(sso, proxyString)
+  const options: CheckSsoOptions =
+    typeof opts === 'string' ? { proxy: opts } : opts || {};
+
+  const token = (sso || '').replace(/^sso=/, '').trim();
+  if (!token) return { alive: false, status: 0, error: '缺少 sso token' };
+
+  const flag = readBotFlagFromToken(token);
+  const timeoutMs = clampTimeout(options.timeoutMs);
+  const retry = clampRetry(options.retry);
+  const proxy = String(options.proxy || '').trim() || undefined;
+  const proxyFallback = options.proxyFallback === true && Boolean(proxy);
+
+  let last = await checkSsoOnce(token, flag, proxy, timeoutMs);
+
+  for (let i = 0; i < retry && isRetryableOutcome(last); i++) {
+    const waitMs = 400 * (i + 1) + Math.floor(Math.random() * 200);
+    await sleep(waitMs);
+    last = await checkSsoOnce(token, flag, proxy, timeoutMs);
+  }
+
+  if (proxyFallback && isRetryableOutcome(last)) {
+    const viaProxy = last;
+    const direct = await checkSsoOnce(token, flag, undefined, timeoutMs);
+    if (direct.alive !== null) {
+      return {
+        ...direct,
+        error: direct.error
+          ? `${direct.error}（代理失败后直连）`
+          : viaProxy.error
+            ? `代理：${viaProxy.error}；已直连确认`
+            : undefined
+      };
+    }
+    // 直连仍未知：合并错误信息
+    const parts = [
+      viaProxy.error ? `代理：${viaProxy.error}` : null,
+      direct.error ? `直连：${direct.error}` : null
+    ].filter(Boolean);
+    return {
+      ...direct,
+      error: parts.length > 0 ? parts.join('；') : '代理与直连均未知'
+    };
+  }
+
+  return last;
 }

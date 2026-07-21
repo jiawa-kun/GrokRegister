@@ -464,6 +464,25 @@ function merge(partial: unknown): AppSettings {
       (p as AppSettings).ssoCheckUseProxy,
       DEFAULT_SETTINGS.ssoCheckUseProxy
     ),
+    ssoCheckConcurrency: (() => {
+      const n = Number((p as AppSettings).ssoCheckConcurrency);
+      if (!Number.isFinite(n) || n < 1) return DEFAULT_SETTINGS.ssoCheckConcurrency;
+      return Math.min(Math.floor(n), 20);
+    })(),
+    ssoCheckTimeoutMs: (() => {
+      const n = Number((p as AppSettings).ssoCheckTimeoutMs);
+      if (!Number.isFinite(n) || n < 5000) return DEFAULT_SETTINGS.ssoCheckTimeoutMs;
+      return Math.min(Math.floor(n), 60_000);
+    })(),
+    ssoCheckRetry: (() => {
+      const n = Number((p as AppSettings).ssoCheckRetry);
+      if (!Number.isFinite(n) || n < 0) return DEFAULT_SETTINGS.ssoCheckRetry;
+      return Math.min(Math.floor(n), 2);
+    })(),
+    ssoCheckProxyFallback: asBool(
+      (p as AppSettings).ssoCheckProxyFallback,
+      DEFAULT_SETTINGS.ssoCheckProxyFallback
+    ),
     autoSsoCheckOnRegister: asBool(
       (p as AppSettings).autoSsoCheckOnRegister,
       DEFAULT_SETTINGS.autoSsoCheckOnRegister

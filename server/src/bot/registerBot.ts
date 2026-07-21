@@ -1209,15 +1209,30 @@ export class RegisterBot extends EventEmitter {
       const sso = String(record.sso || '').trim();
       if (!sso) return;
       const proxy = resolveHttpProxy(settings, 'ssoCheck');
+      const ssoOpts = {
+        proxy,
+        timeoutMs: (() => {
+          const n = Number(settings.ssoCheckTimeoutMs);
+          if (!Number.isFinite(n) || n < 5000) return 12_000;
+          return Math.min(Math.floor(n), 60_000);
+        })(),
+        retry: (() => {
+          const n = Number(settings.ssoCheckRetry);
+          if (!Number.isFinite(n) || n < 0) return 1;
+          return Math.min(Math.floor(n), 2);
+        })(),
+        proxyFallback: settings.ssoCheckProxyFallback === true
+      };
       this.log(
         runId,
         `[sso-check] 自动验活… email=${record.email || '-'} id=${String(stableId).slice(0, 8)}…` +
-          (proxy ? ` proxy=on` : ` proxy=direct`)
+          (proxy ? ` proxy=on` : ` proxy=direct`) +
+          (ssoOpts.proxyFallback ? ' fallback=direct' : '')
       );
-      // 新 SSO 刚 materialize 时 grok get-user 偶发 403；短延迟 + 重试
+      // 新 SSO 刚 materialize 时 grok get-user 偶发 403；短延迟 + 业务重试
       const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
       await sleep(2500);
-      let outcome = await checkSso(sso, proxy);
+      let outcome = await checkSso(sso, ssoOpts);
       for (let attempt = 1; attempt <= 2; attempt++) {
         if (outcome.alive) break;
         if (outcome.status !== 403 && outcome.status !== 0 && outcome.status !== 401) break;
@@ -1227,7 +1242,7 @@ export class RegisterBot extends EventEmitter {
           `[sso-check] status=${outcome.status} 未存活，${waitMs}ms 后重试 (${attempt}/2)…`
         );
         await sleep(waitMs);
-        outcome = await checkSso(sso, proxy);
+        outcome = await checkSso(sso, ssoOpts);
       }
       const checkedAt = new Date().toISOString();
       const applied = await applyAccountSsoChecks([

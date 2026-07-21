@@ -300,7 +300,27 @@ export interface AppSettings {
    */
   ssoCheckUseProxy: boolean;
   /**
-   * 注册成功写入号池后自动验活 SSO（写 ssoCheck 存活/失效）。
+   * 号池 SSO 验活并发（服务端 /api/sso/check）。
+   * 默认 5，范围 1～20。
+   */
+  ssoCheckConcurrency: number;
+  /**
+   * 单次 SSO 验活 HTTP 超时（毫秒）。
+   * 默认 12000，范围 5000～60000。
+   */
+  ssoCheckTimeoutMs: number;
+  /**
+   * SSO 验活对 429/5xx/网络错误的额外重试次数。
+   * 默认 1，范围 0～2；401/403 不重试。
+   */
+  ssoCheckRetry: number;
+  /**
+   * SSO 验活代理传输失败/仍未知时是否再试直连。
+   * 默认 false；需 ssoCheckUseProxy 且实际走了代理才生效。
+   */
+  ssoCheckProxyFallback: boolean;
+  /**
+   * 注册成功写入号池后自动验活 SSO（写 ssoCheck 存活/失效/未知）。
    * 默认 true；关闭则仍须在 SSO 页手动验活。
    */
   autoSsoCheckOnRegister: boolean;
@@ -430,6 +450,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   skipBotFlag1OnMint: true,
   /** 号池验活默认走代理（若总开关与 proxy 已配） */
   ssoCheckUseProxy: true,
+  ssoCheckConcurrency: 5,
+  ssoCheckTimeoutMs: 12_000,
+  ssoCheckRetry: 1,
+  ssoCheckProxyFallback: false,
   /** 注册成功后自动号池 SSO 验活 */
   autoSsoCheckOnRegister: true,
   /** Auth mint/重签/测活默认走代理 */
@@ -1309,6 +1333,24 @@ export function validateSettings(s: AppSettings): Record<string, string> {
       probeConc > 20
     ) {
       errors.proxyProbeConcurrency = '测活并发须在 1 到 20 之间';
+    }
+    {
+      const n = Number(s.ssoCheckConcurrency);
+      if (!Number.isInteger(n) || n < 1 || n > 20) {
+        errors.ssoCheckConcurrency = 'SSO 验活并发须在 1 到 20 之间';
+      }
+    }
+    {
+      const n = Number(s.ssoCheckTimeoutMs);
+      if (!Number.isInteger(n) || n < 5000 || n > 60000) {
+        errors.ssoCheckTimeoutMs = 'SSO 验活超时须在 5000～60000 毫秒';
+      }
+    }
+    {
+      const n = Number(s.ssoCheckRetry);
+      if (!Number.isInteger(n) || n < 0 || n > 2) {
+        errors.ssoCheckRetry = 'SSO 验活重试须在 0 到 2 之间';
+      }
     }
     // sing-box 允许空节点列表保存（可先开模式再填订阅/节点）
   } catch (err) {

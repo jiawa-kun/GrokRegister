@@ -1054,9 +1054,22 @@ app.post('/api/sso/check', asyncHandler(async (req: Request, res: Response) => {
   const settings = await loadSettings();
   // 号池验活：受 ssoCheckUseProxy + 总开关控制（原先无条件用 settings.proxy）
   const proxy = resolveHttpProxy(settings, 'ssoCheck');
-
-  // 限并发 5，避免对 grok 发起过多并发请求
-  const CONCURRENCY = 5;
+  const rawConc = Number(settings.ssoCheckConcurrency);
+  const CONCURRENCY = Math.min(
+    20,
+    Math.max(1, Number.isFinite(rawConc) ? Math.floor(rawConc) : 5)
+  );
+  const timeoutMs = (() => {
+    const n = Number(settings.ssoCheckTimeoutMs);
+    if (!Number.isFinite(n) || n < 5000) return 12_000;
+    return Math.min(Math.floor(n), 60_000);
+  })();
+  const retry = (() => {
+    const n = Number(settings.ssoCheckRetry);
+    if (!Number.isFinite(n) || n < 0) return 1;
+    return Math.min(Math.floor(n), 2);
+  })();
+  const proxyFallback = settings.ssoCheckProxyFallback === true;
   const results: Array<{
     id: string;
     alive: boolean | null;
@@ -1076,7 +1089,12 @@ app.post('/api/sso/check', asyncHandler(async (req: Request, res: Response) => {
     const batch = items.slice(i, i + CONCURRENCY) as { id: string; sso: string }[];
     const settled = await Promise.all(
       batch.map(async (item) => {
-        const outcome = await checkSso(item.sso, proxy);
+        const outcome = await checkSso(item.sso, {
+          proxy,
+          timeoutMs,
+          retry,
+          proxyFallback
+        });
         return { id: item.id, ...outcome, checkedAt: new Date().toISOString() };
       })
     );

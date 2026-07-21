@@ -1036,7 +1036,7 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
               <div className="grid gap-3 sm:grid-cols-2">
                 <ToggleRow
                   label="SSO 验活走代理"
-                  hint="经 sing-box 本地代理"
+                  hint="经 sing-box 本地代理请求 grok get-user；三态：存活/失效/未知"
                   checked={draft.ssoCheckUseProxy !== false}
                   onChange={(v) => update('ssoCheckUseProxy', v)}
                 />
@@ -1046,6 +1046,85 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
                   checked={draft.cpaAuthUseProxy !== false}
                   onChange={(v) => update('cpaAuthUseProxy', v)}
                 />
+                <ToggleRow
+                  label="SSO 代理失败降级直连"
+                  hint="默认关。代理超时/429/5xx/网络仍未知时再试一次直连；401/403 不降级"
+                  checked={draft.ssoCheckProxyFallback === true}
+                  onChange={(v) => update('ssoCheckProxyFallback', v)}
+                />
+              </div>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <Field
+                  label="SSO 验活并发"
+                  hint="1～20，默认 5。号池批量验活服务端并发"
+                >
+                  <Input
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={
+                      draft.ssoCheckConcurrency == null
+                        ? 5
+                        : draft.ssoCheckConcurrency
+                    }
+                    onChange={(e) => {
+                      const n = Number(e.target.value);
+                      update(
+                        'ssoCheckConcurrency',
+                        Number.isFinite(n)
+                          ? Math.min(20, Math.max(1, Math.floor(n)))
+                          : 5
+                      );
+                    }}
+                  />
+                </Field>
+                <Field
+                  label="SSO 验活超时(ms)"
+                  hint="5000～60000，默认 12000"
+                >
+                  <Input
+                    type="number"
+                    min={5000}
+                    max={60000}
+                    step={1000}
+                    value={
+                      draft.ssoCheckTimeoutMs == null
+                        ? 12000
+                        : draft.ssoCheckTimeoutMs
+                    }
+                    onChange={(e) => {
+                      const n = Number(e.target.value);
+                      update(
+                        'ssoCheckTimeoutMs',
+                        Number.isFinite(n)
+                          ? Math.min(60000, Math.max(5000, Math.floor(n)))
+                          : 12000
+                      );
+                    }}
+                  />
+                </Field>
+                <Field
+                  label="SSO 验活重试"
+                  hint="0～2，默认 1。仅对 429/5xx/网络；401/403 不重试"
+                >
+                  <Input
+                    type="number"
+                    min={0}
+                    max={2}
+                    value={
+                      draft.ssoCheckRetry == null ? 1 : draft.ssoCheckRetry
+                    }
+                    onChange={(e) => {
+                      const n = Number(e.target.value);
+                      update(
+                        'ssoCheckRetry',
+                        Number.isFinite(n)
+                          ? Math.min(2, Math.max(0, Math.floor(n)))
+                          : 1
+                      );
+                    }}
+                  />
+                </Field>
               </div>
             </div>
           )}
@@ -1385,7 +1464,7 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
             <div className="grid gap-3 sm:grid-cols-2">
               <ToggleRow
                 label="401 自动重签"
-                hint="默认关。测活 HTTP 401 后自动 refresh→SSO 重签（不含密码重登）；建议配合代理"
+                hint="默认关。Auth「测活/深检」得 HTTP 401 后自动 refresh→SSO mint 重签（不含密码重登、不含 403）；建议配合代理"
                 checked={draft.autoResignOn401 === true}
                 onChange={(v) => update('autoResignOn401', v)}
               />
@@ -1427,10 +1506,14 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
             <div className="text-[12px] font-semibold tracking-tight text-muted-foreground">
               ③ 测活 · 清理
             </div>
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              路径对照：测活=快扫不重登；深检=401/403 可密码恢复；密码重登=手动全量恢复；401
+              自动重签=本页开关（refresh→SSO，不含密码重登）。
+            </p>
             <div className="grid gap-3 sm:grid-cols-2">
               <ToggleRow
                 label="测活死号自动删除"
-                hint="默认关。开启后 Auth 测活遇 401/402/403 才删除本地 Auth 文件；关闭则仅标记死号"
+                hint="默认关。开启后 Auth 测活/深检/mint 后测活遇 401/402/403 才删本地 Auth；关闭仅标记死号"
                 checked={draft.cpaProbeDeleteOnDead === true}
                 onChange={(v) => update('cpaProbeDeleteOnDead', v)}
               />
@@ -1451,7 +1534,7 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
             <div className="grid gap-3 sm:grid-cols-2">
               <ToggleRow
                 label="注册后自动验活 SSO"
-                hint="号池写入后请求 grok get-user，写存活/失效；默认开"
+                hint="号池写入后请求 grok get-user，写存活/失效/未知（三态）；默认开"
                 checked={draft.autoSsoCheckOnRegister !== false}
                 onChange={(v) => update('autoSsoCheckOnRegister', v)}
               />
