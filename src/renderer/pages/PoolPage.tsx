@@ -2011,7 +2011,24 @@ export function PoolPage() {
                       ? '导出筛选'
                       : '导出账号'}
               </Button>
-              {serverPaged && selected.size === 0 ? (
+                            <Button
+                variant="secondary"
+                size="sm"
+                onClick={() =>
+                  void exportSsoCheckCsv(selected.size > 0 ? 'page' : 'filter')
+                }
+                disabled={
+                  busy ||
+                  (serverPaged
+                    ? totalForPager === 0 && pageAccounts.length === 0
+                    : filteredAccounts.length === 0)
+                }
+                title="导出验活 CSV：email,password,sso,verdict,alive,status,checkedAt,error"
+              >
+                <FileDown className="h-3.5 w-3.5" />
+                导出验活
+              </Button>
+{serverPaged && selected.size === 0 ? (
                 <Button
                   variant="secondary"
                   size="sm"

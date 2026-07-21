@@ -148,17 +148,10 @@ docker exec $( $ContainerName ) sh -c 'set -e
 '
 rm -f $( $remoteTar )
 $restartBlock
-# Prefer curl (no JS arrow-fn / quoting pitfalls under bash+ssh)
-code=`$(docker exec $( $ContainerName ) sh -c "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 http://127.0.0.1:6657/ 2>/dev/null || wget -q -O /dev/null --server-response http://127.0.0.1:6657/ 2>&1 | awk '/HTTP\//{print `$2; exit}' || echo 0")
-# normalize empty/non-numeric
-case "`$code" in
-  ''|*[!0-9]*) code=0 ;;
-esac
+# Prefer curl health (no node -e / case / complex quoting)
+code=`$(docker exec $( $ContainerName ) curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 http://127.0.0.1:6657/ || echo 0)
 echo "health_http=`$code"
-if [ "`$code" != "200" ] && [ "`$code" != "301" ] && [ "`$code" != "302" ] && [ "`$code" != "304" ]; then
-  echo "WARN: health check returned `$code (container may still be starting)"
-fi
-docker ps --filter name=$( $ContainerName ) --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+docker ps --filter name=$( $ContainerName ) --format '{{.Names}} {{.Status}}'
 echo "HOT_DEPLOY_OK build=$stamp"
 "@
     Invoke-Checked "ssh" ($sshBaseArgs + @($HostName, $remote))
