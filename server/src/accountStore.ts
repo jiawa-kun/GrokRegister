@@ -609,24 +609,19 @@ async function attachTagsToRecords(records: AccountRecord[]): Promise<AccountRec
       lookupNsfwTag,
       nsfwStatusFromTag,
       zdrStatusFromTag,
+      allPushStatusesFromTag,
       ssoHashHex
     } = await import('./accountTags.js');
     const tags = await loadAccountTagsAsync();
     return records.map((a) => {
-      const side = nsfwStatusFromTag(
-        lookupNsfwTag(tags, {
-          email: a.email,
-          sso: a.sso,
-          ssoHash: a.sso ? ssoHashHex(a.sso) : undefined
-        })
-      );
-      const zdr = zdrStatusFromTag(
-        lookupNsfwTag(tags, {
-          email: a.email,
-          sso: a.sso,
-          ssoHash: a.sso ? ssoHashHex(a.sso) : undefined
-        })
-      );
+      const tag = lookupNsfwTag(tags, {
+        email: a.email,
+        sso: a.sso,
+        ssoHash: a.sso ? ssoHashHex(a.sso) : undefined
+      });
+      const side = nsfwStatusFromTag(tag);
+      const zdr = zdrStatusFromTag(tag);
+      const push = allPushStatusesFromTag(tag);
       return {
         ...a,
         nsfwEnabled: side.nsfwEnabled,
@@ -638,7 +633,10 @@ async function attachTagsToRecords(records: AccountRecord[]): Promise<AccountRec
         zdrAttempted: zdr.zdrAttempted,
         zdrAt: zdr.zdrAt,
         zdrError: zdr.zdrError,
-        zdrStatus: zdr.zdrStatus
+        zdrStatus: zdr.zdrStatus,
+        ssoG2Status: push.ssoG2Status,
+        ssoG2At: push.ssoG2At || null,
+        ssoG2Error: push.ssoG2Error || null
       } as AccountRecord;
     });
   } catch {

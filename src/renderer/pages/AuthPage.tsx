@@ -29,12 +29,13 @@ import {
 } from '@renderer/components/ui/PaginationBar';
 import { BotFlagBadge } from '@renderer/components/domain/BotFlagBadge';
 import { NsfwBadge } from '@renderer/components/domain/NsfwBadge';
-import { PushBadge } from '@renderer/components/domain/PushBadge';
+import { PushChannelBadge } from '@renderer/components/domain/PushChannelBadge';
 import { useToastStore } from '@renderer/store/toastStore';
 import { useSettingsStore } from '@renderer/store/settingsStore';
 import type { CpaAuthItem } from '@shared/ipc';
 import type { ReloginStage } from '@shared/runEvents';
 import { cn } from '@renderer/lib/cn';
+import { fmtBeijingPlain } from '@renderer/lib/time';
 import { setWebApiAbortSignal } from '@renderer/lib/webApi';
 import { getQuery, getQueryInt, oneOf, patchQuery } from '@renderer/lib/urlQuery';
 import {
@@ -2714,15 +2715,17 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
 
   return (
     <div className="space-y-5">
-      <section className="terminal-grid">
-        <AuthMetric
-          label="Auth 文件"
-          value={String(authTotalCount)}
-          Icon={KeyRound}
-        />
-        <AuthMetric label="xai 标识" value={String(xaiCount)} Icon={KeyRound} />
-        <AuthMetric label="无 sso" value={String(missingSsoCount)} Icon={Link2} />
-        <AuthMetric label="无邮箱" value={String(noEmailAuthCount)} Icon={KeyRound} />
+      <section className="rounded-[16px] border border-border bg-card p-2 shadow-[var(--ios-shadow)] sm:p-3">
+        <div className="grid grid-cols-4 gap-2 sm:gap-3">
+          <AuthMetric
+            label="Auth 文件"
+            value={String(authTotalCount)}
+            Icon={KeyRound}
+          />
+          <AuthMetric label="xai 标识" value={String(xaiCount)} Icon={KeyRound} />
+          <AuthMetric label="无 sso" value={String(missingSsoCount)} Icon={Link2} />
+          <AuthMetric label="无邮箱" value={String(noEmailAuthCount)} Icon={KeyRound} />
+        </div>
       </section>
 
       {loadError ? (
@@ -3449,49 +3452,25 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       ) : (
         <>
         <div className="overflow-x-auto rounded-[16px] border border-border bg-card shadow-[var(--ios-shadow)]">
-          <table className="w-full min-w-[720px] text-left text-[13px]">
-            <thead className="border-b border-border/70 text-[11px] uppercase tracking-wide text-muted-foreground">
+          <table className="w-full min-w-[880px] text-left text-[13px]">
+            <thead className="border-b border-border/70 text-[11px] text-muted-foreground">
               <tr>
-                <th className="w-10 px-3 py-2.5" />
-                <th className="px-3 py-2.5 font-medium">邮箱</th>
-                <th className="w-[7rem] max-w-[7rem] px-2 py-2.5 font-medium">
-                  授权
-                </th>
-                <th className="w-[4.5rem] px-3 py-2.5 font-medium">SSO</th>
-                <th className="w-10 px-2 py-2.5 text-center font-medium">Type</th>
-                <th className="w-[3.25rem] px-3 py-2.5 font-medium">xai</th>
-                <th className="w-[3.5rem] px-2 py-2.5 font-medium">Nsfw</th>
-                {/* ZDR 列已隐藏
-                <th className="w-[3.5rem] px-2 py-2.5 font-medium">ZDR</th>
-                */}
-                <th
-                  className="w-[2.75rem] px-1 py-2.5 text-center font-medium"
-                  title="SSO → grok2api"
-                >
-                  G2
-                </th>
-                <th
-                  className="w-[2.75rem] px-1 py-2.5 text-center font-medium"
-                  title="Auth → CPA Management"
-                >
-                  CPA
-                </th>
-                <th
-                  className="w-[2.75rem] px-1 py-2.5 text-center font-medium"
-                  title="Auth → sub2api"
-                >
-                  S2A
-                </th>
-                <th className="w-[4.5rem] px-3 py-2.5 font-medium">bot_flag</th>
-                {/* 固定窄列仅放 O/X，避免测活后邻列横向跳动 */}
-                <th className="w-10 whitespace-nowrap px-2 py-2.5 text-center font-medium">
+                <th className="w-10 px-2 py-2.5" />
+                <th className="min-w-[8rem] px-2 py-2.5 font-medium">邮箱</th>
+                <th className="w-[6.5rem] px-1.5 py-2.5 font-medium">授权</th>
+                <th className="w-11 px-1 py-2.5 text-center font-medium">SSO</th>
+                <th className="w-10 px-1 py-2.5 text-center font-medium">Type</th>
+                <th className="px-1.5 py-2.5 font-medium">TAG</th>
+                <th className="w-11 whitespace-nowrap px-1 py-2.5 text-center font-medium">
                   测活
                 </th>
-                <th className="w-12 whitespace-nowrap px-2 py-2.5 text-center font-medium">
+                <th className="w-12 whitespace-nowrap px-1 py-2.5 text-center font-medium">
                   状态
                 </th>
-                <th className="px-3 py-2.5 font-medium">过期</th>
-                <th className="px-3 py-2.5 font-medium">操作</th>
+                <th className="w-[10rem] whitespace-nowrap px-1.5 py-2.5 font-medium">
+                  过期
+                </th>
+                <th className="w-[14.5rem] px-1.5 py-2.5 font-medium">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -3553,31 +3532,33 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                     >
                       {item.filename}
                     </td>
-                    <td className="w-[4.5rem] min-w-[4.5rem] max-w-[4.5rem] px-3 py-2.5">
-                      {/* SSO：有=绿 / 无=黄（固定槽位防布局跳动） */}
-                      <div className="flex h-5 items-center">
+                    <td className="w-11 px-1 py-2.5 text-center align-middle">
+                      {/* SSO：O=有 / X=无（与测活 O/X 同形） */}
+                      <div className="flex h-5 items-center justify-center">
                         {rowNoSso ? (
                           <span
-                            className="shrink-0 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400"
+                            className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-amber-500/15 text-[12px] font-bold leading-none text-amber-600 dark:text-amber-400"
                             title={
                               rowNoEmail
                                 ? '无 SSO · 且无邮箱，无法 email 回填'
                                 : '无 SSO：可筛选后点「回填SSO」（需有邮箱）'
                             }
+                            aria-label="无 SSO"
                           >
-                            无
+                            X
                           </span>
                         ) : (
                           <span
-                            className="shrink-0 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400"
+                            className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-[12px] font-bold leading-none text-emerald-600 dark:text-emerald-400"
                             title="已含 SSO（SSO→Auth 转换或已回填）"
+                            aria-label="有 SSO"
                           >
-                            有
+                            O
                           </span>
                         )}
                       </div>
                     </td>
-                    <td className="w-10 min-w-10 px-2 py-2.5 text-center">
+                    <td className="w-10 px-1 py-2.5 text-center align-middle">
                       {/* Type：A=PKCE / B=Device，蓝色字 */}
                       {item.mintChannel === 'A' || item.mintChannel === 'B' ? (
                         <span
@@ -3594,106 +3575,82 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                         <span className="text-[11px] text-muted-foreground">—</span>
                       )}
                     </td>
-                    <td className="px-3 py-2.5">
-                      {item.xai ? (
-                        <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
-                          xai
-                        </span>
-                      ) : (
-                        <span className="text-[11px] text-muted-foreground">—</span>
-                      )}
+                    <td className="px-1.5 py-2.5 align-middle">
+                      {/* TAG 单行 nowrap：列宽随可见标签自撑 */}
+                      <div className="flex flex-nowrap items-center gap-1 whitespace-nowrap">
+                        {item.xai ? (
+                          <span
+                            className="inline-flex h-5 shrink-0 items-center rounded-full bg-emerald-500/15 px-2 text-[10px] font-medium leading-none text-emerald-600 dark:text-emerald-400"
+                            title="xai 标识（文件名或 type）"
+                          >
+                            xai
+                          </span>
+                        ) : null}
+                        <NsfwBadge
+                          status={
+                            item.nsfwStatus ??
+                            (item.nsfwAttempted
+                              ? item.nsfwEnabled
+                                ? 'ok'
+                                : 'fail'
+                              : 'none')
+                          }
+                          error={item.nsfwError}
+                          className="shrink-0"
+                        />
+                        <BotFlagBadge
+                          flag={
+                            item.botFlagSource != null && item.botFlagSource !== ''
+                              ? item.botFlagSource
+                              : item.hasSso
+                                ? 0
+                                : item.botFlagSource
+                          }
+                          is1={item.isBotFlag1}
+                          missing="dash"
+                          className="shrink-0"
+                        />
+                        <PushChannelBadge
+                          channel="CPA"
+                          pushed={(item.authCpaStatus ?? 'none') === 'ok'}
+                          at={item.authCpaAt}
+                          className="shrink-0"
+                        />
+                        <PushChannelBadge
+                          channel="S2A"
+                          pushed={(item.authSub2apiStatus ?? 'none') === 'ok'}
+                          at={item.authSub2apiAt}
+                          className="shrink-0"
+                        />
+                      </div>
                     </td>
-                    <td className="w-[3.5rem] min-w-[3.5rem] px-2 py-2.5">
-                      <NsfwBadge
-                        status={
-                          item.nsfwStatus ??
-                          (item.nsfwAttempted
-                            ? item.nsfwEnabled
-                              ? 'ok'
-                              : 'fail'
-                            : 'none')
-                        }
-                        error={item.nsfwError}
-                      />
-                    </td>
-                    {/* ZDR 列已隐藏
-                    <td className="w-[3.5rem] min-w-[3.5rem] px-2 py-2.5">
-                      <ZdrBadge
-                        status={
-                          item.zdrStatus ??
-                          (item.zdrAttempted
-                            ? item.zdrClosed
-                              ? 'closed'
-                              : 'open'
-                            : 'none')
-                        }
-                        error={item.zdrError}
-                      />
-                    </td>
-                    */}
-                    <td className="w-[2.75rem] min-w-[2.75rem] px-1 py-2.5 text-center">
-                      <PushBadge
-                        label="G2"
-                        status={item.ssoG2Status ?? 'none'}
-                        error={item.ssoG2Error}
-                        at={item.ssoG2At}
-                      />
-                    </td>
-                    <td className="w-[2.75rem] min-w-[2.75rem] px-1 py-2.5 text-center">
-                      <PushBadge
-                        label="CPA"
-                        status={item.authCpaStatus ?? 'none'}
-                        error={item.authCpaError}
-                        at={item.authCpaAt}
-                      />
-                    </td>
-                    <td className="w-[2.75rem] min-w-[2.75rem] px-1 py-2.5 text-center">
-                      <PushBadge
-                        label="S2A"
-                        status={item.authSub2apiStatus ?? 'none'}
-                        error={item.authSub2apiError}
-                        at={item.authSub2apiAt}
-                      />
-                    </td>
-                    <td className="w-[4.5rem] min-w-[4.5rem] px-3 py-2.5">
-                      <BotFlagBadge
-                        flag={
-                          // 0 合法；有 sso 且无 claim 时显示绿 None
-                          item.botFlagSource != null && item.botFlagSource !== ''
-                            ? item.botFlagSource
-                            : item.hasSso
-                              ? 0
-                              : item.botFlagSource
-                        }
-                        is1={item.isBotFlag1}
-                        missing="dash"
-                      />
-                    </td>
-                    <td className="w-10 min-w-10 max-w-10 whitespace-nowrap px-2 py-2.5 text-center">
-                      {/* 仅固定 O/X 槽，按钮移至操作列，杜绝邻列位移 */}
+                    <td className="w-11 whitespace-nowrap px-1 py-2.5 text-center align-middle">
                       <span className="inline-flex h-5 w-5 items-center justify-center">
                         <ProbeBadge action={probeAction} />
                       </span>
                     </td>
-                    <td className="w-12 min-w-12 max-w-12 whitespace-nowrap px-2 py-2.5 text-center">
+                    <td className="w-12 whitespace-nowrap px-1 py-2.5 text-center align-middle">
                       <ProbeHttpBadge http={probeHttp} action={probeAction} />
                     </td>
-                    <td className="whitespace-nowrap px-3 py-2.5 text-[12px] text-muted-foreground">
-                      {item.expired || '—'}
+                    <td
+                      className="w-[10rem] whitespace-nowrap px-1.5 py-2.5 align-middle text-[12px] tabular-nums text-muted-foreground"
+                      title={item.expired || undefined}
+                    >
+                      {item.expired ? fmtBeijingPlain(item.expired) : '—'}
                     </td>
-                    <td className="px-3 py-2.5">
-                      <div className="inline-flex flex-row flex-wrap items-center gap-1">
+                    <td className="w-[14.5rem] px-1.5 py-2 align-middle">
+                      <div className="flex w-[13.75rem] flex-col gap-1">
                         {rowStage && (
                           <span
                             className={cn(
-                              'shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium tabular-nums',
+                              'inline-flex w-fit max-w-full truncate rounded-full px-2 py-0.5 text-[10px] font-medium tabular-nums',
                               rowStage === 'done'
                                 ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
                                 : rowStage === 'error'
                                   ? 'bg-red-500/15 text-red-600 dark:text-red-400'
                                   : rowStage === 'queued'
                                     ? 'bg-slate-500/15 text-slate-600 dark:text-slate-300'
-                                    : 'bg-amber-500/15 text-amber-700 dark:text-amber-400 animate-pulse'
+                                    : 'animate-pulse bg-amber-500/15 text-amber-700 dark:text-amber-400'
                             )}
                             title={
                               rowReloginSt?.message
@@ -3704,10 +3661,11 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                             {reloginStageLabel(rowStage)}
                           </span>
                         )}
+                        <div className="grid w-full grid-cols-2 gap-1">
                         <Button
                           variant="secondary"
                           size="sm"
-                          className="h-7 shrink-0"
+                          className="h-7 gap-1 whitespace-nowrap px-1.5 text-[12px]"
                           disabled={busy}
                           onClick={() => void probeOne(item)}
                           title="单条 CPA 测活（结果落盘）"
@@ -3720,7 +3678,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                         <Button
                           variant="secondary"
                           size="sm"
-                          className="h-7 shrink-0"
+                          className="h-7 gap-1 whitespace-nowrap px-1.5 text-[12px]"
                           disabled={
                             (busy && !rowStageActive) ||
                             rowNoEmail ||
@@ -3757,7 +3715,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                         <Button
                           variant="secondary"
                           size="sm"
-                          className="h-7 shrink-0"
+                          className="h-7 gap-1 whitespace-nowrap px-1.5 text-[12px]"
                           disabled={busy}
                           title="重签 cli · base=cli-chat-proxy 满额"
                           onClick={() => void resign(item, 'cli')}
@@ -3770,7 +3728,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                         <Button
                           variant="secondary"
                           size="sm"
-                          className="h-7 shrink-0"
+                          className="h-7 gap-1 whitespace-nowrap px-1.5 text-[12px]"
                           disabled={busy}
                           title="重签 api · base=api.x.ai 防风控·约50%额度"
                           onClick={() => void resign(item, 'api')}
@@ -3780,6 +3738,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                           />
                           {rowResign ? '…' : '重签 api'}
                         </Button>
+                        </div>
                       </div>
                     </td>
                   </tr>
@@ -3915,12 +3874,14 @@ function AuthMetric({
   Icon: typeof KeyRound;
 }) {
   return (
-    <div className="rounded-[16px] border border-border bg-card p-4 shadow-[var(--ios-shadow)]">
-      <div className="flex items-center justify-between gap-2">
-        <p className="text-[12px] text-muted-foreground">{label}</p>
-        <Icon className="h-4 w-4 text-muted-foreground/80" />
+    <div className="min-w-0 rounded-[12px] border border-border/70 bg-muted/40 px-2.5 py-2.5 sm:px-3 sm:py-3">
+      <div className="flex items-center justify-between gap-1.5">
+        <p className="truncate text-[11px] text-muted-foreground sm:text-[12px]">{label}</p>
+        <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/80 sm:h-4 sm:w-4" />
       </div>
-      <p className="mt-2 text-[22px] font-semibold tracking-tight tabular-nums">{value}</p>
+      <p className="mt-1.5 truncate text-[18px] font-semibold tracking-tight tabular-nums sm:mt-2 sm:text-[22px]">
+        {value}
+      </p>
     </div>
   );
 }

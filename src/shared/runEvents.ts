@@ -83,6 +83,10 @@ export interface AccountRecord {
    */
   hasPassword?: boolean;
   hasSso?: boolean;
+  /** SSO→grok2api (G2A) 推送状态，来自 account_tags */
+  ssoG2Status?: 'ok' | 'fail' | 'none';
+  ssoG2At?: string | null;
+  ssoG2Error?: string | null;
 }
 
 export interface StructuredRunEvent {
