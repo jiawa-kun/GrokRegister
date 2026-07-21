@@ -117,6 +117,8 @@ const webApi: RendererApi = {
   changeCredentials: (input) => http('POST', '/api/auth/change', input),
 
   getSettings: () => http('GET', '/api/settings'),
+  getPythonPoolStats: () => http('GET', '/api/python-pool/stats'),
+  pingPythonPool: (input) => http('POST', '/api/python-pool/ping', input ?? {}),
   saveSettings: async (s) => {
     await http('PUT', '/api/settings', s);
     return { ok: true };

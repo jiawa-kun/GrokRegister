@@ -336,6 +336,40 @@ export interface RendererApi {
   // settings
   getSettings(): Promise<AppSettings>;
   saveSettings(s: AppSettings): Promise<{ ok: true }>;
+  /** Python 进程池健康指标 */
+  getPythonPoolStats(): Promise<{
+    enabled: boolean;
+    size: number;
+    timeoutSec: number;
+    pools: Array<{
+      workers: number;
+      busy: number;
+      queued: number;
+      jobsTotal: number;
+      jobsOk: number;
+      jobsFail: number;
+      timeouts: number;
+      spawns: number;
+      timeoutMs: number;
+      maxSize: number;
+    }>;
+    totals: {
+      workers: number;
+      busy: number;
+      queued: number;
+      jobsTotal: number;
+      jobsOk: number;
+      jobsFail: number;
+      timeouts: number;
+      spawns: number;
+    };
+  }>;
+  pingPythonPool(input?: { reset?: boolean }): Promise<{
+    ok: boolean;
+    enabled?: boolean;
+    error?: string;
+    stats?: Record<string, unknown>;
+  }>;
 
   // register
   startRegister(args?: RegisterStartArgs): Promise<{ runId: string }>;

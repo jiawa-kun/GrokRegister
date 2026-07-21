@@ -115,6 +115,8 @@ type TaskProgress = {
   ssoFromPool?: number;
   /** 失败原因摘要 */
   failReasonSummary?: string;
+  /** 失败原因计数（chips 一键复检） */
+  failReasons?: Record<string, number>;
 };
 
 const PAGE_SIZE_KEY = 'gra-auth-page-size';
@@ -279,6 +281,8 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   /** 上次批量重签失败文件名（会话内「仅失败」复检） */
   const lastResignFailedRef = useRef<string[]>([]);
+  /** 上次重签按 failReason 分组的文件名（点原因 chip 复检） */
+  const lastResignFailedByReasonRef = useRef<Record<string, string[]>>({});
 
   type BatchKind =
     | 'resign'
@@ -1430,23 +1434,26 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       .join(' ');
   };
 
-  type ResignRecheck = 'all' | 'failed' | 'no_refresh' | 'no_sso' | '401';
+  type ResignRecheck = 'all' | 'failed' | 'no_refresh' | 'no_sso' | '401' | 'fail_reason';
 
   const resignBatch = async (
     baseUrlTarget: 'cli' | 'api' = 'cli',
-    opts?: { recheck?: ResignRecheck }
+    opts?: { recheck?: ResignRecheck; failReason?: string }
   ) => {
     const recheck: ResignRecheck = opts?.recheck || 'all';
+    const failReasonKey = String(opts?.failReason || '').trim();
     const recheckHint =
       recheck === 'failed'
         ? '仅失败'
-        : recheck === 'no_refresh'
-          ? '仅无refresh'
-          : recheck === 'no_sso'
-            ? '仅缺SSO'
-            : recheck === '401'
-              ? '仅401'
-              : '';
+        : recheck === 'fail_reason'
+          ? '仅原因:' + (failReasonKey || '?')
+          : recheck === 'no_refresh'
+            ? '仅无refresh'
+            : recheck === 'no_sso'
+              ? '仅缺SSO'
+              : recheck === '401'
+                ? '仅401'
+                : '';
     const label =
       (baseUrlTarget === 'api' ? '重签 api' : '重签 cli') +
       (recheckHint ? '·' + recheckHint : '');
@@ -1459,6 +1466,18 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
             tone: 'warn',
             title: '没有上次失败的重签目标',
             description: '请先跑一轮批量重签'
+          });
+          return;
+        }
+      } else if (recheck === 'fail_reason') {
+        filenames = [...(lastResignFailedByReasonRef.current[failReasonKey] || [])];
+        if (!failReasonKey || filenames.length === 0) {
+          push({
+            tone: 'warn',
+            title: '没有该原因的失败目标',
+            description: failReasonKey
+              ? '原因 ' + failReasonKey + ' 无会话记忆，请先跑一轮批量重签'
+              : '未指定 failReason'
           });
           return;
         }
@@ -1536,6 +1555,8 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       const tip =
         recheck === 'failed'
           ? '没有上次失败的目标'
+          : recheck === 'fail_reason'
+            ? '没有原因 ' + (failReasonKey || '?') + ' 的失败目标'
           : recheck === 'no_refresh'
             ? '没有缺 refresh_token 的 Auth'
             : recheck === 'no_sso'
@@ -1566,6 +1587,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       let ssoFromPoolN = 0;
       let cancelled = false;
       const failedNames: string[] = [];
+      const failedByReason: Record<string, string[]> = {};
       const modeCounts: Record<string, number> = {};
       const reasonCounts: Record<string, number> = {};
       const allResults: {
@@ -1592,9 +1614,13 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
         if (x.ok) ok += 1;
         else {
           failed += 1;
-          if (x.filename) failedNames.push(x.filename);
           const fr = x.failReason || 'unknown';
           reasonCounts[fr] = (reasonCounts[fr] || 0) + 1;
+          if (x.filename) {
+            failedNames.push(x.filename);
+            if (!failedByReason[fr]) failedByReason[fr] = [];
+            failedByReason[fr].push(x.filename);
+          }
         }
         if (x.ok && x.xai === false) noXai += 1;
         if (x.remoteOk === true) remoteOkN += 1;
@@ -1619,7 +1645,8 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
           modeSummary: Object.entries(modeCounts)
             .map(([k, v]) => k + ':' + v)
             .join(' '),
-          failReasonSummary: reasonSummary || undefined
+          failReasonSummary: reasonSummary || undefined,
+          failReasons: { ...reasonCounts }
         });
       };
 
@@ -1690,6 +1717,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       }
 
       lastResignFailedRef.current = failedNames;
+      lastResignFailedByReasonRef.current = failedByReason;
 
       const modePart = Object.entries(modeCounts)
         .map(([k, v]) => k + ':' + v)
@@ -3119,6 +3147,29 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
               }}
             />
           </div>
+          {!prog.running && prog.failReasons && Object.keys(prog.failReasons).length > 0 ? (
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              <span className="text-[10px] font-semibold tracking-wide text-muted-foreground">
+                点原因复检
+              </span>
+              {Object.entries(prog.failReasons)
+                .sort((a, b) => b[1] - a[1])
+                .map(([reason, n]) => (
+                  <button
+                    key={reason}
+                    type="button"
+                    className="chip cursor-pointer border border-border/70 bg-background/80 text-[11px] hover:border-primary hover:text-primary"
+                    title={'仅复检失败原因 ' + reason + '（' + n + '）'}
+                    onClick={() => {
+                      if (busy) return;
+                      void resignBatch('cli', { recheck: 'fail_reason', failReason: reason });
+                    }}
+                  >
+                    {reason}:{n}
+                  </button>
+                ))}
+            </div>
+          ) : null}
         </div>
       )}
 

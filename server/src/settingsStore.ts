@@ -436,6 +436,20 @@ function merge(partial: unknown): AppSettings {
       if (!Number.isFinite(n) || n < 1) return DEFAULT_SETTINGS.cpaResignConcurrency;
       return Math.min(Math.floor(n), 3);
     })(),
+    pythonPoolEnabled: asBool(
+      (p as AppSettings).pythonPoolEnabled,
+      DEFAULT_SETTINGS.pythonPoolEnabled
+    ),
+    pythonPoolSize: (() => {
+      const n = Number((p as AppSettings).pythonPoolSize);
+      if (!Number.isFinite(n) || n < 1) return DEFAULT_SETTINGS.pythonPoolSize;
+      return Math.min(Math.floor(n), 4);
+    })(),
+    pythonPoolTimeoutSec: (() => {
+      const n = Number((p as AppSettings).pythonPoolTimeoutSec);
+      if (!Number.isFinite(n)) return DEFAULT_SETTINGS.pythonPoolTimeoutSec;
+      return Math.max(30, Math.min(Math.floor(n), 600));
+    })(),
     resignPushRemote: asBool(
       (p as AppSettings).resignPushRemote,
       DEFAULT_SETTINGS.resignPushRemote

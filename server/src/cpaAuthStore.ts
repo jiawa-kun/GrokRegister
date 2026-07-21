@@ -1295,8 +1295,23 @@ print(json.dumps(r, ensure_ascii=False))
 
   const proxy = resolveHttpProxy(settings, 'cpaAuth');
   let r: Record<string, unknown>;
+  const poolEnabled = settings.pythonPoolEnabled !== false;
+  const poolSize = Math.min(
+    4,
+    Math.max(1, Number(settings.pythonPoolSize) || Number(settings.cpaResignConcurrency) || 2)
+  );
+  const poolTimeoutMs = Math.min(
+    600_000,
+    Math.max(10_000, (Number(settings.pythonPoolTimeoutSec) || 180) * 1000)
+  );
   try {
-    const pool = getPythonJobPool(runtime.pythonPath, runtime.registerDir, 3);
+    if (!poolEnabled) throw new Error('python pool disabled');
+    const pool = getPythonJobPool(
+      runtime.pythonPath,
+      runtime.registerDir,
+      poolSize,
+      poolTimeoutMs
+    );
     r = await pool.run({
       op: 'resign',
       path: resolved,
@@ -1306,10 +1321,12 @@ print(json.dumps(r, ensure_ascii=False))
       baseUrlTarget
     });
   } catch (poolErr) {
-    console.warn(
-      '[cpa-auth] resign pool failed, fallback spawn:',
-      poolErr instanceof Error ? poolErr.message : poolErr
-    );
+    if (poolEnabled) {
+      console.warn(
+        '[cpa-auth] resign pool failed, fallback spawn:',
+        poolErr instanceof Error ? poolErr.message : poolErr
+      );
+    }
     r = await runPythonJson(runtime.pythonPath, runtime.registerDir, code, [
       resolved,
       proxy,
@@ -2756,8 +2773,23 @@ print(json.dumps(r, ensure_ascii=False))
       try {
         const proxyMint = resolveHttpProxy(settings, 'cpaAuth');
         let r: Record<string, unknown>;
+        const poolEnabled = settings.pythonPoolEnabled !== false;
+        const poolSize = Math.min(
+          4,
+          Math.max(1, Number(settings.pythonPoolSize) || concurrency)
+        );
+        const poolTimeoutMs = Math.min(
+          600_000,
+          Math.max(10_000, (Number(settings.pythonPoolTimeoutSec) || 180) * 1000)
+        );
         try {
-          const pool = getPythonJobPool(runtime!.pythonPath, runtime!.registerDir, concurrency);
+          if (!poolEnabled) throw new Error('python pool disabled');
+          const pool = getPythonJobPool(
+            runtime!.pythonPath,
+            runtime!.registerDir,
+            poolSize,
+            poolTimeoutMs
+          );
           r = await pool.run({
             op: 'mint',
             sso,
@@ -2769,10 +2801,12 @@ print(json.dumps(r, ensure_ascii=False))
             mintMode
           });
         } catch (poolErr) {
-          console.warn(
-            '[cpa-auth] mint pool failed, fallback spawn:',
-            poolErr instanceof Error ? poolErr.message : poolErr
-          );
+          if (poolEnabled) {
+            console.warn(
+              '[cpa-auth] mint pool failed, fallback spawn:',
+              poolErr instanceof Error ? poolErr.message : poolErr
+            );
+          }
           r = await runPythonJson(runtime!.pythonPath, runtime!.registerDir, code, [
             sso,
             email,

@@ -140,6 +140,8 @@ type MintProgress = {
   current?: string;
   running: boolean;
   failReasonSummary?: string;
+  /** 失败/跳过原因计数（chips 一键复检） */
+  failReasons?: Record<string, number>;
 };
 
 /** SSO 批量验活进度 */
@@ -188,6 +190,10 @@ export function PoolPage() {
   const mintAbortRef = useRef<AbortController | null>(null);
   /** 上次补签失败目标（会话内仅失败复检） */
   const lastMintFailedRef = useRef<{ sso: string; email?: string }[]>([]);
+  /** 上次补签按 failReason 分组（点原因 chip 复检；含 skipped） */
+  const lastMintFailedByReasonRef = useRef<
+    Record<string, { sso: string; email?: string }[]>
+  >({});
   const [pushingG2a, setPushingG2a] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -1366,13 +1372,14 @@ export function PoolPage() {
    */
   const mintAuthFromSso = async (
     scope: 'page' | 'filter' = 'filter',
-    opts?: { recheck?: 'all' | 'failed' | 'unconverted' }
+    opts?: { recheck?: 'all' | 'failed' | 'unconverted' | 'fail_reason'; failReason?: string }
   ) => {
     if (mintProg?.running) {
       cancelMint();
       return;
     }
     const recheck = opts?.recheck || 'all';
+    const failReasonKey = String(opts?.failReason || '').trim();
     let targets: ActionTarget[] = [];
     try {
       if (recheck === 'failed') {
@@ -1389,6 +1396,26 @@ export function PoolPage() {
             tone: 'warn',
             title: '没有上次失败的补签目标',
             description: '请先跑一轮补签 Auth'
+          });
+          return;
+        }
+      } else if (recheck === 'fail_reason') {
+        const list = lastMintFailedByReasonRef.current[failReasonKey] || [];
+        targets = list
+          .filter((x) => x.sso)
+          .map((x, i) => ({
+            id: 'fr-' + failReasonKey + '-' + i,
+            sso: x.sso,
+            email: x.email || '',
+            password: ''
+          }));
+        if (!failReasonKey || targets.length === 0) {
+          push({
+            tone: 'warn',
+            title: '没有该原因的补签目标',
+            description: failReasonKey
+              ? '原因 ' + failReasonKey + ' 无会话记忆，请先跑一轮补签'
+              : '未指定 failReason'
           });
           return;
         }
@@ -1418,7 +1445,9 @@ export function PoolPage() {
           push({
             tone: 'warn',
             title:
-              recheck === 'unconverted' ? '没有未转 Auth 的 SSO' : '没有可 mint 的 SSO'
+              recheck === 'unconverted'
+                ? '没有未转 Auth 的 SSO'
+                : '没有可 mint 的 SSO'
           });
           return;
         }
@@ -1464,10 +1493,20 @@ export function PoolPage() {
     let cancelled = false;
     const allResults: CpaAuthBatchResultItem[] = [];
     const failedTargets: { sso: string; email?: string }[] = [];
+    const failedByReason: Record<string, { sso: string; email?: string }[]> = {};
     const reasonCounts: Record<string, number> = {};
     const ssoByEmail = new Map(
       targets.map((t) => [String(t.email || '').toLowerCase(), t.sso] as const)
     );
+
+    const resolveItemTarget = (x: CpaAuthBatchResultItem) => {
+      const em = String(x.email || '').toLowerCase();
+      const sso =
+        (em && ssoByEmail.get(em)) ||
+        targets.find((t) => t.email && t.email.toLowerCase() === em)?.sso ||
+        '';
+      return sso ? { sso, email: x.email } : null;
+    };
 
     const applyItem = (x: CpaAuthBatchResultItem) => {
       allResults.push(x);
@@ -1475,18 +1514,23 @@ export function PoolPage() {
         skipped += 1;
         const fr = x.failReason || x.verdict || 'skipped';
         reasonCounts[fr] = (reasonCounts[fr] || 0) + 1;
+        const t = resolveItemTarget(x);
+        if (t) {
+          if (!failedByReason[fr]) failedByReason[fr] = [];
+          failedByReason[fr].push(t);
+        }
       } else if (x.ok) {
         ok += 1;
       } else {
         failed += 1;
         const fr = x.failReason || 'unknown';
         reasonCounts[fr] = (reasonCounts[fr] || 0) + 1;
-        const em = String(x.email || '').toLowerCase();
-        const sso =
-          (em && ssoByEmail.get(em)) ||
-          targets.find((t) => t.email && t.email.toLowerCase() === em)?.sso ||
-          '';
-        if (sso) failedTargets.push({ sso, email: x.email });
+        const t = resolveItemTarget(x);
+        if (t) {
+          failedTargets.push(t);
+          if (!failedByReason[fr]) failedByReason[fr] = [];
+          failedByReason[fr].push(t);
+        }
       }
       if (x.verdict === 'banned') banned += 1;
       if (x.probeAction === 'dead' || x.probeDeleted) probeDead += 1;
@@ -1504,7 +1548,8 @@ export function PoolPage() {
         banned,
         current: x.email || x.filename || '',
         running: allResults.length < targets.length && !ac.signal.aborted,
-        failReasonSummary: reasonSummary || undefined
+        failReasonSummary: reasonSummary || undefined,
+        failReasons: { ...reasonCounts }
       });
     };
 
@@ -1565,6 +1610,7 @@ export function PoolPage() {
       }
 
       lastMintFailedRef.current = failedTargets;
+      lastMintFailedByReasonRef.current = failedByReason;
 
       const botFlagN = allResults.filter((x) => x.verdict === 'bot_flag').length;
       const remoteOkN = allResults.filter((x) => x.remoteOk === true).length;
@@ -1882,6 +1928,33 @@ export function PoolPage() {
               style={{ width: `${mintPct}%` }}
             />
           </div>
+          {!mintProg.running && mintProg.failReasons && Object.keys(mintProg.failReasons).length > 0 ? (
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              <span className="text-[10px] font-semibold tracking-wide text-muted-foreground">
+                点原因复检
+              </span>
+              {Object.entries(mintProg.failReasons)
+                .sort((a, b) => b[1] - a[1])
+                .map(([reason, n]) => (
+                  <button
+                    key={reason}
+                    type="button"
+                    className="chip cursor-pointer border border-border/70 bg-background/80 text-[11px] hover:border-primary hover:text-primary"
+                    title={'仅复检补签原因 ' + reason + '（' + n + '）'}
+                    onClick={() => {
+                      if (busy && !minting) return;
+                      if (minting) return;
+                      void mintAuthFromSso(selected.size > 0 ? 'page' : 'filter', {
+                        recheck: 'fail_reason',
+                        failReason: reason
+                      });
+                    }}
+                  >
+                    {reason}:{n}
+                  </button>
+                ))}
+            </div>
+          ) : null}
         </div>
       )}
 

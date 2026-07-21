@@ -26,6 +26,22 @@ export type PythonPoolJob =
     }
   | { op: 'ping' };
 
+export type PythonPoolStats = {
+  key: string;
+  pythonPath: string;
+  registerDir: string;
+  workers: number;
+  busy: number;
+  queued: number;
+  jobsTotal: number;
+  jobsOk: number;
+  jobsFail: number;
+  timeouts: number;
+  spawns: number;
+  timeoutMs: number;
+  maxSize: number;
+};
+
 type Pending = {
   resolve: (v: Record<string, unknown>) => void;
   reject: (e: Error) => void;
@@ -45,7 +61,6 @@ type Slot = {
 };
 
 function buildWorkerCode(registerDir: string): string {
-  // 单行引导：读 stdin JSON 行 → 派发 resign/mint → 写 stdout JSON 行
   return `
 import json, sys, traceback
 sys.path.insert(0, ${JSON.stringify(registerDir)})
@@ -143,17 +158,32 @@ function poolKey(pythonPath: string, registerDir: string): string {
 export function getPythonJobPool(
   pythonPath: string,
   registerDir: string,
-  size = 2
+  size = 2,
+  jobTimeoutMs = 180_000
 ): PythonJobPool {
   const key = poolKey(pythonPath, registerDir);
   let p = pools.get(key);
   if (!p || p.disposed) {
-    p = new PythonJobPool(pythonPath, registerDir, size);
+    p = new PythonJobPool(pythonPath, registerDir, size, jobTimeoutMs);
     pools.set(key, p);
-  } else if (size > p.size) {
-    p.ensureSize(size);
+  } else {
+    p.configure({ size, timeoutMs: jobTimeoutMs });
   }
   return p;
+}
+
+export function listPythonJobPoolStats(): PythonPoolStats[] {
+  const out: PythonPoolStats[] = [];
+  for (const [key, p] of pools) {
+    if (p.disposed) continue;
+    out.push(p.getStats(key));
+  }
+  return out;
+}
+
+export function disposeAllPythonJobPools(): void {
+  for (const p of pools.values()) p.dispose();
+  pools.clear();
 }
 
 export class PythonJobPool {
@@ -161,20 +191,67 @@ export class PythonJobPool {
   readonly registerDir: string;
   private slots: Slot[] = [];
   private readonly code: string;
-  private readonly jobTimeoutMs: number;
+  private jobTimeoutMs: number;
+  private maxSize: number;
   disposed = false;
 
-  constructor(pythonPath: string, registerDir: string, size: number, jobTimeoutMs = 180_000) {
+  private jobsTotal = 0;
+  private jobsOk = 0;
+  private jobsFail = 0;
+  private timeouts = 0;
+  private spawns = 0;
+
+  constructor(
+    pythonPath: string,
+    registerDir: string,
+    size: number,
+    jobTimeoutMs = 180_000
+  ) {
     this.pythonPath = pythonPath;
     this.registerDir = registerDir;
     this.code = buildWorkerCode(registerDir);
-    this.jobTimeoutMs = jobTimeoutMs;
-    const n = Math.min(4, Math.max(1, Math.floor(size) || 1));
-    for (let i = 0; i < n; i++) this.spawnSlot();
+    this.jobTimeoutMs = Math.max(10_000, Math.floor(jobTimeoutMs) || 180_000);
+    this.maxSize = Math.min(4, Math.max(1, Math.floor(size) || 1));
+    for (let i = 0; i < this.maxSize; i++) this.spawnSlot();
   }
 
   get size(): number {
     return this.slots.filter((s) => !s.dead).length;
+  }
+
+  configure(opts: { size?: number; timeoutMs?: number }): void {
+    if (opts.timeoutMs != null && Number.isFinite(opts.timeoutMs)) {
+      this.jobTimeoutMs = Math.max(10_000, Math.floor(opts.timeoutMs));
+    }
+    if (opts.size != null && Number.isFinite(opts.size)) {
+      const want = Math.min(4, Math.max(1, Math.floor(opts.size)));
+      this.maxSize = want;
+      this.ensureSize(want);
+      // 缩容：多余空闲 worker 不强杀（避免打断 inflight），仅不再补位；
+      // 若 alive > want 且有空闲，尝试结束空闲的
+      const alive = this.slots.filter((s) => !s.dead);
+      let extra = alive.length - want;
+      if (extra > 0) {
+        for (const s of alive) {
+          if (extra <= 0) break;
+          if (!s.busy && s.queue.length === 0) {
+            s.dead = true;
+            try {
+              s.child.stdin.end();
+            } catch {
+              /* ignore */
+            }
+            try {
+              s.child.kill();
+            } catch {
+              /* ignore */
+            }
+            extra -= 1;
+          }
+        }
+        this.slots = this.slots.filter((s) => !s.dead);
+      }
+    }
   }
 
   ensureSize(size: number): void {
@@ -183,7 +260,34 @@ export class PythonJobPool {
     for (let i = alive; i < want; i++) this.spawnSlot();
   }
 
+  getStats(key?: string): PythonPoolStats {
+    const alive = this.slots.filter((s) => !s.dead);
+    let busy = 0;
+    let queued = 0;
+    for (const s of alive) {
+      if (s.busy) busy += 1;
+      queued += s.queue.length;
+    }
+    return {
+      key: key || poolKey(this.pythonPath, this.registerDir),
+      pythonPath: this.pythonPath,
+      registerDir: this.registerDir,
+      workers: alive.length,
+      busy,
+      queued,
+      jobsTotal: this.jobsTotal,
+      jobsOk: this.jobsOk,
+      jobsFail: this.jobsFail,
+      timeouts: this.timeouts,
+      spawns: this.spawns,
+      timeoutMs: this.jobTimeoutMs,
+      maxSize: this.maxSize
+    };
+  }
+
   private spawnSlot(): void {
+    if (this.disposed) return;
+    if (this.slots.filter((s) => !s.dead).length >= this.maxSize) return;
     try {
       const child = spawn(this.pythonPath, ['-u', '-c', this.code], {
         cwd: this.registerDir,
@@ -191,6 +295,7 @@ export class PythonJobPool {
         windowsHide: true,
         stdio: ['pipe', 'pipe', 'pipe']
       }) as ChildProcessWithoutNullStreams;
+      this.spawns += 1;
 
       const slot: Slot = {
         child,
@@ -220,6 +325,9 @@ export class PythonJobPool {
           clearTimeout(q.pending.timer);
           const { _id, ...rest } = msg;
           void _id;
+          this.jobsTotal += 1;
+          if (rest.ok === false || rest.error) this.jobsFail += 1;
+          else this.jobsOk += 1;
           q.pending.resolve(rest);
           slot.busy = false;
           this.pump(slot);
@@ -230,6 +338,8 @@ export class PythonJobPool {
         slot.dead = true;
         for (const q of slot.queue) {
           clearTimeout(q.pending.timer);
+          this.jobsTotal += 1;
+          this.jobsFail += 1;
           q.pending.reject(err);
         }
         slot.queue = [];
@@ -240,13 +350,16 @@ export class PythonJobPool {
         const s = String(d).trim();
         if (s) console.warn('[python-pool] stderr:', s.slice(0, 300));
       });
-      child.on('error', (err) => killPending(err instanceof Error ? err : new Error(String(err))));
+      child.on('error', (err) =>
+        killPending(err instanceof Error ? err : new Error(String(err)))
+      );
       child.on('close', (code) => {
         killPending(new Error(`python worker exit ${code}`));
-        // 自动补位
         if (!this.disposed) {
           this.slots = this.slots.filter((s) => s !== slot);
-          this.spawnSlot();
+          if (this.slots.filter((s) => !s.dead).length < this.maxSize) {
+            this.spawnSlot();
+          }
         }
       });
 
@@ -267,6 +380,8 @@ export class PythonJobPool {
     } catch (err) {
       slot.queue.shift();
       clearTimeout(next.pending.timer);
+      this.jobsTotal += 1;
+      this.jobsFail += 1;
       next.pending.reject(err instanceof Error ? err : new Error(String(err)));
       slot.busy = false;
       this.pump(slot);
@@ -276,20 +391,20 @@ export class PythonJobPool {
   run(job: PythonPoolJob): Promise<Record<string, unknown>> {
     if (this.disposed) return Promise.reject(new Error('python pool disposed'));
     const alive = this.slots.filter((s) => !s.dead);
-    if (alive.length === 0) {
-      this.spawnSlot();
-    }
+    if (alive.length === 0) this.spawnSlot();
     const slots = this.slots.filter((s) => !s.dead);
     if (slots.length === 0) {
       return Promise.reject(new Error('no python workers'));
     }
-    // 选队列最短的 worker
     slots.sort((a, b) => a.queue.length - b.queue.length);
     const slot = slots[0];
     const id = randomUUID();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         slot.queue = slot.queue.filter((x) => x.id !== id);
+        this.jobsTotal += 1;
+        this.jobsFail += 1;
+        this.timeouts += 1;
         reject(new Error('python pool job timeout'));
         slot.busy = false;
         this.pump(slot);
@@ -301,6 +416,15 @@ export class PythonJobPool {
       });
       this.pump(slot);
     });
+  }
+
+  async ping(): Promise<boolean> {
+    try {
+      const r = await this.run({ op: 'ping' });
+      return r.ok === true || r.pong === true;
+    } catch {
+      return false;
+    }
   }
 
   dispose(): void {

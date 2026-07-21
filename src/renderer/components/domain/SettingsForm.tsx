@@ -202,6 +202,22 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
   const [secProxy, setSecProxy] = useState(false);
   const [secRegister, setSecRegister] = useState(false);
   const [secAuth, setSecAuth] = useState(false);
+  const [poolStats, setPoolStats] = useState<{
+    enabled: boolean;
+    size: number;
+    timeoutSec: number;
+    totals: {
+      workers: number;
+      busy: number;
+      queued: number;
+      jobsTotal: number;
+      jobsOk: number;
+      jobsFail: number;
+      timeouts: number;
+      spawns: number;
+    };
+  } | null>(null);
+  const [poolBusy, setPoolBusy] = useState(false);
   const [secPush, setSecPush] = useState(false);
 
   useEffect(() => {
@@ -1500,6 +1516,179 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
               />
             </Field>
           </div>
+
+          
+            <div className="space-y-2 rounded-[12px] border border-border/60 bg-muted/20 p-3">
+              <div className="text-[12px] font-semibold tracking-tight">Python 进程池</div>
+              <p className="text-[11px] leading-relaxed text-muted-foreground">
+                重签/补签复用常驻 Python worker，减少冷启动。关闭后回退为每条任务单独 spawn。
+              </p>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <ToggleRow
+                  label="启用进程池"
+                  hint="默认开。批量重签与号池补签 Auth 共用"
+                  checked={draft.pythonPoolEnabled !== false}
+                  onChange={(v) => update('pythonPoolEnabled', v)}
+                />
+                <Field
+                  label="Worker 数"
+                  hint="1～4，默认 2（可与重签并发接近）"
+                >
+                  <Input
+                    type="number"
+                    min={1}
+                    max={4}
+                    value={
+                      draft.pythonPoolSize == null ? 2 : draft.pythonPoolSize
+                    }
+                    onChange={(e) => {
+                      const n = Number(e.target.value);
+                      update(
+                        'pythonPoolSize',
+                        Number.isFinite(n)
+                          ? Math.min(4, Math.max(1, Math.floor(n)))
+                          : 2
+                      );
+                    }}
+                  />
+                </Field>
+                <Field
+                  label="单任务超时（秒）"
+                  hint="30～600，默认 180"
+                >
+                  <Input
+                    type="number"
+                    min={30}
+                    max={600}
+                    value={
+                      draft.pythonPoolTimeoutSec == null
+                        ? 180
+                        : draft.pythonPoolTimeoutSec
+                    }
+                    onChange={(e) => {
+                      const n = Number(e.target.value);
+                      update(
+                        'pythonPoolTimeoutSec',
+                        Number.isFinite(n)
+                          ? Math.min(600, Math.max(30, Math.floor(n)))
+                          : 180
+                      );
+                    }}
+                  />
+                </Field>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  disabled={poolBusy}
+                  onClick={() => {
+                    void (async () => {
+                      setPoolBusy(true);
+                      try {
+                        const s = await window.api.getPythonPoolStats();
+                        setPoolStats(s);
+                      } catch (err) {
+                        push({
+                          tone: 'danger',
+                          title: '读取进程池失败',
+                          description:
+                            err instanceof Error ? err.message : String(err)
+                        });
+                      } finally {
+                        setPoolBusy(false);
+                      }
+                    })();
+                  }}
+                >
+                  <Activity className="h-3.5 w-3.5" />
+                  刷新指标
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  disabled={poolBusy}
+                  onClick={() => {
+                    void (async () => {
+                      setPoolBusy(true);
+                      try {
+                        const r = await window.api.pingPythonPool({});
+                        const s = await window.api.getPythonPoolStats();
+                        setPoolStats(s);
+                        push({
+                          tone: r.ok ? 'ok' : 'warn',
+                          title: r.ok ? '进程池探测 OK' : '进程池探测失败',
+                          description: r.error || (r.ok ? 'ping 成功' : 'ping 未通过')
+                        });
+                      } catch (err) {
+                        push({
+                          tone: 'danger',
+                          title: '进程池探测失败',
+                          description:
+                            err instanceof Error ? err.message : String(err)
+                        });
+                      } finally {
+                        setPoolBusy(false);
+                      }
+                    })();
+                  }}
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  探测
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  disabled={poolBusy}
+                  onClick={() => {
+                    void (async () => {
+                      setPoolBusy(true);
+                      try {
+                        await window.api.pingPythonPool({ reset: true });
+                        const s = await window.api.getPythonPoolStats();
+                        setPoolStats(s);
+                        push({
+                          tone: 'ok',
+                          title: '进程池已重置',
+                          description: '旧 worker 已结束，下次任务将重建'
+                        });
+                      } catch (err) {
+                        push({
+                          tone: 'danger',
+                          title: '重置失败',
+                          description:
+                            err instanceof Error ? err.message : String(err)
+                        });
+                      } finally {
+                        setPoolBusy(false);
+                      }
+                    })();
+                  }}
+                >
+                  重置池
+                </Button>
+              </div>
+              {poolStats ? (
+                <p className="text-[11px] tabular-nums text-muted-foreground">
+                  {poolStats.enabled ? '已启用' : '已关闭'}
+                  {' · '}配置 size={poolStats.size} timeout={poolStats.timeoutSec}s
+                  {' · '}workers {poolStats.totals.workers}
+                  {' · '}busy {poolStats.totals.busy}
+                  {' · '}queued {poolStats.totals.queued}
+                  {' · '}jobs {poolStats.totals.jobsOk}/{poolStats.totals.jobsTotal}
+                  {' · '}fail {poolStats.totals.jobsFail}
+                  {' · '}timeouts {poolStats.totals.timeouts}
+                  {' · '}spawns {poolStats.totals.spawns}
+                </p>
+              ) : (
+                <p className="text-[11px] text-muted-foreground">
+                  点「刷新指标」查看当前 worker / 排队 / 超时
+                </p>
+              )}
+            </div>
 
           {/* ③ 测活清理 */}
           <div className="space-y-3 border-t border-border/50 pt-3">

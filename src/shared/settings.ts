@@ -279,6 +279,19 @@ export interface AppSettings {
    */
   cpaResignConcurrency: number;
   /**
+   * 重签/补签是否启用常驻 Python 进程池（默认 true）。
+   * 关闭后每条任务单独 spawn。
+   */
+  pythonPoolEnabled: boolean;
+  /**
+   * Python 进程池 worker 数（1～4，默认 2）。
+   */
+  pythonPoolSize: number;
+  /**
+   * 单任务超时（秒，默认 180，范围 30～600）。
+   */
+  pythonPoolTimeoutSec: number;
+  /**
    * 手动「重签 cli/api」成功后是否再推远程 CPA。
    * 默认 false（仅本地写文件）。401 自动重签不读此开关。
    */
@@ -445,6 +458,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   cpaProbeDeleteSsoOnDead: false,
   autoResignOn401: false,
   cpaResignConcurrency: 2,
+  pythonPoolEnabled: true,
+  pythonPoolSize: 2,
+  pythonPoolTimeoutSec: 180,
   resignPushRemote: false,
   proxyIpIntervalSec: 0,
   skipBotFlag1OnMint: true,

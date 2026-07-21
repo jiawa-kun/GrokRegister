@@ -100,6 +100,12 @@ import {
   listSub2apiGroups
 } from './cpaAuthStore.js';
 import { pushSsoToGrok2apiBatch } from './ssoGrok2apiPush.js';
+import {
+  listPythonJobPoolStats,
+  disposeAllPythonJobPools,
+  getPythonJobPool
+} from './pythonJobPool.js';
+import { resolveRegisterRuntime } from './bot/registerRuntime.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 6657);
@@ -515,6 +521,71 @@ app.get('/api/system/update-check', asyncHandler(async (_req, res) => {
 }));
 
 /** 授权队列 metrics（register/data/auth_queue_metrics.json） */
+/** Python 进程池健康指标 */
+app.get('/api/python-pool/stats', asyncHandler(async (_req, res) => {
+  const settings = await loadSettings();
+  const pools = listPythonJobPoolStats();
+  const totals = pools.reduce(
+    (acc, p) => {
+      acc.workers += p.workers;
+      acc.busy += p.busy;
+      acc.queued += p.queued;
+      acc.jobsTotal += p.jobsTotal;
+      acc.jobsOk += p.jobsOk;
+      acc.jobsFail += p.jobsFail;
+      acc.timeouts += p.timeouts;
+      acc.spawns += p.spawns;
+      return acc;
+    },
+    {
+      workers: 0,
+      busy: 0,
+      queued: 0,
+      jobsTotal: 0,
+      jobsOk: 0,
+      jobsFail: 0,
+      timeouts: 0,
+      spawns: 0
+    }
+  );
+  res.json({
+    enabled: settings.pythonPoolEnabled !== false,
+    size: settings.pythonPoolSize ?? 2,
+    timeoutSec: settings.pythonPoolTimeoutSec ?? 180,
+    pools,
+    totals
+  });
+}));
+
+/** 探测进程池（触发 spawn + ping）；可选 reset */
+app.post('/api/python-pool/ping', asyncHandler(async (req, res) => {
+  const settings = await loadSettings();
+  if (settings.pythonPoolEnabled === false) {
+    res.json({ ok: false, enabled: false, error: 'python pool disabled' });
+    return;
+  }
+  const body = (req.body ?? {}) as { reset?: boolean };
+  if (body.reset) disposeAllPythonJobPools();
+  const rt = resolveRegisterRuntime(settings);
+  if (!rt) {
+    res.status(400).json({ error: '未找到注册脚本目录' });
+    return;
+  }
+  const size = Math.min(4, Math.max(1, Number(settings.pythonPoolSize) || 2));
+  const timeoutMs = Math.min(
+    600_000,
+    Math.max(10_000, (Number(settings.pythonPoolTimeoutSec) || 180) * 1000)
+  );
+  const pool = getPythonJobPool(rt.pythonPath, rt.registerDir, size, timeoutMs);
+  const ok = await pool.ping();
+  res.json({
+    ok,
+    enabled: true,
+    stats: pool.getStats(),
+    all: listPythonJobPoolStats()
+  });
+}));
+
 app.get('/api/auth-queue/metrics', asyncHandler(async (_req, res) => {
   try {
     const { loadSettings } = await import('./settingsStore.js');
