@@ -342,15 +342,44 @@ export interface AutoTaskStepSummary {
   remoteFailed?: number;
   botFlagSkipped?: number;
   ssoDeleted?: number;
+  durationMs?: number;
+  retrySelected?: number;
+  retryRecorded?: number;
+  retryCleared?: number;
+  failReasons?: Record<string, number>;
+  modeCounts?: Record<string, number>;
 }
 
 export interface AutoTaskRunSummary {
+  id?: string;
   reason: string;
   startedAt: string;
   finishedAt?: string;
   durationMs?: number;
   steps: Record<string, AutoTaskStepSummary>;
   errors?: string[];
+}
+
+export interface AutoTaskRetryItem {
+  key: string;
+  step: string;
+  target: string;
+  attempts: number;
+  maxAttempts: number;
+  lastReason: string;
+  lastError?: string;
+  lastAt: string;
+  nextAt: string | null;
+  retryable: boolean;
+}
+
+export interface AutoTaskRetryOverview {
+  total: number;
+  due: number;
+  blocked: number;
+  byStep: Record<string, number>;
+  byReason: Record<string, number>;
+  items: AutoTaskRetryItem[];
 }
 
 export interface AutoTaskStatus {
@@ -363,6 +392,8 @@ export interface AutoTaskStatus {
   nextRunAt: string | null;
   lastError: string | null;
   lastSummary: AutoTaskRunSummary | null;
+  history: AutoTaskRunSummary[];
+  retry: AutoTaskRetryOverview;
 }
 
 /** preload 暴露给 renderer 的 typed surface（与 src/preload/index.ts 保持一致） */

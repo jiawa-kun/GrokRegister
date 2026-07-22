@@ -189,6 +189,16 @@ export interface AppSettings {
   autoTaskIntervalMin: number;
   /** 库存自动任务每个子任务单轮最多处理数量，默认 100，范围 10～200。 */
   autoTaskBatchLimit: number;
+  /** 自动任务历史保留条数，默认 20，范围 5～100。 */
+  autoTaskHistoryLimit: number;
+  /** 存活 SSO 快照超过多少小时后重新验活，默认 24，范围 1～168。 */
+  autoTaskSsoRecheckHours: number;
+  /** 失败原因智能复检开关，仅重试 timeout/network/429/http_error 等暂态错误。 */
+  autoTaskRetryEnabled: boolean;
+  /** 智能复检基础退避分钟数，默认 60，范围 5～1440。 */
+  autoTaskRetryBackoffMin: number;
+  /** 单目标智能复检最大尝试次数，默认 3，范围 1～10。 */
+  autoTaskRetryMaxAttempts: number;
   /** 库存自动 SSO 验活：扫未验活/未知/过期存活快照。 */
   autoTaskSsoCheckEnabled: boolean;
   /** 库存自动 Auth：扫未转 Auth 的 SSO，先验活，存活再 mint。 */
@@ -451,6 +461,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoTaskEnabled: false,
   autoTaskIntervalMin: 30,
   autoTaskBatchLimit: 100,
+  autoTaskHistoryLimit: 20,
+  autoTaskSsoRecheckHours: 24,
+  autoTaskRetryEnabled: true,
+  autoTaskRetryBackoffMin: 60,
+  autoTaskRetryMaxAttempts: 3,
   autoTaskSsoCheckEnabled: false,
   autoTaskAuthMintEnabled: false,
   autoTaskCpaProbeEnabled: false,
@@ -1328,6 +1343,30 @@ export function validateSettings(s: AppSettings): Record<string, string> {
       const n = Number(s.autoTaskBatchLimit);
       if (!Number.isInteger(n) || n < 10 || n > 200) {
         errors.autoTaskBatchLimit = '自动任务每轮上限须在 10～200 之间';
+      }
+    }
+    {
+      const n = Number(s.autoTaskHistoryLimit);
+      if (!Number.isInteger(n) || n < 5 || n > 100) {
+        errors.autoTaskHistoryLimit = '自动任务历史保留须在 5～100 条';
+      }
+    }
+    {
+      const n = Number(s.autoTaskSsoRecheckHours);
+      if (!Number.isInteger(n) || n < 1 || n > 168) {
+        errors.autoTaskSsoRecheckHours = 'SSO 复验窗口须在 1～168 小时';
+      }
+    }
+    {
+      const n = Number(s.autoTaskRetryBackoffMin);
+      if (!Number.isInteger(n) || n < 5 || n > 1440) {
+        errors.autoTaskRetryBackoffMin = '智能复检退避须在 5～1440 分钟';
+      }
+    }
+    {
+      const n = Number(s.autoTaskRetryMaxAttempts);
+      if (!Number.isInteger(n) || n < 1 || n > 10) {
+        errors.autoTaskRetryMaxAttempts = '智能复检最大次数须在 1～10 次';
       }
     }
     {

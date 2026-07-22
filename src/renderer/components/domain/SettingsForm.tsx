@@ -95,7 +95,7 @@ function formatDateTime(value?: string | null): string {
   return d.toLocaleString();
 }
 
-function compactAutoTaskSummary(status: AutoTaskStatus | null): string {
+function compactAutoTaskSummary(status: Pick<AutoTaskStatus, 'lastSummary'> | null): string {
   const steps = status?.lastSummary?.steps || {};
   const parts: string[] = [];
   const add = (label: string, key: string) => {
@@ -1924,6 +1924,104 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
           </div>
 
           <div className="grid gap-3 sm:grid-cols-2">
+            <Field
+              label="历史保留条数"
+              hint="自动任务状态会持久化到服务端，重启后仍可查看最近记录"
+              error={errors.autoTaskHistoryLimit}
+            >
+              <Input
+                type="number"
+                min={5}
+                max={100}
+                value={draft.autoTaskHistoryLimit ?? 20}
+                onChange={(e) => {
+                  const n = Number(e.target.value);
+                  update(
+                    'autoTaskHistoryLimit',
+                    Number.isFinite(n)
+                      ? Math.max(5, Math.min(100, Math.floor(n)))
+                      : 20
+                  );
+                }}
+              />
+            </Field>
+            <Field
+              label="SSO 复验窗口（小时）"
+              hint="已存活 SSO 超过该时间后才再次验活；unknown 不受此窗口限制"
+              error={errors.autoTaskSsoRecheckHours}
+            >
+              <Input
+                type="number"
+                min={1}
+                max={168}
+                value={draft.autoTaskSsoRecheckHours ?? 24}
+                onChange={(e) => {
+                  const n = Number(e.target.value);
+                  update(
+                    'autoTaskSsoRecheckHours',
+                    Number.isFinite(n)
+                      ? Math.max(1, Math.min(168, Math.floor(n)))
+                      : 24
+                  );
+                }}
+              />
+            </Field>
+          </div>
+
+          <div className="space-y-3 rounded-[12px] border border-border/60 bg-muted/20 p-3">
+            <ToggleRow
+              label="智能复检"
+              hint="只对 timeout / network / 429 / http_error / unknown 等暂态错误做退避重试；永久错误只入 blocked 统计"
+              checked={draft.autoTaskRetryEnabled !== false}
+              onChange={(v) => update('autoTaskRetryEnabled', v)}
+            />
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field
+                label="复检基础退避（分钟）"
+                hint="每失败一次按 1x/2x/4x 递增，最高 24 小时"
+                error={errors.autoTaskRetryBackoffMin}
+              >
+                <Input
+                  type="number"
+                  min={5}
+                  max={1440}
+                  value={draft.autoTaskRetryBackoffMin ?? 60}
+                  onChange={(e) => {
+                    const n = Number(e.target.value);
+                    update(
+                      'autoTaskRetryBackoffMin',
+                      Number.isFinite(n)
+                        ? Math.max(5, Math.min(1440, Math.floor(n)))
+                        : 60
+                    );
+                  }}
+                />
+              </Field>
+              <Field
+                label="单目标最大复检次数"
+                hint="超过次数后转 blocked，避免同一坏目标无限重试"
+                error={errors.autoTaskRetryMaxAttempts}
+              >
+                <Input
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={draft.autoTaskRetryMaxAttempts ?? 3}
+                  onChange={(e) => {
+                    const n = Number(e.target.value);
+                    update(
+                      'autoTaskRetryMaxAttempts',
+                      Number.isFinite(n)
+                        ? Math.max(1, Math.min(10, Math.floor(n)))
+                        : 3
+                    );
+                  }}
+                />
+              </Field>
+            </div>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2">
             <ToggleRow
               label="自动 SSO 验活"
               hint="扫未验活、未知，以及超过 24 小时的存活快照；写回号池三态"
@@ -1983,17 +2081,7 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
                         push({
                           tone: r.errors?.length ? 'warn' : 'ok',
                           title: r.errors?.length ? '自动任务执行完成，有错误' : '自动任务已执行',
-                          description: compactAutoTaskSummary({
-                            enabled: draft.autoTaskEnabled === true,
-                            running: false,
-                            intervalMin: draft.autoTaskIntervalMin ?? 30,
-                            batchLimit: draft.autoTaskBatchLimit ?? 100,
-                            lastStartedAt: r.startedAt,
-                            lastFinishedAt: r.finishedAt ?? null,
-                            nextRunAt: null,
-                            lastError: r.errors?.join('；') ?? null,
-                            lastSummary: r
-                          })
+                          description: compactAutoTaskSummary({ lastSummary: r })
                         });
                       } catch (err) {
                         push({
@@ -2035,6 +2123,79 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
                 最近错误：{autoTaskStatus.lastError}
               </p>
             )}
+            <div className="grid gap-3 border-t border-border/50 pt-3 lg:grid-cols-2">
+              <div className="space-y-2">
+                <div className="text-[12px] font-semibold tracking-tight">智能复检队列</div>
+                <p className="text-[11px] text-muted-foreground">
+                  total {autoTaskStatus?.retry?.total ?? 0}
+                  {' · '}due {autoTaskStatus?.retry?.due ?? 0}
+                  {' · '}blocked {autoTaskStatus?.retry?.blocked ?? 0}
+                </p>
+                {autoTaskStatus?.retry?.byReason &&
+                Object.keys(autoTaskStatus.retry.byReason).length > 0 ? (
+                  <div className="flex flex-wrap gap-1.5">
+                    {Object.entries(autoTaskStatus.retry.byReason).map(([reason, count]) => (
+                      <span
+                        key={reason}
+                        className="rounded-full bg-background px-2 py-0.5 text-[11px] text-muted-foreground"
+                      >
+                        {reason}:{count}
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-muted-foreground">暂无待复检目标</p>
+                )}
+                {autoTaskStatus?.retry?.items?.length ? (
+                  <div className="max-h-32 space-y-1 overflow-auto rounded-lg bg-background/70 p-2">
+                    {autoTaskStatus.retry.items.slice(0, 8).map((item) => (
+                      <div
+                        key={item.key}
+                        className="flex items-center justify-between gap-2 text-[11px]"
+                      >
+                        <span className="min-w-0 truncate text-muted-foreground">
+                          {item.step} · {item.target} · {item.lastReason}
+                        </span>
+                        <span className="shrink-0 tabular-nums text-muted-foreground">
+                          {item.retryable
+                            ? `#${item.attempts}/${item.maxAttempts} ${formatDateTime(
+                                item.nextAt
+                              )}`
+                            : `blocked #${item.attempts}`}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+              <div className="space-y-2">
+                <div className="text-[12px] font-semibold tracking-tight">最近历史</div>
+                {autoTaskStatus?.history?.length ? (
+                  <div className="max-h-44 space-y-1 overflow-auto rounded-lg bg-background/70 p-2">
+                    {autoTaskStatus.history.slice(0, 6).map((run) => (
+                      <div key={run.id || run.startedAt} className="space-y-0.5 text-[11px]">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-medium text-foreground">
+                            {run.reason} · {formatDateTime(run.finishedAt || run.startedAt)}
+                          </span>
+                          <span className="shrink-0 tabular-nums text-muted-foreground">
+                            {Math.round((run.durationMs || 0) / 1000)}s
+                          </span>
+                        </div>
+                        <p className="truncate text-muted-foreground">
+                          {compactAutoTaskSummary({ lastSummary: run })}
+                        </p>
+                        {run.errors?.length ? (
+                          <p className="truncate text-danger">{run.errors.join('；')}</p>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-muted-foreground">暂无历史记录</p>
+                )}
+              </div>
+            </div>
           </div>
         </CardBody>
       </Card>

@@ -362,6 +362,30 @@ function merge(partial: unknown): AppSettings {
       if (!Number.isFinite(n) || n < 10) return DEFAULT_SETTINGS.autoTaskBatchLimit;
       return Math.min(Math.floor(n), 200);
     })(),
+    autoTaskHistoryLimit: (() => {
+      const n = Number((p as AppSettings).autoTaskHistoryLimit);
+      if (!Number.isFinite(n) || n < 5) return DEFAULT_SETTINGS.autoTaskHistoryLimit;
+      return Math.min(Math.floor(n), 100);
+    })(),
+    autoTaskSsoRecheckHours: (() => {
+      const n = Number((p as AppSettings).autoTaskSsoRecheckHours);
+      if (!Number.isFinite(n) || n < 1) return DEFAULT_SETTINGS.autoTaskSsoRecheckHours;
+      return Math.min(Math.floor(n), 168);
+    })(),
+    autoTaskRetryEnabled:
+      typeof p.autoTaskRetryEnabled === 'boolean'
+        ? p.autoTaskRetryEnabled
+        : DEFAULT_SETTINGS.autoTaskRetryEnabled,
+    autoTaskRetryBackoffMin: (() => {
+      const n = Number((p as AppSettings).autoTaskRetryBackoffMin);
+      if (!Number.isFinite(n) || n < 5) return DEFAULT_SETTINGS.autoTaskRetryBackoffMin;
+      return Math.min(Math.floor(n), 1440);
+    })(),
+    autoTaskRetryMaxAttempts: (() => {
+      const n = Number((p as AppSettings).autoTaskRetryMaxAttempts);
+      if (!Number.isFinite(n) || n < 1) return DEFAULT_SETTINGS.autoTaskRetryMaxAttempts;
+      return Math.min(Math.floor(n), 10);
+    })(),
     autoTaskSsoCheckEnabled:
       typeof p.autoTaskSsoCheckEnabled === 'boolean'
         ? p.autoTaskSsoCheckEnabled
