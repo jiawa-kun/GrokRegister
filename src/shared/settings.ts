@@ -189,6 +189,20 @@ export interface AppSettings {
   autoTaskIntervalMin: number;
   /** 库存自动任务每个子任务单轮最多处理数量，默认 100，范围 10～200。 */
   autoTaskBatchLimit: number;
+  /** 单轮自动任务最大运行时长（分钟），默认 20，范围 5～180。超时后停止领取新任务。 */
+  autoTaskMaxRunMinutes: number;
+  /** 自动 SSO 验活单轮上限，默认 100，范围 1～200。 */
+  autoTaskSsoBatchLimit: number;
+  /** 自动 Auth mint 单轮上限，默认 20，范围 1～200。 */
+  autoTaskAuthMintBatchLimit: number;
+  /** 自动 CPA 测活单轮上限，默认 100，范围 1～200。 */
+  autoTaskCpaProbeBatchLimit: number;
+  /** 自动 Auth→CPA 推送单轮上限，默认 30，范围 1～200。 */
+  autoTaskPushCpaBatchLimit: number;
+  /** 自动 Auth→sub2api 推送单轮上限，默认 30，范围 1～200。 */
+  autoTaskPushSub2apiBatchLimit: number;
+  /** 自动 SSO→grok2api 推送单轮上限，默认 30，范围 1～200。 */
+  autoTaskPushGrok2apiBatchLimit: number;
   /** 自动任务历史保留条数，默认 20，范围 5～100。 */
   autoTaskHistoryLimit: number;
   /** 存活 SSO 快照超过多少小时后重新验活，默认 24，范围 1～168。 */
@@ -461,6 +475,13 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoTaskEnabled: false,
   autoTaskIntervalMin: 30,
   autoTaskBatchLimit: 100,
+  autoTaskMaxRunMinutes: 20,
+  autoTaskSsoBatchLimit: 100,
+  autoTaskAuthMintBatchLimit: 20,
+  autoTaskCpaProbeBatchLimit: 100,
+  autoTaskPushCpaBatchLimit: 30,
+  autoTaskPushSub2apiBatchLimit: 30,
+  autoTaskPushGrok2apiBatchLimit: 30,
   autoTaskHistoryLimit: 20,
   autoTaskSsoRecheckHours: 24,
   autoTaskRetryEnabled: true,
@@ -1343,6 +1364,25 @@ export function validateSettings(s: AppSettings): Record<string, string> {
       const n = Number(s.autoTaskBatchLimit);
       if (!Number.isInteger(n) || n < 10 || n > 200) {
         errors.autoTaskBatchLimit = '自动任务每轮上限须在 10～200 之间';
+      }
+    }
+    {
+      const n = Number(s.autoTaskMaxRunMinutes);
+      if (!Number.isInteger(n) || n < 5 || n > 180) {
+        errors.autoTaskMaxRunMinutes = '自动任务最大运行时长须在 5～180 分钟';
+      }
+    }
+    for (const [key, label] of [
+      ['autoTaskSsoBatchLimit', 'SSO 验活上限'],
+      ['autoTaskAuthMintBatchLimit', 'Auth 上限'],
+      ['autoTaskCpaProbeBatchLimit', 'CPA 测活上限'],
+      ['autoTaskPushCpaBatchLimit', 'CPA 推送上限'],
+      ['autoTaskPushSub2apiBatchLimit', 'sub2api 推送上限'],
+      ['autoTaskPushGrok2apiBatchLimit', 'grok2api 推送上限']
+    ] as const) {
+      const n = Number(s[key]);
+      if (!Number.isInteger(n) || n < 1 || n > 200) {
+        errors[key] = `${label}须在 1～200 之间`;
       }
     }
     {

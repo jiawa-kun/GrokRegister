@@ -362,6 +362,41 @@ function merge(partial: unknown): AppSettings {
       if (!Number.isFinite(n) || n < 10) return DEFAULT_SETTINGS.autoTaskBatchLimit;
       return Math.min(Math.floor(n), 200);
     })(),
+    autoTaskMaxRunMinutes: (() => {
+      const n = Number((p as AppSettings).autoTaskMaxRunMinutes);
+      if (!Number.isFinite(n) || n < 5) return DEFAULT_SETTINGS.autoTaskMaxRunMinutes;
+      return Math.min(Math.floor(n), 180);
+    })(),
+    autoTaskSsoBatchLimit: (() => {
+      const n = Number((p as AppSettings).autoTaskSsoBatchLimit);
+      if (!Number.isFinite(n) || n < 1) return DEFAULT_SETTINGS.autoTaskSsoBatchLimit;
+      return Math.min(Math.floor(n), 200);
+    })(),
+    autoTaskAuthMintBatchLimit: (() => {
+      const n = Number((p as AppSettings).autoTaskAuthMintBatchLimit);
+      if (!Number.isFinite(n) || n < 1) return DEFAULT_SETTINGS.autoTaskAuthMintBatchLimit;
+      return Math.min(Math.floor(n), 200);
+    })(),
+    autoTaskCpaProbeBatchLimit: (() => {
+      const n = Number((p as AppSettings).autoTaskCpaProbeBatchLimit);
+      if (!Number.isFinite(n) || n < 1) return DEFAULT_SETTINGS.autoTaskCpaProbeBatchLimit;
+      return Math.min(Math.floor(n), 200);
+    })(),
+    autoTaskPushCpaBatchLimit: (() => {
+      const n = Number((p as AppSettings).autoTaskPushCpaBatchLimit);
+      if (!Number.isFinite(n) || n < 1) return DEFAULT_SETTINGS.autoTaskPushCpaBatchLimit;
+      return Math.min(Math.floor(n), 200);
+    })(),
+    autoTaskPushSub2apiBatchLimit: (() => {
+      const n = Number((p as AppSettings).autoTaskPushSub2apiBatchLimit);
+      if (!Number.isFinite(n) || n < 1) return DEFAULT_SETTINGS.autoTaskPushSub2apiBatchLimit;
+      return Math.min(Math.floor(n), 200);
+    })(),
+    autoTaskPushGrok2apiBatchLimit: (() => {
+      const n = Number((p as AppSettings).autoTaskPushGrok2apiBatchLimit);
+      if (!Number.isFinite(n) || n < 1) return DEFAULT_SETTINGS.autoTaskPushGrok2apiBatchLimit;
+      return Math.min(Math.floor(n), 200);
+    })(),
     autoTaskHistoryLimit: (() => {
       const n = Number((p as AppSettings).autoTaskHistoryLimit);
       if (!Number.isFinite(n) || n < 5) return DEFAULT_SETTINGS.autoTaskHistoryLimit;

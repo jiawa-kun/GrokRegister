@@ -101,8 +101,14 @@ import {
 } from './cpaAuthStore.js';
 import { pushSsoToGrok2apiBatch } from './ssoGrok2apiPush.js';
 import {
+  clearAutoTaskBlocked,
   getAutoTaskStatus,
+  pauseAutoTasks,
+  requestStopAutoTaskRun,
+  resumeAutoTasks,
+  runAutoTaskDue,
   runAutoTaskOnce,
+  runAutoTaskStep,
   startAutoTaskRunner,
   stopAutoTaskRunner
 } from './autoTaskRunner.js';
@@ -642,6 +648,45 @@ app.post('/api/auto-tasks/run-once', asyncHandler(async (_req, res) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(400).json({ error: message });
   }
+}));
+
+app.post('/api/auto-tasks/run-step', asyncHandler(async (req, res) => {
+  try {
+    const step = String((req.body as { step?: string })?.step || '');
+    if (!['ssoCheck', 'authMint', 'cpaProbe', 'push'].includes(step)) {
+      res.status(400).json({ error: '未知自动任务步骤' });
+      return;
+    }
+    res.json(await runAutoTaskStep(step as 'ssoCheck' | 'authMint' | 'cpaProbe' | 'push'));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: message });
+  }
+}));
+
+app.post('/api/auto-tasks/run-due', asyncHandler(async (_req, res) => {
+  try {
+    res.json(await runAutoTaskDue());
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: message });
+  }
+}));
+
+app.post('/api/auto-tasks/pause', asyncHandler(async (_req, res) => {
+  res.json(await pauseAutoTasks());
+}));
+
+app.post('/api/auto-tasks/resume', asyncHandler(async (_req, res) => {
+  res.json(await resumeAutoTasks());
+}));
+
+app.post('/api/auto-tasks/stop', asyncHandler(async (_req, res) => {
+  res.json(await requestStopAutoTaskRun());
+}));
+
+app.post('/api/auto-tasks/clear-blocked', asyncHandler(async (_req, res) => {
+  res.json(await clearAutoTaskBlocked());
 }));
 
 app.get('/api/run/status', asyncHandler(async (_req, res) => {

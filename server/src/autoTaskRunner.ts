@@ -5,6 +5,7 @@ import type {
 } from '@shared/runEvents';
 import type {
   AutoTaskRunSummary,
+  AutoTaskCurrentRun,
   AutoTaskRetryItem,
   AutoTaskRetryOverview,
   AutoTaskStatus,
@@ -54,8 +55,25 @@ type RetryStateItem = AutoTaskRetryItem & {
   createdAt: string;
 };
 
+type AutoTaskLogicalStep = 'ssoCheck' | 'authMint' | 'cpaProbe' | 'push';
+type AutoTaskSubStep =
+  | 'ssoCheck'
+  | 'authMint'
+  | 'cpaProbe'
+  | 'pushCpa'
+  | 'pushSub2api'
+  | 'pushGrok2api';
+
+type AutoTaskRunOptions = {
+  onlyStep?: AutoTaskLogicalStep;
+  dueOnly?: boolean;
+};
+
 type PersistedAutoTaskState = {
   version: number;
+  paused: boolean;
+  skippedWhileRunning: number;
+  currentRun: AutoTaskCurrentRun | null;
   lastStartedAt: string | null;
   lastFinishedAt: string | null;
   nextRunAt: string | null;
@@ -67,6 +85,12 @@ type PersistedAutoTaskState = {
 
 let timer: ReturnType<typeof setInterval> | null = null;
 let running = false;
+let paused = false;
+let skippedWhileRunning = 0;
+let stopRequested = false;
+let currentRun: AutoTaskCurrentRun | null = null;
+let activeRunStartedMs = 0;
+let activeRunMaxRunAtMs: number | null = null;
 let nextRunAtMs: number | null = null;
 let lastStartedAt: string | null = null;
 let lastFinishedAt: string | null = null;
@@ -114,6 +138,79 @@ function batchLimit(settings: AppSettings): number {
   return Math.min(Math.floor(n), 200);
 }
 
+function maxRunMs(settings: AppSettings): number {
+  const n = Number(settings.autoTaskMaxRunMinutes);
+  if (!Number.isFinite(n) || n < 5) return 20 * 60_000;
+  return Math.min(Math.floor(n), 180) * 60_000;
+}
+
+function stepBatchLimit(settings: AppSettings, step: AutoTaskSubStep): number {
+  const raw = (() => {
+    switch (step) {
+      case 'ssoCheck':
+        return Number(settings.autoTaskSsoBatchLimit);
+      case 'authMint':
+        return Number(settings.autoTaskAuthMintBatchLimit);
+      case 'cpaProbe':
+        return Number(settings.autoTaskCpaProbeBatchLimit);
+      case 'pushCpa':
+        return Number(settings.autoTaskPushCpaBatchLimit);
+      case 'pushSub2api':
+        return Number(settings.autoTaskPushSub2apiBatchLimit);
+      case 'pushGrok2api':
+        return Number(settings.autoTaskPushGrok2apiBatchLimit);
+      default:
+        return Number(settings.autoTaskBatchLimit);
+    }
+  })();
+  if (!Number.isFinite(raw) || raw < 1) return batchLimit(settings);
+  return Math.min(Math.floor(raw), 200);
+}
+
+function currentRunSnapshot(): AutoTaskCurrentRun | null {
+  if (!currentRun) return null;
+  return {
+    ...currentRun,
+    stopRequested,
+    elapsedMs: Math.max(0, Date.now() - activeRunStartedMs)
+  };
+}
+
+function markCurrentStep(step: AutoTaskCurrentRun['currentStep']): void {
+  if (!currentRun) return;
+  currentRun = {
+    ...currentRun,
+    currentStep: step,
+    stepStartedAt: step ? new Date().toISOString() : null
+  };
+}
+
+function stopGuardMessage(): { kind: 'stopped' | 'timeout'; message: string } | null {
+  if (stopRequested) {
+    return { kind: 'stopped', message: '已收到停止请求，当前轮结束后不再领取后续任务' };
+  }
+  if (activeRunMaxRunAtMs && Date.now() >= activeRunMaxRunAtMs) {
+    return { kind: 'timeout', message: '已达到自动任务最大运行时长，停止领取后续任务' };
+  }
+  return null;
+}
+
+function flagSummaryStop(summary: AutoTaskRunSummary, kind: 'stopped' | 'timeout'): void {
+  if (kind === 'timeout') {
+    summary.timeout = true;
+  } else {
+    summary.stopped = true;
+  }
+}
+
+function appendRunError(summary: AutoTaskRunSummary, message: string): void {
+  if (!message) return;
+  const errors = summary.errors || [];
+  if (!errors.includes(message)) {
+    summary.errors = [...errors, message];
+  }
+}
+
 function historyLimit(settings: AppSettings): number {
   const n = Number(settings.autoTaskHistoryLimit);
   if (!Number.isFinite(n) || n < 5) return 20;
@@ -154,6 +251,11 @@ async function ensureStateLoaded(): Promise<void> {
       }
       const raw = JSON.parse(await fsp.readFile(file, 'utf-8')) as Partial<PersistedAutoTaskState>;
       if (raw && typeof raw === 'object') {
+        paused = raw.paused === true;
+        skippedWhileRunning = Math.max(
+          0,
+          Math.floor(Number(raw.skippedWhileRunning) || 0)
+        );
         lastStartedAt = typeof raw.lastStartedAt === 'string' ? raw.lastStartedAt : null;
         lastFinishedAt = typeof raw.lastFinishedAt === 'string' ? raw.lastFinishedAt : null;
         lastError = typeof raw.lastError === 'string' ? raw.lastError : null;
@@ -170,6 +272,39 @@ async function ensureStateLoaded(): Promise<void> {
             : {};
         const nextMs = isoToMs(raw.nextRunAt);
         nextRunAtMs = nextMs && nextMs > Date.now() ? nextMs : null;
+        if (raw.currentRun && typeof raw.currentRun === 'object') {
+          const now = Date.now();
+          const run = raw.currentRun as Partial<AutoTaskCurrentRun>;
+          const startedAt =
+            typeof run.startedAt === 'string' && run.startedAt
+              ? run.startedAt
+              : lastStartedAt || new Date(now).toISOString();
+          const stepStartedMs = isoToMs(run.stepStartedAt);
+          const startedMs = isoToMs(startedAt) || now;
+          const interrupted: AutoTaskRunSummary = {
+            id: typeof run.id === 'string' && run.id ? run.id : `auto-interrupted-${now.toString(36)}`,
+            reason: typeof run.reason === 'string' && run.reason ? run.reason : 'unknown',
+            startedAt,
+            finishedAt: new Date(now).toISOString(),
+            durationMs: Math.max(0, now - startedMs),
+            steps: {},
+            errors: ['服务重启/热更导致自动任务中断'],
+            interrupted: true
+          };
+          if (typeof run.currentStep === 'string' && run.currentStep) {
+            interrupted.steps[run.currentStep] = {
+              failed: 1,
+              durationMs: Math.max(0, now - (stepStartedMs || startedMs))
+            };
+          }
+          currentRun = null;
+          stopRequested = false;
+          lastFinishedAt = interrupted.finishedAt || null;
+          lastSummary = interrupted;
+          lastError = interrupted.errors?.join('；') || null;
+          history = [interrupted, ...history].slice(0, 20);
+          await saveState();
+        }
       }
     } catch (err) {
       console.warn('[auto-task] load state failed', err);
@@ -187,6 +322,9 @@ async function saveState(settings?: AppSettings): Promise<void> {
   retryState = Object.fromEntries(retryEntries.slice(0, 800).map((item) => [item.key, item]));
   const doc: PersistedAutoTaskState = {
     version: STATE_VERSION,
+    paused,
+    skippedWhileRunning,
+    currentRun: currentRunSnapshot(),
     lastStartedAt,
     lastFinishedAt,
     nextRunAt: isoOrNull(nextRunAtMs),
@@ -472,9 +610,34 @@ async function selectSsoCheckCandidates(limit: number): Promise<{
   };
 }
 
-async function runSsoCheckStep(settings: AppSettings): Promise<AutoTaskStepSummary> {
-  const limit = batchLimit(settings);
-  const selected = await selectSsoCheckCandidates(limit);
+async function selectDueSsoCheckCandidates(limit: number): Promise<{
+  total: number;
+  items: { id: string; sso: string }[];
+  retrySelected: number;
+}> {
+  const due = dueRetryTargets('ssoCheck', limit);
+  const dueIds = due.map((item) => String(item.target || '').trim()).filter(Boolean);
+  if (dueIds.length === 0) return { total: 0, items: [], retrySelected: 0 };
+  const all = await listAccountsLite();
+  const byId = new Map(all.map((a) => [String(a.id || '').trim(), a]));
+  const items = dueIds
+    .map((id) => byId.get(id))
+    .filter((a): a is AccountRecord => Boolean(a && String(a.sso || '').trim()))
+    .map((a) => ({
+      id: a.id,
+      sso: String(a.sso || '').trim()
+    }));
+  return { total: due.length, items, retrySelected: items.length };
+}
+
+async function runSsoCheckStep(
+  settings: AppSettings,
+  opts: { dueOnly?: boolean } = {}
+): Promise<AutoTaskStepSummary> {
+  const limit = stepBatchLimit(settings, 'ssoCheck');
+  const selected = opts.dueOnly
+    ? await selectDueSsoCheckCandidates(limit)
+    : await selectSsoCheckCandidates(limit);
   if (selected.items.length === 0) {
     return { total: selected.total, selected: 0 };
   }
@@ -507,26 +670,37 @@ async function runSsoCheckStep(settings: AppSettings): Promise<AutoTaskStepSumma
   };
 }
 
-async function runAuthMintStep(settings: AppSettings): Promise<AutoTaskStepSummary> {
-  const limit = batchLimit(settings);
+async function runAuthMintStep(
+  settings: AppSettings,
+  opts: { dueOnly?: boolean } = {}
+): Promise<AutoTaskStepSummary> {
+  const limit = stepBatchLimit(settings, 'authMint');
+  const dueTargets = opts.dueOnly
+    ? new Set(dueRetryTargets('authMint', 2_000).map((item) => item.target))
+    : null;
   invalidateAuthIndexCache();
   const matched = await matchAccounts({
     sso: 'has_sso',
     auth: 'unconverted',
     requireSso: true,
-    limit
+    limit: dueTargets ? 2_000 : limit
   });
   const candidates = matched.items
     .filter((a) => String(a.sso || '').trim())
-    .filter((a) => retryGateAllows(settings, 'authMint', authMintTarget(a)))
+    .filter((a) => {
+      const target = authMintTarget(a);
+      return dueTargets ? dueTargets.has(target) : retryGateAllows(settings, 'authMint', target);
+    })
     .sort((a, b) => {
       const ad = retryDue(retryState[retryKey('authMint', authMintTarget(a))]) ? 0 : 1;
       const bd = retryDue(retryState[retryKey('authMint', authMintTarget(b))]) ? 0 : 1;
       if (ad !== bd) return ad - bd;
       return a.createdAt.localeCompare(b.createdAt);
-    });
+    })
+    .slice(0, limit);
+  const total = dueTargets ? dueTargets.size : matched.total;
   if (candidates.length === 0) {
-    return { total: matched.total, selected: 0 };
+    return { total, selected: 0 };
   }
 
   const now = Date.now();
@@ -576,7 +750,7 @@ async function runAuthMintStep(settings: AppSettings): Promise<AutoTaskStepSumma
 
   if (mintItems.length === 0) {
     return {
-      total: matched.total,
+      total,
       selected: 0,
       checked: needCheck.length,
       dead: checkedDead,
@@ -616,7 +790,7 @@ async function runAuthMintStep(settings: AppSettings): Promise<AutoTaskStepSumma
     if (recordRetryFailure(settings, 'authMint', target, reason, item.error)) retryRecorded++;
   }
   return {
-    total: matched.total,
+    total,
     selected: mintItems.length,
     retrySelected,
     checked: needCheck.length,
@@ -634,7 +808,7 @@ async function runAuthMintStep(settings: AppSettings): Promise<AutoTaskStepSumma
   };
 }
 
-async function selectCpaProbeFilenames(settings: AppSettings, limit: number): Promise<{
+async function selectCpaProbeFilenames(settings: AppSettings, limit: number, dueOnly = false): Promise<{
   total: number;
   filenames: string[];
   retrySelected: number;
@@ -650,6 +824,13 @@ async function selectCpaProbeFilenames(settings: AppSettings, limit: number): Pr
     seen.add(filename);
     filenames.push(filename);
     if (filenames.length >= limit) break;
+  }
+  if (dueOnly) {
+    return {
+      total,
+      filenames,
+      retrySelected: filenames.filter((f) => retryDue(retryState[retryKey('cpaProbe', f)])).length
+    };
   }
   const add = async (status: 'unprobed' | 'other_err') => {
     if (filenames.length >= limit) return;
@@ -680,9 +861,12 @@ async function selectCpaProbeFilenames(settings: AppSettings, limit: number): Pr
   };
 }
 
-async function runCpaProbeStep(settings: AppSettings): Promise<AutoTaskStepSummary> {
-  const limit = batchLimit(settings);
-  const selected = await selectCpaProbeFilenames(settings, limit);
+async function runCpaProbeStep(
+  settings: AppSettings,
+  opts: { dueOnly?: boolean } = {}
+): Promise<AutoTaskStepSummary> {
+  const limit = stepBatchLimit(settings, 'cpaProbe');
+  const selected = await selectCpaProbeFilenames(settings, limit, opts.dueOnly === true);
   if (selected.filenames.length === 0) {
     return { total: selected.total, selected: 0 };
   }
@@ -731,7 +915,8 @@ async function runCpaProbeStep(settings: AppSettings): Promise<AutoTaskStepSumma
 async function selectAuthPushFilenames(
   settings: AppSettings,
   prefix: 'cpa' | 's2a',
-  limit: number
+  limit: number,
+  dueOnly = false
 ): Promise<{ total: number; filenames: string[]; retrySelected: number }> {
   const filenames: string[] = [];
   const seen = new Set<string>();
@@ -745,6 +930,13 @@ async function selectAuthPushFilenames(
     seen.add(filename);
     filenames.push(filename);
     if (filenames.length >= limit) break;
+  }
+  if (dueOnly) {
+    return {
+      total,
+      filenames,
+      retrySelected: filenames.filter((f) => retryDue(retryState[retryKey(step, f)])).length
+    };
   }
   const add = async (push: 'cpa_none' | 'cpa_fail' | 's2a_none' | 's2a_fail') => {
     if (filenames.length >= limit) return;
@@ -777,12 +969,15 @@ async function selectAuthPushFilenames(
   };
 }
 
-async function runCpaPushStep(settings: AppSettings): Promise<AutoTaskStepSummary> {
+async function runCpaPushStep(
+  settings: AppSettings,
+  opts: { dueOnly?: boolean } = {}
+): Promise<AutoTaskStepSummary> {
   if (settings.autoPushAuthToCpa !== true) {
     return { selected: 0, skipped: 0 };
   }
-  const limit = batchLimit(settings);
-  const selected = await selectAuthPushFilenames(settings, 'cpa', limit);
+  const limit = stepBatchLimit(settings, 'pushCpa');
+  const selected = await selectAuthPushFilenames(settings, 'cpa', limit, opts.dueOnly === true);
   if (selected.filenames.length === 0) {
     return { total: selected.total, selected: 0 };
   }
@@ -826,12 +1021,15 @@ async function runCpaPushStep(settings: AppSettings): Promise<AutoTaskStepSummar
   };
 }
 
-async function runSub2apiPushStep(settings: AppSettings): Promise<AutoTaskStepSummary> {
+async function runSub2apiPushStep(
+  settings: AppSettings,
+  opts: { dueOnly?: boolean } = {}
+): Promise<AutoTaskStepSummary> {
   if (settings.autoPushAuthToSub2api !== true) {
     return { selected: 0, skipped: 0 };
   }
-  const limit = batchLimit(settings);
-  const selected = await selectAuthPushFilenames(settings, 's2a', limit);
+  const limit = stepBatchLimit(settings, 'pushSub2api');
+  const selected = await selectAuthPushFilenames(settings, 's2a', limit, opts.dueOnly === true);
   if (selected.filenames.length === 0) {
     return { total: selected.total, selected: 0 };
   }
@@ -873,19 +1071,25 @@ async function runSub2apiPushStep(settings: AppSettings): Promise<AutoTaskStepSu
   };
 }
 
-async function selectGrok2apiPushItems(settings: AppSettings, limit: number): Promise<{
+async function selectGrok2apiPushItems(
+  settings: AppSettings,
+  limit: number,
+  dueOnly = false
+): Promise<{
   total: number;
   items: { id: string; sso: string; email?: string }[];
   retrySelected: number;
 }> {
   const all = await listAccounts();
+  const dueIds = dueOnly ? new Set(dueRetryTargets('pushGrok2api', 2_000).map((item) => item.target)) : null;
   const candidates = all
     .filter((a) => {
       if (!String(a.sso || '').trim()) return false;
       if (ssoCheckVerdict(a.ssoCheck) !== 'alive') return false;
-      if (!retryGateAllows(settings, 'pushGrok2api', a.id)) return false;
       const status = a.ssoG2Status || 'none';
-      return status === 'none' || status === 'fail';
+      if (!(status === 'none' || status === 'fail')) return false;
+      if (dueIds) return dueIds.has(a.id);
+      return retryGateAllows(settings, 'pushGrok2api', a.id);
     })
     .sort((a, b) => {
       const ad = retryDue(retryState[retryKey('pushGrok2api', a.id)]) ? 0 : 1;
@@ -912,12 +1116,15 @@ async function selectGrok2apiPushItems(settings: AppSettings, limit: number): Pr
   };
 }
 
-async function runGrok2apiPushStep(settings: AppSettings): Promise<AutoTaskStepSummary> {
+async function runGrok2apiPushStep(
+  settings: AppSettings,
+  opts: { dueOnly?: boolean } = {}
+): Promise<AutoTaskStepSummary> {
   if (settings.autoPushSsoToGrok2api !== true) {
     return { selected: 0, skipped: 0 };
   }
-  const limit = batchLimit(settings);
-  const selected = await selectGrok2apiPushItems(settings, limit);
+  const limit = stepBatchLimit(settings, 'pushGrok2api');
+  const selected = await selectGrok2apiPushItems(settings, limit, opts.dueOnly === true);
   if (selected.items.length === 0) {
     return { total: selected.total, selected: 0 };
   }
@@ -954,11 +1161,20 @@ async function runGrok2apiPushStep(settings: AppSettings): Promise<AutoTaskStepS
 }
 
 async function runStep(
+  settings: AppSettings,
   summary: AutoTaskRunSummary,
-  key: string,
+  key: AutoTaskSubStep,
   fn: () => Promise<AutoTaskStepSummary>
 ): Promise<void> {
+  const guard = stopGuardMessage();
+  if (guard) {
+    flagSummaryStop(summary, guard.kind);
+    appendRunError(summary, guard.message);
+    return;
+  }
   const started = Date.now();
+  markCurrentStep(key);
+  await saveState(settings);
   try {
     summary.steps[key] = {
       ...(await fn()),
@@ -969,34 +1185,84 @@ async function runStep(
     summary.errors = [...(summary.errors || []), message];
     summary.steps[key] = { failed: 1, durationMs: Date.now() - started };
     console.warn(`[auto-task] ${message}`);
+  } finally {
+    markCurrentStep(null);
+    await saveState(settings);
   }
 }
 
 async function runConfiguredSteps(
   settings: AppSettings,
-  summary: AutoTaskRunSummary
+  summary: AutoTaskRunSummary,
+  opts: AutoTaskRunOptions = {}
 ): Promise<void> {
+  if (opts.onlyStep) {
+    if (opts.onlyStep === 'ssoCheck') {
+      await runStep(settings, summary, 'ssoCheck', () =>
+        runSsoCheckStep(settings, { dueOnly: opts.dueOnly === true })
+      );
+      return;
+    }
+    if (opts.onlyStep === 'authMint') {
+      await runStep(settings, summary, 'authMint', () =>
+        runAuthMintStep(settings, { dueOnly: opts.dueOnly === true })
+      );
+      return;
+    }
+    if (opts.onlyStep === 'cpaProbe') {
+      await runStep(settings, summary, 'cpaProbe', () =>
+        runCpaProbeStep(settings, { dueOnly: opts.dueOnly === true })
+      );
+      return;
+    }
+    await runStep(settings, summary, 'pushCpa', () =>
+      runCpaPushStep(settings, { dueOnly: opts.dueOnly === true })
+    );
+    await runStep(settings, summary, 'pushSub2api', () =>
+      runSub2apiPushStep(settings, { dueOnly: opts.dueOnly === true })
+    );
+    await runStep(settings, summary, 'pushGrok2api', () =>
+      runGrok2apiPushStep(settings, { dueOnly: opts.dueOnly === true })
+    );
+    return;
+  }
   if (settings.autoTaskSsoCheckEnabled === true) {
-    await runStep(summary, 'ssoCheck', () => runSsoCheckStep(settings));
+    await runStep(settings, summary, 'ssoCheck', () =>
+      runSsoCheckStep(settings, { dueOnly: opts.dueOnly === true })
+    );
   }
   if (settings.autoTaskAuthMintEnabled === true) {
-    await runStep(summary, 'authMint', () => runAuthMintStep(settings));
+    await runStep(settings, summary, 'authMint', () =>
+      runAuthMintStep(settings, { dueOnly: opts.dueOnly === true })
+    );
   }
   if (settings.autoTaskCpaProbeEnabled === true) {
-    await runStep(summary, 'cpaProbe', () => runCpaProbeStep(settings));
+    await runStep(settings, summary, 'cpaProbe', () =>
+      runCpaProbeStep(settings, { dueOnly: opts.dueOnly === true })
+    );
   }
   if (settings.autoTaskPushEnabled === true) {
-    await runStep(summary, 'pushCpa', () => runCpaPushStep(settings));
-    await runStep(summary, 'pushSub2api', () => runSub2apiPushStep(settings));
-    await runStep(summary, 'pushGrok2api', () => runGrok2apiPushStep(settings));
+    await runStep(settings, summary, 'pushCpa', () =>
+      runCpaPushStep(settings, { dueOnly: opts.dueOnly === true })
+    );
+    await runStep(settings, summary, 'pushSub2api', () =>
+      runSub2apiPushStep(settings, { dueOnly: opts.dueOnly === true })
+    );
+    await runStep(settings, summary, 'pushGrok2api', () =>
+      runGrok2apiPushStep(settings, { dueOnly: opts.dueOnly === true })
+    );
   }
 }
 
-export async function runAutoTaskOnce(reason = 'manual'): Promise<AutoTaskRunSummary> {
+export async function runAutoTaskOnce(
+  reason = 'manual',
+  opts: AutoTaskRunOptions = {}
+): Promise<AutoTaskRunSummary> {
   await ensureStateLoaded();
   if (running) throw new Error('自动任务正在运行中');
   const settings = await loadSettings();
   const started = Date.now();
+  const maxAt = started + maxRunMs(settings);
   const summary: AutoTaskRunSummary = {
     id: `auto-${started.toString(36)}`,
     reason,
@@ -1004,19 +1270,48 @@ export async function runAutoTaskOnce(reason = 'manual'): Promise<AutoTaskRunSum
     steps: {}
   };
   running = true;
+  stopRequested = false;
+  activeRunStartedMs = started;
+  activeRunMaxRunAtMs = maxAt;
+  currentRun = {
+    id: summary.id || `auto-${started.toString(36)}`,
+    reason,
+    startedAt: summary.startedAt,
+    currentStep: null,
+    stepStartedAt: null,
+    stopRequested: false,
+    maxRunAt: new Date(maxAt).toISOString(),
+    elapsedMs: 0
+  };
   lastStartedAt = summary.startedAt;
   lastError = null;
   await saveState(settings);
-  console.log(`[auto-task] start reason=${reason}`);
+  console.log(
+    `[auto-task] start reason=${reason}` +
+      (opts.onlyStep ? ` onlyStep=${opts.onlyStep}` : '') +
+      (opts.dueOnly ? ' dueOnly=true' : '')
+  );
   try {
-    await runConfiguredSteps(settings, summary);
+    await runConfiguredSteps(settings, summary, opts);
   } catch (err) {
     summary.errors = [...(summary.errors || []), errorText(err)];
   } finally {
     const finished = Date.now();
+    if (stopRequested && !summary.stopped && !summary.timeout) {
+      summary.stopped = true;
+      appendRunError(summary, '已收到停止请求，当前轮已停止');
+    }
+    if (activeRunMaxRunAtMs && finished >= activeRunMaxRunAtMs && !summary.timeout) {
+      summary.timeout = true;
+      appendRunError(summary, '自动任务超过最大运行时长');
+    }
     summary.finishedAt = new Date(finished).toISOString();
     summary.durationMs = finished - started;
     running = false;
+    stopRequested = false;
+    currentRun = null;
+    activeRunStartedMs = 0;
+    activeRunMaxRunAtMs = null;
     lastFinishedAt = summary.finishedAt;
     lastSummary = summary;
     lastError = summary.errors?.length ? summary.errors.join('；') : null;
@@ -1034,7 +1329,15 @@ export async function runAutoTaskOnce(reason = 'manual'): Promise<AutoTaskRunSum
 
 async function tick(): Promise<void> {
   await ensureStateLoaded();
-  if (running) return;
+  if (running) {
+    skippedWhileRunning += 1;
+    try {
+      await saveState(await loadSettings());
+    } catch {
+      await saveState();
+    }
+    return;
+  }
   let settings: AppSettings;
   try {
     settings = await loadSettings();
@@ -1045,10 +1348,11 @@ async function tick(): Promise<void> {
   }
   ensureSchedule(settings);
   await saveState(settings);
-  if (settings.autoTaskEnabled !== true || !nextRunAtMs) return;
+  if (settings.autoTaskEnabled !== true || paused || !nextRunAtMs) return;
   if (Date.now() < nextRunAtMs) return;
   await runAutoTaskOnce('schedule').catch((err) => {
     lastError = errorText(err);
+    void saveState(settings);
   });
 }
 
@@ -1068,6 +1372,58 @@ export function stopAutoTaskRunner(): void {
   timer = null;
 }
 
+export async function runAutoTaskStep(step: AutoTaskLogicalStep): Promise<AutoTaskRunSummary> {
+  if (!['ssoCheck', 'authMint', 'cpaProbe', 'push'].includes(step)) {
+    throw new Error('未知自动任务步骤');
+  }
+  return runAutoTaskOnce(`manual:${step}`, { onlyStep: step });
+}
+
+export async function runAutoTaskDue(): Promise<AutoTaskRunSummary> {
+  return runAutoTaskOnce('manual:due', { dueOnly: true });
+}
+
+export async function pauseAutoTasks(): Promise<AutoTaskStatus> {
+  await ensureStateLoaded();
+  paused = true;
+  const settings = await loadSettings();
+  await saveState(settings);
+  return getAutoTaskStatus();
+}
+
+export async function resumeAutoTasks(): Promise<AutoTaskStatus> {
+  await ensureStateLoaded();
+  paused = false;
+  const settings = await loadSettings();
+  ensureSchedule(settings);
+  await saveState(settings);
+  return getAutoTaskStatus();
+}
+
+export async function requestStopAutoTaskRun(): Promise<AutoTaskStatus> {
+  await ensureStateLoaded();
+  if (running) {
+    stopRequested = true;
+  }
+  const settings = await loadSettings();
+  await saveState(settings);
+  return getAutoTaskStatus();
+}
+
+export async function clearAutoTaskBlocked(): Promise<{ cleared: number; status: AutoTaskStatus }> {
+  await ensureStateLoaded();
+  let cleared = 0;
+  for (const [key, item] of Object.entries(retryState)) {
+    if (item.retryable === false) {
+      delete retryState[key];
+      cleared += 1;
+    }
+  }
+  const settings = await loadSettings();
+  await saveState(settings);
+  return { cleared, status: await getAutoTaskStatus() };
+}
+
 export async function getAutoTaskStatus(): Promise<AutoTaskStatus> {
   await ensureStateLoaded();
   const settings = await loadSettings();
@@ -1075,9 +1431,13 @@ export async function getAutoTaskStatus(): Promise<AutoTaskStatus> {
   await saveState(settings);
   return {
     enabled: settings.autoTaskEnabled === true,
+    paused,
     running,
     intervalMin: intervalMin(settings),
     batchLimit: batchLimit(settings),
+    skippedWhileRunning,
+    stopRequested,
+    currentRun: currentRunSnapshot(),
     lastStartedAt,
     lastFinishedAt,
     nextRunAt: isoOrNull(nextRunAtMs),

@@ -400,6 +400,9 @@ export interface AutoTaskRunSummary {
   durationMs?: number;
   steps: Record<string, AutoTaskStepSummary>;
   errors?: string[];
+  interrupted?: boolean;
+  stopped?: boolean;
+  timeout?: boolean;
 }
 
 export interface AutoTaskRetryItem {
@@ -424,11 +427,26 @@ export interface AutoTaskRetryOverview {
   items: AutoTaskRetryItem[];
 }
 
+export interface AutoTaskCurrentRun {
+  id: string;
+  reason: string;
+  startedAt: string;
+  currentStep: string | null;
+  stepStartedAt: string | null;
+  stopRequested: boolean;
+  maxRunAt: string | null;
+  elapsedMs: number;
+}
+
 export interface AutoTaskStatus {
   enabled: boolean;
+  paused: boolean;
   running: boolean;
   intervalMin: number;
   batchLimit: number;
+  skippedWhileRunning: number;
+  stopRequested: boolean;
+  currentRun: AutoTaskCurrentRun | null;
   lastStartedAt: string | null;
   lastFinishedAt: string | null;
   nextRunAt: string | null;
@@ -452,6 +470,12 @@ export interface RendererApi {
   saveSettings(s: AppSettings): Promise<{ ok: true }>;
   getAutoTaskStatus(): Promise<AutoTaskStatus>;
   runAutoTaskOnce(): Promise<AutoTaskRunSummary>;
+  runAutoTaskStep(step: 'ssoCheck' | 'authMint' | 'cpaProbe' | 'push'): Promise<AutoTaskRunSummary>;
+  runAutoTaskDue(): Promise<AutoTaskRunSummary>;
+  pauseAutoTasks(): Promise<AutoTaskStatus>;
+  resumeAutoTasks(): Promise<AutoTaskStatus>;
+  stopAutoTaskRun(): Promise<AutoTaskStatus>;
+  clearAutoTaskBlocked(): Promise<{ cleared: number; status: AutoTaskStatus }>;
   /** Python 进程池健康指标 */
   getPythonPoolStats(): Promise<{
     enabled: boolean;

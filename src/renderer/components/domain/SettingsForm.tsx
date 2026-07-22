@@ -95,6 +95,15 @@ function formatDateTime(value?: string | null): string {
   return d.toLocaleString();
 }
 
+function formatDurationMs(value?: number | null): string {
+  const ms = Math.max(0, Number(value || 0));
+  if (!Number.isFinite(ms) || ms <= 0) return '0s';
+  const sec = Math.floor(ms / 1000);
+  const min = Math.floor(sec / 60);
+  const rem = sec % 60;
+  return min > 0 ? `${min}m ${rem}s` : `${rem}s`;
+}
+
 function compactAutoTaskSummary(status: Pick<AutoTaskStatus, 'lastSummary'> | null): string {
   const steps = status?.lastSummary?.steps || {};
   const parts: string[] = [];
@@ -301,6 +310,38 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
       setAutoTaskStatus(await window.api.getAutoTaskStatus());
     } catch {
       /* 状态读取失败不阻塞设置页 */
+    }
+  };
+
+  const runAutoTaskAction = async (
+    title: string,
+    action: () => Promise<unknown>,
+    summaryTitle?: string
+  ) => {
+    setAutoTaskBusy(true);
+    try {
+      const result = await action();
+      await refreshAutoTaskStatus();
+      const maybeRun =
+        result && typeof result === 'object' && 'steps' in result
+          ? (result as { errors?: unknown[] })
+          : null;
+      push({
+        tone: maybeRun?.errors?.length ? 'warn' : 'ok',
+        title: summaryTitle || `${title}完成`,
+        description:
+          result && typeof result === 'object' && 'steps' in result
+            ? compactAutoTaskSummary({ lastSummary: result as AutoTaskStatus['lastSummary'] })
+            : undefined
+      });
+    } catch (err) {
+      push({
+        tone: 'danger',
+        title: `${title}失败`,
+        description: err instanceof Error ? err.message : String(err)
+      });
+    } finally {
+      setAutoTaskBusy(false);
     }
   };
 
@@ -1923,6 +1964,61 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
             </Field>
           </div>
 
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <Field
+              label="单轮最长运行（分钟）"
+              hint="超时后不再领取后续子任务；不会强杀正在执行的底层批次"
+              error={errors.autoTaskMaxRunMinutes}
+            >
+              <Input
+                type="number"
+                min={5}
+                max={180}
+                value={draft.autoTaskMaxRunMinutes ?? 20}
+                onChange={(e) => {
+                  const n = Number(e.target.value);
+                  update(
+                    'autoTaskMaxRunMinutes',
+                    Number.isFinite(n)
+                      ? Math.max(5, Math.min(180, Math.floor(n)))
+                      : 20
+                  );
+                }}
+              />
+            </Field>
+            {[
+              ['autoTaskSsoBatchLimit', '验活上限', 100],
+              ['autoTaskAuthMintBatchLimit', 'Auth 上限', 20],
+              ['autoTaskCpaProbeBatchLimit', '测活上限', 100],
+              ['autoTaskPushCpaBatchLimit', 'CPA 推送上限', 30],
+              ['autoTaskPushSub2apiBatchLimit', 'S2A 推送上限', 30],
+              ['autoTaskPushGrok2apiBatchLimit', 'G2A 推送上限', 30]
+            ].map(([key, label, fallback]) => (
+              <Field
+                key={key}
+                label={String(label)}
+                hint="范围 1～200；未配置时回落到每轮上限"
+                error={errors[key as keyof AppSettings]}
+              >
+                <Input
+                  type="number"
+                  min={1}
+                  max={200}
+                  value={Number(draft[key as keyof AppSettings] ?? fallback)}
+                  onChange={(e) => {
+                    const n = Number(e.target.value);
+                    update(
+                      key as keyof AppSettings,
+                      Number.isFinite(n)
+                        ? Math.max(1, Math.min(200, Math.floor(n)))
+                        : Number(fallback)
+                    );
+                  }}
+                />
+              </Field>
+            ))}
+          </div>
+
           <div className="grid gap-3 sm:grid-cols-2">
             <Field
               label="历史保留条数"
@@ -2073,32 +2169,92 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
                   variant="secondary"
                   disabled={autoTaskBusy || autoTaskStatus?.running === true}
                   onClick={() => {
-                    void (async () => {
-                      setAutoTaskBusy(true);
-                      try {
-                        const r = await window.api.runAutoTaskOnce();
-                        await refreshAutoTaskStatus();
-                        push({
-                          tone: r.errors?.length ? 'warn' : 'ok',
-                          title: r.errors?.length ? '自动任务执行完成，有错误' : '自动任务已执行',
-                          description: compactAutoTaskSummary({ lastSummary: r })
-                        });
-                      } catch (err) {
-                        push({
-                          tone: 'danger',
-                          title: '自动任务执行失败',
-                          description: err instanceof Error ? err.message : String(err)
-                        });
-                      } finally {
-                        setAutoTaskBusy(false);
-                      }
-                    })();
+                    void runAutoTaskAction('自动任务执行', () => window.api.runAutoTaskOnce(), '自动任务已执行');
                   }}
                 >
                   <Activity className="h-3.5 w-3.5" />
                   立即跑一轮
                 </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  disabled={autoTaskBusy || autoTaskStatus?.running === true}
+                  onClick={() => {
+                    void runAutoTaskAction('Due 队列执行', () => window.api.runAutoTaskDue(), 'Due 队列已执行');
+                  }}
+                >
+                  跑 due
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={autoTaskStatus?.paused ? 'primary' : 'secondary'}
+                  disabled={autoTaskBusy}
+                  onClick={() => {
+                    void runAutoTaskAction(
+                      autoTaskStatus?.paused ? '恢复自动任务' : '暂停自动任务',
+                      () =>
+                        autoTaskStatus?.paused
+                          ? window.api.resumeAutoTasks()
+                          : window.api.pauseAutoTasks(),
+                      autoTaskStatus?.paused ? '自动任务已恢复' : '自动任务已暂停'
+                    );
+                  }}
+                >
+                  {autoTaskStatus?.paused ? '恢复调度' : '暂停调度'}
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="danger"
+                  disabled={autoTaskBusy || autoTaskStatus?.running !== true || autoTaskStatus?.stopRequested === true}
+                  onClick={() => {
+                    void runAutoTaskAction('停止当前轮', () => window.api.stopAutoTaskRun(), '已请求停止当前轮');
+                  }}
+                >
+                  停止当前轮
+                </Button>
               </div>
+            </div>
+            <div className="flex flex-wrap gap-2 border-t border-border/50 pt-3">
+              {[
+                ['ssoCheck', '只跑验活'],
+                ['authMint', '只跑 Auth'],
+                ['cpaProbe', '只跑测活'],
+                ['push', '只跑推送']
+              ].map(([step, label]) => (
+                <Button
+                  key={step}
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={autoTaskBusy || autoTaskStatus?.running === true}
+                  onClick={() => {
+                    void runAutoTaskAction(
+                      String(label),
+                      () =>
+                        window.api.runAutoTaskStep(
+                          step as 'ssoCheck' | 'authMint' | 'cpaProbe' | 'push'
+                        ),
+                      `${label}完成`
+                    );
+                  }}
+                >
+                  {label}
+                </Button>
+              ))}
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={autoTaskBusy || (autoTaskStatus?.retry?.blocked ?? 0) <= 0}
+                onClick={() => {
+                  void runAutoTaskAction('清空 blocked', () => window.api.clearAutoTaskBlocked(), 'blocked 队列已清空');
+                }}
+              >
+                清空 blocked
+              </Button>
             </div>
             <div className="grid gap-2 text-[11px] text-muted-foreground sm:grid-cols-2">
               <p>
@@ -2106,6 +2262,8 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
                 <span className="font-medium text-foreground">
                   {autoTaskStatus?.running
                     ? '运行中'
+                    : autoTaskStatus?.paused
+                      ? '已暂停'
                     : autoTaskStatus?.enabled
                       ? '等待下一轮'
                       : '关闭'}
@@ -2114,7 +2272,16 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
               <p>下次执行：{formatDateTime(autoTaskStatus?.nextRunAt)}</p>
               <p>上次开始：{formatDateTime(autoTaskStatus?.lastStartedAt)}</p>
               <p>上次结束：{formatDateTime(autoTaskStatus?.lastFinishedAt)}</p>
+              <p>跳过重叠轮次：{autoTaskStatus?.skippedWhileRunning ?? 0}</p>
+              <p>当前步骤：{autoTaskStatus?.currentRun?.currentStep || '-'}</p>
+              <p>已运行：{formatDurationMs(autoTaskStatus?.currentRun?.elapsedMs)}</p>
+              <p>最长运行到：{formatDateTime(autoTaskStatus?.currentRun?.maxRunAt)}</p>
             </div>
+            {autoTaskStatus?.stopRequested ? (
+              <p className="text-[11px] leading-relaxed text-amber-700 dark:text-amber-300">
+                已请求停止：正在执行的底层批次完成后，不再领取后续子任务。
+              </p>
+            ) : null}
             <p className="text-[11px] leading-relaxed text-muted-foreground">
               {compactAutoTaskSummary(autoTaskStatus)}
             </p>

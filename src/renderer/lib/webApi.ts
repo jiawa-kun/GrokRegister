@@ -229,6 +229,12 @@ const webApi: RendererApi = {
   },
   getAutoTaskStatus: () => http('GET', '/api/auto-tasks/status'),
   runAutoTaskOnce: () => http('POST', '/api/auto-tasks/run-once', {}),
+  runAutoTaskStep: (step) => http('POST', '/api/auto-tasks/run-step', { step }),
+  runAutoTaskDue: () => http('POST', '/api/auto-tasks/run-due', {}),
+  pauseAutoTasks: () => http('POST', '/api/auto-tasks/pause', {}),
+  resumeAutoTasks: () => http('POST', '/api/auto-tasks/resume', {}),
+  stopAutoTaskRun: () => http('POST', '/api/auto-tasks/stop', {}),
+  clearAutoTaskBlocked: () => http('POST', '/api/auto-tasks/clear-blocked', {}),
 
   startRegister: (args) => http('POST', '/api/run/start', args ?? {}),
   stopRegister: async (runId, opts) => {
