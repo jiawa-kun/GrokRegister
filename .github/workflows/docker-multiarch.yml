@@ -5,14 +5,14 @@ name: Docker multi-arch
 
 on:
   push:
-    branches: [beta]
+    branches: [beta_dev]
     tags: ["v*"]
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
   # must match root docker-compose.yml (all lowercase)
-  IMAGE: ghcr.io/murasamecyan/grokregisteragent
+  IMAGE: ghcr.io/garrenkun/grokregister
   # 与 scripts/fetch-sing-box.sh 默认一致；升级时改此处即可
   SING_BOX_VERSION: "1.13.14"
 
@@ -32,8 +32,8 @@ jobs:
           set -euo pipefail
           SHA_SHORT="$(echo '${{ github.sha }}' | cut -c1-7)"
           TAGS="${{ env.IMAGE }}:sha-${SHA_SHORT}"
-          if [ "${{ github.ref }}" = "refs/heads/beta" ]; then
-            TAGS="${TAGS},${{ env.IMAGE }}:beta,${{ env.IMAGE }}:latest"
+          if [ "${{ github.ref }}" = "refs/heads/beta_dev" ]; then
+            TAGS="${TAGS},${{ env.IMAGE }}:beta_dev,${{ env.IMAGE }}:beta-dev,${{ env.IMAGE }}:latest"
           elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             VER="${{ github.ref_name }}"
             TAGS="${TAGS},${{ env.IMAGE }}:${VER}"

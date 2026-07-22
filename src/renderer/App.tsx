@@ -448,7 +448,7 @@ export default function App() {
                 <ThemeToggle />
               </div>
               <a
-                href="https://github.com/MurasameCyan/GrokRegisterAgent"
+                href="https://github.com/Garrenkun/GrokRegister"
                 target="_blank"
                 rel="noreferrer"
                 className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-muted text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"

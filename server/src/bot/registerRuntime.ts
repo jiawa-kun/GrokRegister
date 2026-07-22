@@ -21,7 +21,7 @@ export interface RegisterRuntime {
 }
 
 const RUNTIME_CONFIG_MARKER = {
-  generated_by: 'GrokRegisterAgent',
+  generated_by: 'GrokRegister',
   runtime: true
 };
 

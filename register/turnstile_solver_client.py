@@ -99,7 +99,7 @@ def _http_json(
     timeout: float = 20.0,
 ) -> dict[str, Any]:
     data = None
-    headers = {"Accept": "application/json", "User-Agent": "GrokRegisterAgent/turnstile-solver-client"}
+    headers = {"Accept": "application/json", "User-Agent": "GrokRegister/turnstile-solver-client"}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -126,7 +126,7 @@ def probe_solver(
     try:
         req = Request(
             base + "/",
-            headers={"User-Agent": "GrokRegisterAgent/probe"},
+            headers={"User-Agent": "GrokRegister/probe"},
             method="GET",
         )
         with urlopen(req, timeout=timeout) as resp:

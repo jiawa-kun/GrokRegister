@@ -8,8 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import type { UpdateInfo } from '@shared/ipc';
 
-const REPO = 'MurasameCyan/GrokRegisterAgent';
-const BETA_REF = 'beta';
+const REPO = 'Garrenkun/GrokRegister';
+const BETA_REF = 'beta_dev';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 let cachedBuildId: string | null = null;

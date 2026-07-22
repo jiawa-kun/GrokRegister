@@ -1320,7 +1320,7 @@ function httpGetText(url: string, timeoutMs = 25000): Promise<string> {
           headers: {
             // 部分订阅站按 UA 分流；用常见 Clash 客户端标识提高兼容
             'User-Agent':
-              'clash-meta/1.18.0 GrokRegisterAgent/1.0 (+subscription-import)',
+              'clash-meta/1.18.0 GrokRegister/1.0 (+subscription-import)',
             Accept: 'text/plain,application/octet-stream,*/*'
           }
         },

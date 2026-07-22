@@ -195,8 +195,8 @@ try {
   const configPaths = seen.map((item) => String(item.configPath || ''));
   assert(new Set(configPaths).size === 2, 'runtime config paths should be unique per job');
   assert(
-    seen.every((item) => item.config?._gra_runtime_config?.generated_by === 'GrokRegisterAgent'),
-    'runtime configs should include the GrokRegisterAgent marker'
+    seen.every((item) => item.config?._gra_runtime_config?.generated_by === 'GrokRegister'),
+    'runtime configs should include the GrokRegister marker'
   );
 
   const remainingRuntimeConfigs = (await readdir(registerDir)).filter((name) => name.startsWith('config.runtime.'));

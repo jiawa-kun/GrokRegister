@@ -10,7 +10,8 @@
 
 services:
   grok-register-agent:
-    image: ghcr.io/murasamecyan/grokregisteragent:beta
+    image: ${GRA_IMAGE:-ghcr.io/garrenkun/grokregister:latest}
+    pull_policy: always
     container_name: grok-register-agent
     restart: unless-stopped
     ports:
@@ -52,7 +53,8 @@ services:
   # multi-arch amd64/arm64；ARM 可跑，通过率通常仍低于 x86
   turnstile-solver:
     profiles: ["solver"]
-    image: ghcr.io/murasamecyan/grok-turnstile-solver:beta
+    image: ${TURNSTILE_SOLVER_IMAGE:-ghcr.io/garrenkun/grok-turnstile-solver:latest}
+    pull_policy: always
     container_name: grok-turnstile-solver
     restart: unless-stopped
     # 仅内部网络；调试可映射 5072

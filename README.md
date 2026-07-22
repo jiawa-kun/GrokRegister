@@ -1,13 +1,34 @@
-# Grok Register Agent (GRA)
+# Grok Register (Garrenkun 二开版)
 
-来都来了 不点个⭐再走吗~?
+这是 Garrenkun 维护的 Grok Register 二开版本，基于 [MurasameCyan/GrokRegisterAgent](https://github.com/MurasameCyan/GrokRegisterAgent) 继续扩展。
 
-可自部署的 Grok 注册机 Web 控制台（Grok Register Agent）：Docker 多架构镜像、DrissionPage / Hybrid 注册、邮件验证码、SSO 号池、Auth mint、NSFW 标签与本地账号管理。
+可自部署的 Grok 注册机 Web 控制台：Docker 多架构镜像、DrissionPage / Hybrid 注册、邮件验证码、SSO 号池、Auth mint、NSFW 标签、本地账号管理、任务自动化与 GHCR 镜像更新。
 
 > 本项目与 xAI、Grok、X 没有官方关联。请仅在合法、合规、获得许可的研究、学习或自托管实验环境中使用。
 
 
 ---
+
+## 二开说明
+
+- 原始项目：[MurasameCyan/GrokRegisterAgent](https://github.com/MurasameCyan/GrokRegisterAgent)
+- 当前维护仓库：[Garrenkun/GrokRegister](https://github.com/Garrenkun/GrokRegister)
+- 当前主线分支：`beta_dev`
+- 当前生产镜像：`ghcr.io/garrenkun/grokregister:latest`
+- 当前 Solver 镜像：`ghcr.io/garrenkun/grok-turnstile-solver:latest`
+
+## 与原项目的主要差异
+
+| 方向 | Garrenkun 二开内容 |
+|------|--------------------|
+| **任务自动化** | 新增库存自动任务、任务历史持久化、智能重试、任务控制与单步限制 |
+| **注册性能诊断** | 新增注册性能诊断、流式进度、失败原因复检与快速目标入口 |
+| **SSO / Auth 号池** | 增强 SSO 验活分块进度、可取消、三态验活、429 自适应并发、CSV 验活导出 |
+| **Python 进程池** | 新增 Python 进程池设置、指标与补签/补 SSO 流式进度 |
+| **CPA / S2A / G2A 推送** | 增强 CPA/S2A/G2A 推送进度、失败原因复检、sub2api 分组拉取与名称解析 |
+| **邮件与注册链路** | 合并 DuckMail OTP 详情、YYDS/GPTMail/Duck 启动校验修正、Plan C 邮件 provider 适配 |
+| **Sing-Box 代理** | 支持订阅 URL、URL-safe Base64、Clash YAML proxies、更多分享链接与 http/https/socks 节点 |
+| **部署与更新** | 镜像发布迁移到 `Garrenkun/GrokRegister` 的 GHCR；新增从 GitHub/GHCR 拉取最新镜像的更新脚本 |
 
 ## 功能一览
 
@@ -28,8 +49,8 @@
 ## 快速部署（GHCR 镜像，推荐）
 
 ```bash
-git clone -b beta https://github.com/MurasameCyan/GrokRegisterAgent.git
-cd GrokRegisterAgent
+git clone -b beta_dev https://github.com/Garrenkun/GrokRegister.git
+cd GrokRegister
 cp .env.example .env
 # 按需编辑 .env：邮件 / 端口 / 初始密码 / 存储加密 / Solver 等
 docker compose up -d --pull always --remove-orphans
@@ -48,8 +69,42 @@ docker compose --profile solver up -d
 ```
 
 - 设置页：**注册方案 → 外置 Turnstile Solver**
-- Solver 镜像：`ghcr.io/murasamecyan/grok-turnstile-solver:beta`  
+- Solver 镜像：`ghcr.io/garrenkun/grok-turnstile-solver:latest`
 - ARM 可运行；Turnstile 成功率通常仍低于 x86  
+
+### 从 GitHub 拉取最新镜像更新
+
+GitHub Actions 会在 `beta_dev` 分支构建并发布 GHCR 镜像，标签包括：
+
+- `ghcr.io/garrenkun/grokregister:latest`
+- `ghcr.io/garrenkun/grokregister:beta_dev`
+- `ghcr.io/garrenkun/grokregister:sha-xxxxxxx`
+
+服务器更新到 GitHub 最新镜像：
+
+```powershell
+.\scripts\update-from-github.ps1
+```
+
+同时更新外置 Solver：
+
+```powershell
+.\scripts\update-from-github.ps1 -Solver
+```
+
+Linux / 服务器手动更新：
+
+```bash
+docker compose pull
+docker compose up -d --remove-orphans
+```
+
+如果 GHCR 包是私有的，服务器首次拉取前需要登录：
+
+```bash
+docker login ghcr.io -u Garrenkun
+# 密码填写 GitHub token，至少需要 read:packages 权限
+```
 
 
 ### 访问
@@ -86,6 +141,8 @@ docker logs grok-register-agent
 | `MAIL_ADMIN_AUTH` | admin 密码 → `x-admin-auth` |
 | `MAIL_DOMAIN` | 可收信域名 |
 | `HTTP_PROXY` / `BROWSER_PROXY` | 可选全局代理（更推荐在 Web「配置」里用 Sing-Box） |
+| `GRA_IMAGE` | 主服务 GHCR 镜像，默认 `ghcr.io/garrenkun/grokregister:latest` |
+| `TURNSTILE_SOLVER_IMAGE` | Solver GHCR 镜像，默认 `ghcr.io/garrenkun/grok-turnstile-solver:latest` |
 | `COOKIE_SECURE` | HTTPS 反代时设 `1`；纯 HTTP 留空 |
 | `GRA_INITIAL_PASSWORD` | 可选。指定 Web 控制台首次启动的初始密码；不填则自动生成并写入 `/data/auth-bootstrap.json` |
 | `GRA_MASTER_KEY` | 可选但强烈建议。用于加密 `/data/config.json`、`/data/accounts.json` 中的敏感字段 |
@@ -272,6 +329,7 @@ docker compose up -d --build
 
 ## 致谢
 
+- 本项目为 [MurasameCyan/GrokRegisterAgent](https://github.com/MurasameCyan/GrokRegisterAgent) 的二开维护版
 - 感谢 [ReinerBRO/grok-register](https://github.com/ReinerBRO/grok-register)，自动化注册思路与 Python 流程受其启发
 - 感谢 [dreamhunter2333/cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)，默认邮件后端适配对象
 - [LINUX DO](https://linux.do/)

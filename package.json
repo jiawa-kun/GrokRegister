@@ -1,7 +1,7 @@
 {
-  "name": "grok-register-agent",
+  "name": "grok-register",
   "version": "1.0.0",
-  "description": "Grok Register Agent — 可自部署的 Grok 注册机 Web 控制台，支持 Docker、DrissionPage、邮件后端与本地号池。",
+  "description": "Grok Register Agent — MurasameCyan/GrokRegisterAgent 的二开维护版，可自部署的 Grok 注册机 Web 控制台，支持 Docker、DrissionPage、邮件后端与本地号池。",
   "keywords": [
     "grok",
     "grok注册机",
@@ -15,16 +15,16 @@
     "注册工具"
   ],
   "private": false,
-  "author": "MurasameCyan",
+  "author": "Garrenkun",
   "license": "MIT",
   "type": "module",
-  "homepage": "https://github.com/MurasameCyan/GrokRegisterAgent",
+  "homepage": "https://github.com/Garrenkun/GrokRegister",
   "repository": {
     "type": "git",
-    "url": "https://github.com/MurasameCyan/GrokRegisterAgent.git"
+    "url": "https://github.com/Garrenkun/GrokRegister.git"
   },
   "bugs": {
-    "url": "https://github.com/MurasameCyan/GrokRegisterAgent/issues"
+    "url": "https://github.com/Garrenkun/GrokRegister/issues"
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.web.json",

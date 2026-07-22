@@ -1,7 +1,7 @@
 param(
     [string]$HostName = "jiawa-vps",
     [int]$SshPort = 22,
-    [string]$RemoteDir = "/home/jiawa/GrokRegisterAgent",
+    [string]$RemoteDir = "/home/jiawa/GrokRegister",
     [string]$ContainerName = "grok-register-agent",
     [string]$ImageName = "grok-register-agent:local",
     [string]$IdentityFile,

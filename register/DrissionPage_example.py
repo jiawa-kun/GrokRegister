@@ -1411,7 +1411,7 @@ _EMAIL_SIGNUP_FIND_TRIES = 5
 def open_signup_page(*, find_tries: int | None = None):
     """打开注册页并点击「使用邮箱注册」。
 
-    对齐 GrokRegisterAgent4 主流程：刷新/重开找按钮，中途不狂 demote。
+    对齐 GrokRegister 主流程：刷新/重开找按钮，中途不狂 demote。
     硬失败（chrome-error / This site can't be reached）：立即降级代理并缩短重试。
     注意：page.url 可能仍显示 accounts.x.ai，但文档实为 chrome-error 页——以 body/diag 为准。
     """

@@ -134,7 +134,7 @@ def main(*, quiet: bool = False, verbose: bool = False) -> int:
     """
     show_all = verbose or (not quiet)
     if show_all:
-        print("=== GrokRegisterAgent optimization_checks ===")
+        print("=== GrokRegister optimization_checks ===")
     failed = 0
     fail_names: list[str] = []
     for name, fn in CHECKS:
