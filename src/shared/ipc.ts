@@ -30,6 +30,48 @@ export interface RegisterJobsListResult {
   focus: string | null;
 }
 
+export interface RunPerfStageSummary {
+  stage: string;
+  count: number;
+  ok: number;
+  failed: number;
+  totalMs: number;
+  avgMs: number;
+  p50Ms: number;
+  p95Ms: number;
+  maxMs: number;
+  lastMs: number;
+  lastAt: number | null;
+}
+
+export interface RunPerfRecentItem {
+  type: 'round' | 'stage';
+  round?: number;
+  stage?: string;
+  ms: number;
+  ok?: boolean;
+  plan?: string;
+  message?: string;
+  ts: number;
+}
+
+export interface RunPerfSummary {
+  runId: string | null;
+  phase: import('./runEvents').RunPhase | null;
+  startedAt: number | null;
+  updatedAt: number | null;
+  rounds: number;
+  successRounds: number;
+  failedRounds: number;
+  avgRoundMs: number;
+  p50RoundMs: number;
+  p95RoundMs: number;
+  maxRoundMs: number;
+  slowestStage: RunPerfStageSummary | null;
+  stages: RunPerfStageSummary[];
+  recent: RunPerfRecentItem[];
+}
+
 export interface ThemeState {
   mode: ThemeMode;
   /** 应用到 DOM 上的实际主题：'light' | 'dark' */
@@ -464,6 +506,7 @@ export interface RendererApi {
   listRegisterJobs(): Promise<RegisterJobsListResult>;
   getRegisterJobStatus(runId: string): Promise<RunStatus>;
   focusRegisterJob(runId: string | null): Promise<{ ok: boolean; runId: string | null }>;
+  getRunPerf?(runId?: string): Promise<RunPerfSummary>;
   /** 清理已停/完成/失败的任务，返回移除数量 */
   clearFinishedRegisterJobs(): Promise<{
     ok: true;

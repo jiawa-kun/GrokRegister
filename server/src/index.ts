@@ -666,6 +666,11 @@ app.get('/api/run/jobs/:runId', asyncHandler(async (req: Request, res: Response)
   res.json(st);
 }));
 
+app.get('/api/run/perf', asyncHandler(async (req: Request, res: Response) => {
+  const runId = typeof req.query.runId === 'string' ? req.query.runId : '';
+  res.json(registerBot.getRunPerf(runId || undefined));
+}));
+
 app.post('/api/run/focus', asyncHandler(async (req: Request, res: Response) => {
   const runId = req.body?.runId != null ? String(req.body.runId) : null;
   res.json(registerBot.setFocus(runId || null));

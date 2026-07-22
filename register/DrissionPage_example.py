@@ -700,6 +700,60 @@ def _emit_structured(event_type: str, **payload) -> None:
         pass
 
 
+def _perf_now() -> float:
+    return time.perf_counter()
+
+
+def _emit_perf_stage(
+    stage: str,
+    started: float,
+    *,
+    round_no: int | None = None,
+    plan: str | None = None,
+    ok: bool | None = None,
+    message: str | None = None,
+) -> None:
+    try:
+        ms = int(max(0.0, time.perf_counter() - started) * 1000)
+    except Exception:
+        ms = 0
+    _emit_structured(
+        "perf_stage",
+        stage=stage,
+        ms=ms,
+        round=round_no,
+        plan=plan,
+        ok=ok,
+        message=(str(message)[:160] if message else None),
+    )
+
+
+def _emit_perf_round_start(round_no: int) -> None:
+    _emit_structured("perf_round_start", round=round_no)
+
+
+def _emit_perf_round_end(
+    round_no: int,
+    started: float,
+    *,
+    ok: bool,
+    plan: str | None = None,
+    message: str | None = None,
+) -> None:
+    try:
+        ms = int(max(0.0, time.perf_counter() - started) * 1000)
+    except Exception:
+        ms = 0
+    _emit_structured(
+        "perf_round_end",
+        round=round_no,
+        ms=ms,
+        ok=ok,
+        plan=plan,
+        message=(str(message)[:160] if message else None),
+    )
+
+
 def log_runtime_fingerprint(tab=None, force: bool = False):
     """
     打印架构 / 浏览器版本 / WebGL 探测，方便确认 ARM 无 GUI 环境是否可用。
@@ -4512,7 +4566,11 @@ def push_sso_to_api(new_tokens: list):
 
 
 def run_single_registration(
-    output_path=DEFAULT_SSO_FILE, extract_numbers=False, *, plan: str = "a"
+    output_path=DEFAULT_SSO_FILE,
+    extract_numbers=False,
+    *,
+    plan: str = "a",
+    round_no: int | None = None,
 ):
     # 单轮流程：打开注册页 -> 完成注册 -> 触发生日门(可选) -> 获取 sso -> 写 txt。
     # plan="a"：本项目主流程；plan="b"：Plan B 兜底（FlowPilot 人机等待/模拟点击/CF 拦截）
@@ -4545,6 +4603,7 @@ def run_single_registration(
     last_mail_err: Exception | None = None
     for mail_try in range(1, max_mail_retry + 1):
         try:
+            _stage_t = _perf_now()
             if mail_try == 1:
                 open_signup_page()
             else:
@@ -4557,6 +4616,13 @@ def run_single_registration(
                 except Exception as oe:
                     # 已在注册页时 open 可能失败，继续填邮箱
                     print(f"[Warn] 重试开页: {oe}", flush=True)
+            _emit_perf_stage(
+                "open_signup",
+                _stage_t,
+                round_no=round_no,
+                plan=plan_mode,
+                ok=True,
+            )
             if plan_mode == "b" and mail_try == 1:
                 try:
                     from plan_b import detect_cf_security_block, human_pause_major
@@ -4569,11 +4635,35 @@ def run_single_registration(
                     if "CF 安全拦截" in str(e):
                         raise
                     print(f"[plan-b] 开页预检跳过: {e}")
+            _stage_t = _perf_now()
             email, dev_token = fill_email_and_submit()
+            _emit_perf_stage(
+                "email_create",
+                _stage_t,
+                round_no=round_no,
+                plan=plan_mode,
+                ok=True,
+            )
+            _stage_t = _perf_now()
             fill_code_and_submit(email, dev_token)
+            _emit_perf_stage(
+                "mail_code",
+                _stage_t,
+                round_no=round_no,
+                plan=plan_mode,
+                ok=True,
+            )
             print(f"[*] 填写注册资料并提交（Plan {plan_mode.upper()}）…")
+            _stage_t = _perf_now()
             try:
                 profile = fill_profile_and_submit(mode=plan_mode)
+                _emit_perf_stage(
+                    "profile_turnstile_submit",
+                    _stage_t,
+                    round_no=round_no,
+                    plan=plan_mode,
+                    ok=True,
+                )
             except Exception as pe:
                 em = str(pe)
                 # Turnstile 通过后提交触发导航时 Drission 偶发整段抛刷新
@@ -4586,11 +4676,35 @@ def run_single_registration(
                         "plan": plan_mode,
                         "nav_soft": True,
                     }
+                    _emit_perf_stage(
+                        "profile_turnstile_submit",
+                        _stage_t,
+                        round_no=round_no,
+                        plan=plan_mode,
+                        ok=True,
+                        message="soft_nav",
+                    )
                 else:
+                    _emit_perf_stage(
+                        "profile_turnstile_submit",
+                        _stage_t,
+                        round_no=round_no,
+                        plan=plan_mode,
+                        ok=False,
+                        message=em,
+                    )
                     raise
             last_mail_err = None
             break
         except AccountRetryNeeded as re:
+            _emit_perf_stage(
+                "mail_retry",
+                _stage_t if "_stage_t" in locals() else _perf_now(),
+                round_no=round_no,
+                plan=plan_mode,
+                ok=False,
+                message=str(re),
+            )
             last_mail_err = re
             print(
                 f"[*] 可换邮箱重试（{mail_try}/{max_mail_retry}）: {re}",
@@ -4602,6 +4716,14 @@ def run_single_registration(
                 ) from re
             continue
         except Exception as e:
+            _emit_perf_stage(
+                "mail_or_profile_attempt",
+                _stage_t if "_stage_t" in locals() else _perf_now(),
+                round_no=round_no,
+                plan=plan_mode,
+                ok=False,
+                message=str(e),
+            )
             # 获取邮箱失败也可换邮箱重试
             msg = str(e)
             if "获取邮箱失败" in msg or "创建邮箱失败" in msg or "获取验证码失败" in msg:
@@ -4620,13 +4742,38 @@ def run_single_registration(
     # 会话 cookie（含 cf_clearance / sso / sso-rw）此时才会真正写下来。
     # soft-nav：提交已触发导航，禁止最终页二次点「完成注册」
     _nav_soft = bool(isinstance(profile, dict) and profile.get("nav_soft"))
+    _stage_t = _perf_now()
     if not wait_for_grok_com_landing(skip_cf_retry=_nav_soft):
         print("[Warn] 未能落到 grok.com 登录态，sso 质量可能受影响")
+    _emit_perf_stage(
+        "grok_landing",
+        _stage_t,
+        round_no=round_no,
+        plan=plan_mode,
+        ok=True,
+        message=("soft_nav" if _nav_soft else None),
+    )
 
     # 发随机英文短消息触发生日/年龄确认弹窗，并自动填随机成年出生年（失败不阻断写 sso）
+    _stage_t = _perf_now()
     age_status = ensure_age_gate_completed(timeout=45)
+    _emit_perf_stage(
+        "age_gate",
+        _stage_t,
+        round_no=round_no,
+        plan=plan_mode,
+        ok=bool(isinstance(age_status, dict) and age_status.get("submitted")),
+    )
 
+    _stage_t = _perf_now()
     sso_value = wait_for_sso_cookie()
+    _emit_perf_stage(
+        "sso_cookie",
+        _stage_t,
+        round_no=round_no,
+        plan=plan_mode,
+        ok=bool(sso_value),
+    )
     password = str(profile.get("password", "") or "")
     if isinstance(profile, dict):
         profile = {**profile, "plan": plan_mode}
@@ -4660,7 +4807,15 @@ def run_single_registration(
     # 模块 register/zdr_toggle.py、account_tags.set_zdr_tag 仍保留，后续研究再接回。
     # 原逻辑：enable_disable_zdr + disable_zdr_for_sso + set_zdr_tag（见 git 历史）。
 
+    _stage_t = _perf_now()
     append_sso_to_txt(sso_value, output_path, email=email, password=password)
+    _emit_perf_stage(
+        "sso_file_write",
+        _stage_t,
+        round_no=round_no,
+        plan=plan_mode,
+        ok=True,
+    )
 
     # W2 · 捕获 CF 上下文供下一轮复用
     try:
@@ -4681,6 +4836,7 @@ def run_single_registration(
     grok2api_status = {"attempted": False, "ok": False, "queued": False}
     if sso_value:
         try:
+            _stage_t = _perf_now()
             proxy_for_auth = ""
             try:
                 proxy_for_auth = next_proxy(_browser_proxy) or _browser_proxy or ""
@@ -4836,10 +4992,26 @@ def run_single_registration(
                 print(f"[Warn] 授权入队失败: {q.get('error')}", flush=True)
                 auth_status["ok"] = False
                 grok2api_status["ok"] = False
+            _emit_perf_stage(
+                "auth_enqueue",
+                _stage_t,
+                round_no=round_no,
+                plan=plan_mode,
+                ok=bool(q.get("queued") or q.get("skipped")),
+                message=str(q.get("error") or ""),
+            )
         except Exception as e:
             print(f"[Warn] 授权入队异常（不影响 sso 落盘）: {e}", flush=True)
             auth_status = {"attempted": True, "ok": False, "queued": False, "error": str(e)}
             grok2api_status = {"attempted": False, "ok": False, "error": str(e)[:200]}
+            _emit_perf_stage(
+                "auth_enqueue",
+                _stage_t if "_stage_t" in locals() else _perf_now(),
+                round_no=round_no,
+                plan=plan_mode,
+                ok=False,
+                message=str(e),
+            )
 
     if extract_numbers:
         extract_visible_numbers()
@@ -5139,6 +5311,8 @@ def main():
                 break
 
             current_round += 1
+            round_started = _perf_now()
+            _emit_perf_round_start(current_round)
             _emit_structured(
                 "progress",
                 current=current_round,
@@ -5237,6 +5411,12 @@ def main():
                 print(
                     f"✘ 第 {current_round} 轮跳过：注册方案 A/B/C 均已关闭，请在「注册方案」中至少开启一项"
                 )
+                _emit_perf_round_end(
+                    current_round,
+                    round_started,
+                    ok=False,
+                    message="all plans disabled",
+                )
                 if args.count == 0 or current_round < args.count:
                     time.sleep(0.5)
                 continue
@@ -5263,22 +5443,57 @@ def main():
 
             # ---------- Plan A ----------
             if result is None and plan_a_enabled:
+                _plan_t = _perf_now()
                 try:
                     print("═══ Plan A 注册开始 ═══")
                     result = run_single_registration(
-                        args.output, extract_numbers=args.extract_numbers, plan="a"
+                        args.output,
+                        extract_numbers=args.extract_numbers,
+                        plan="a",
+                        round_no=current_round,
                     )
                     used_plan = "a"
+                    _emit_perf_stage(
+                        "plan_a",
+                        _plan_t,
+                        round_no=current_round,
+                        plan="a",
+                        ok=True,
+                    )
                 except KeyboardInterrupt:
+                    _emit_perf_stage(
+                        "plan_a",
+                        _plan_t,
+                        round_no=current_round,
+                        plan="a",
+                        ok=False,
+                        message="KeyboardInterrupt",
+                    )
                     print("")
                     print("[Info] 收到中断信号，停止后续轮次。")
                     break
                 except AccountRetryNeeded as e:
+                    _emit_perf_stage(
+                        "plan_a",
+                        _plan_t,
+                        round_no=current_round,
+                        plan="a",
+                        ok=False,
+                        message=str(e),
+                    )
                     # 含 W3 重复 SSO：不记成功，可换号继续（不占成功配额）
                     last_err = e
                     err_parts.append(f"A:retry:{str(e)[:50]}")
                     print(f"[plan-a] ⟳ 可重试: {e}")
                 except Exception as e:
+                    _emit_perf_stage(
+                        "plan_a",
+                        _plan_t,
+                        round_no=current_round,
+                        plan="a",
+                        ok=False,
+                        message=str(e),
+                    )
                     last_err = e
                     err_parts.append(f"A:{str(e)[:60]}")
                     print(f"[plan-a] ✘ 失败: {e}")
@@ -5295,6 +5510,7 @@ def main():
                 err_parts.append("B:skipped_hard_proxy")
 
             if result is None and plan_b_enabled and not skip_b_hard:
+                _plan_t = _perf_now()
                 try:
                     print("═══ Plan B 注册开始 ═══")
                     try:
@@ -5308,19 +5524,44 @@ def main():
                         args.output,
                         extract_numbers=args.extract_numbers,
                         plan="b",
+                        round_no=current_round,
                     )
                     used_plan = "b"
+                    _emit_perf_stage(
+                        "plan_b",
+                        _plan_t,
+                        round_no=current_round,
+                        plan="b",
+                        ok=True,
+                    )
                 except KeyboardInterrupt:
+                    _emit_perf_stage(
+                        "plan_b",
+                        _plan_t,
+                        round_no=current_round,
+                        plan="b",
+                        ok=False,
+                        message="KeyboardInterrupt",
+                    )
                     print("")
                     print("[Info] 收到中断信号，停止后续轮次。")
                     break
                 except Exception as e:
+                    _emit_perf_stage(
+                        "plan_b",
+                        _plan_t,
+                        round_no=current_round,
+                        plan="b",
+                        ok=False,
+                        message=str(e),
+                    )
                     last_err = e
                     err_parts.append(f"B:{str(e)[:60]}")
                     print(f"[plan-b] ✘ 失败: {e}")
 
             # ---------- Plan C (hybrid) ----------
             if result is None and plan_c_enabled:
+                _plan_t = _perf_now()
                 try:
                     from hybrid_register import run_hybrid_registration
 
@@ -5331,6 +5572,13 @@ def main():
                     if hy and hy.get("sso"):
                         result = hy
                         used_plan = "c"
+                        _emit_perf_stage(
+                            "plan_c",
+                            _plan_t,
+                            round_no=current_round,
+                            plan="c",
+                            ok=True,
+                        )
                     else:
                         detail = ""
                         if isinstance(hy, dict):
@@ -5338,11 +5586,35 @@ def main():
                         msg = detail if detail else "hybrid 未返回 sso"
                         err_parts.append(f"C:{msg[:80]}")
                         print(f"[plan-c] ✘ {msg}")
+                        _emit_perf_stage(
+                            "plan_c",
+                            _plan_t,
+                            round_no=current_round,
+                            plan="c",
+                            ok=False,
+                            message=msg,
+                        )
                 except KeyboardInterrupt:
+                    _emit_perf_stage(
+                        "plan_c",
+                        _plan_t,
+                        round_no=current_round,
+                        plan="c",
+                        ok=False,
+                        message="KeyboardInterrupt",
+                    )
                     print("")
                     print("[Info] 收到中断信号，停止后续轮次。")
                     break
                 except Exception as e:
+                    _emit_perf_stage(
+                        "plan_c",
+                        _plan_t,
+                        round_no=current_round,
+                        plan="c",
+                        ok=False,
+                        message=str(e),
+                    )
                     last_err = e
                     err_parts.append(f"C:{str(e)[:60]}")
                     print(f"[plan-c] ✘ 失败: {e}")
@@ -5358,6 +5630,13 @@ def main():
                     success=success_count,
                     failed=fail_count,
                     round=current_round,
+                    plan=used_plan or None,
+                    message=detail,
+                )
+                _emit_perf_round_end(
+                    current_round,
+                    round_started,
+                    ok=False,
                     plan=used_plan or None,
                     message=detail,
                 )
@@ -5392,6 +5671,12 @@ def main():
                     email=str(result.get("email") or "").strip() or None,
                     password=str(result.get("password") or "").strip() or None,
                     sso=str(result.get("sso") or "").strip() or None,
+                )
+                _emit_perf_round_end(
+                    current_round,
+                    round_started,
+                    ok=True,
+                    plan=used_plan or None,
                 )
                 # P2/3：成功后 GC；每 N 成功强制下轮重启浏览器
                 try:
@@ -5446,8 +5731,15 @@ def main():
                     f"（pending≈{st.get('pending')} · 最长 {wait_cap:.0f}s）…",
                     flush=True,
                 )
+                _stage_t = _perf_now()
                 ok = wait_queue_idle(timeout=wait_cap)
                 st2 = queue_stats()
+                _emit_perf_stage(
+                    "auth_queue_wait",
+                    _stage_t,
+                    ok=bool(ok),
+                    message=f"pending={st2.get('pending')} ok={st2.get('done_ok')} fail={st2.get('done_fail')}",
+                )
                 print(
                     f"[auth-queue] 队列{'已清空' if ok else '超时仍有剩余'}"
                     f" · ok={st2.get('done_ok')} fail={st2.get('done_fail')}"

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
+  Activity,
   Layers,
   Play,
   Save,
@@ -20,6 +21,7 @@ import { useSettingsStore } from '@renderer/store/settingsStore';
 import { useToastStore } from '@renderer/store/toastStore';
 import { cn } from '@renderer/lib/cn';
 import type { AppSettings, CpaMintMode } from '@shared/settings';
+import type { RunPerfSummary } from '@shared/ipc';
 import {
   FAIL_STAGE_LABELS,
   suggestForFailStages,
@@ -206,6 +208,8 @@ export function RegisterPage({
                 />
               </div>
             </div>
+
+            <PerformanceDiagnosticsCard />
 
             {!ready && (
               <div className="rounded-xl bg-warn/10 p-4 text-[13px] leading-5 text-warn">
@@ -530,6 +534,166 @@ function InfoBox({ label, value }: { label: string; value: string }) {
     <div className="rounded-xl border border-border/60 bg-card/70 p-3.5">
       <div className="field-label">{label}</div>
       <div className="mt-1.5 break-all text-[13px] font-medium">{value}</div>
+    </div>
+  );
+}
+
+const PERF_STAGE_LABELS: Record<string, string> = {
+  open_signup: '打开注册页',
+  email_create: '创建邮箱',
+  mail_code: '邮件验证码',
+  profile_turnstile_submit: '资料/Turnstile',
+  grok_landing: '落到 Grok',
+  age_gate: '年龄门',
+  sso_cookie: '获取 SSO',
+  sso_file_write: '写入 SSO',
+  auth_enqueue: 'Auth 入队',
+  auth_queue_wait: '等待 Auth 队列',
+  plan_a: 'Plan A',
+  plan_b: 'Plan B',
+  plan_c: 'Plan C',
+  mail_retry: '邮箱重试',
+  mail_or_profile_attempt: '邮箱/资料尝试'
+};
+
+function fmtPerfMs(ms?: number | null): string {
+  const n = Math.max(0, Math.round(Number(ms) || 0));
+  if (n < 1000) return `${n}ms`;
+  if (n < 60_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}s`;
+  return `${(n / 60_000).toFixed(1)}m`;
+}
+
+function stageLabel(stage?: string): string {
+  const key = String(stage || '').trim();
+  return PERF_STAGE_LABELS[key] || key || '未知阶段';
+}
+
+function PerformanceDiagnosticsCard() {
+  const focusRunId = useRunStore((s) => s.focusRunId);
+  const phase = useRunStore((s) => s.status.phase);
+  const [open, setOpen] = useState(false);
+  const [perf, setPerf] = useState<RunPerfSummary | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        if (!window.api.getRunPerf) return;
+        const r = await window.api.getRunPerf(focusRunId || undefined);
+        if (!cancelled) setPerf(r);
+      } catch {
+        /* diagnostics only */
+      }
+    };
+    void load();
+    const active = phase === 'starting' || phase === 'running';
+    const id = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      void load();
+    }, active ? 5000 : 12000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [focusRunId, phase]);
+
+  const rounds = perf?.rounds ?? 0;
+  const successRate =
+    rounds > 0 ? Math.round(((perf?.successRounds ?? 0) / rounds) * 1000) / 10 : 0;
+  const topStages = (perf?.stages || []).slice(0, 5);
+  const slowest = perf?.slowestStage;
+
+  return (
+    <div className="rounded-xl border border-border bg-card/80 p-3.5 shadow-[var(--ios-shadow)]">
+      <div className="flex items-center justify-between gap-2">
+        <button
+          type="button"
+          className="flex min-w-0 flex-1 items-start gap-2 text-left"
+          onClick={() => setOpen((v) => !v)}
+          title={open ? '折叠性能诊断' : '展开性能诊断'}
+        >
+          {open ? (
+            <ChevronDown className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+          ) : (
+            <ChevronRight className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+          )}
+          <Activity className="mt-0.5 h-4 w-4 shrink-0 text-info" />
+          <div className="min-w-0">
+            <div className="text-[13px] font-semibold tracking-[-0.02em]">性能诊断</div>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">
+              {rounds > 0
+                ? `均值 ${fmtPerfMs(perf?.avgRoundMs)} · P95 ${fmtPerfMs(perf?.p95RoundMs)} · 成功率 ${successRate}%`
+                : '等待注册任务上报阶段耗时'}
+            </p>
+          </div>
+        </button>
+        {perf?.runId ? (
+          <span className="font-mono text-[10px] text-muted-foreground">
+            #{perf.runId.slice(0, 8)}
+          </span>
+        ) : null}
+      </div>
+
+      {open ? (
+        <div className="mt-3 space-y-3">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <div className="rounded-lg border border-border/50 bg-muted/50 px-2.5 py-2">
+              <div className="text-[10px] text-muted-foreground">轮次</div>
+              <div className="text-[15px] font-semibold tabular-nums">{rounds}</div>
+            </div>
+            <div className="rounded-lg border border-border/50 bg-muted/50 px-2.5 py-2">
+              <div className="text-[10px] text-muted-foreground">平均</div>
+              <div className="text-[15px] font-semibold tabular-nums">
+                {fmtPerfMs(perf?.avgRoundMs)}
+              </div>
+            </div>
+            <div className="rounded-lg border border-border/50 bg-muted/50 px-2.5 py-2">
+              <div className="text-[10px] text-muted-foreground">P95</div>
+              <div className="text-[15px] font-semibold tabular-nums">
+                {fmtPerfMs(perf?.p95RoundMs)}
+              </div>
+            </div>
+            <div className="rounded-lg border border-border/50 bg-muted/50 px-2.5 py-2">
+              <div className="text-[10px] text-muted-foreground">最慢</div>
+              <div className="truncate text-[15px] font-semibold">
+                {slowest ? stageLabel(slowest.stage) : '-'}
+              </div>
+            </div>
+          </div>
+
+          {topStages.length > 0 ? (
+            <div className="space-y-1.5">
+              {topStages.map((s) => (
+                <div key={s.stage} className="flex items-center gap-2">
+                  <div className="w-[6.5rem] shrink-0 truncate text-[11px] text-muted-foreground">
+                    {stageLabel(s.stage)}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                      <div
+                        className="h-full rounded-full bg-info/80"
+                        style={{
+                          width: `${
+                            slowest?.totalMs
+                              ? Math.max(8, Math.round((s.totalMs / slowest.totalMs) * 100))
+                              : 8
+                          }%`
+                        }}
+                      />
+                    </div>
+                  </div>
+                  <div className="w-24 shrink-0 text-right text-[11px] tabular-nums">
+                    {fmtPerfMs(s.avgMs)}
+                    <span className="ml-1 text-[10px] text-muted-foreground">x{s.count}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-[11px] text-muted-foreground">暂无阶段样本。</p>
+          )}
+        </div>
+      ) : null}
     </div>
   );
 }

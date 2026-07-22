@@ -91,7 +91,18 @@ export interface AccountRecord {
 }
 
 export interface StructuredRunEvent {
-  type: 'log' | 'progress' | 'account' | 'success' | 'failed' | 'sso' | 'exit' | 'bootstrap';
+  type:
+    | 'log'
+    | 'progress'
+    | 'account'
+    | 'success'
+    | 'failed'
+    | 'sso'
+    | 'exit'
+    | 'bootstrap'
+    | 'perf_round_start'
+    | 'perf_stage'
+    | 'perf_round_end';
   runId?: string;
   level?: LogLevel;
   current?: number;
@@ -115,6 +126,9 @@ export interface StructuredRunEvent {
   planBSuccess?: number;
   planCSuccess?: number;
   round?: number;
+  stage?: string;
+  ms?: number;
+  ok?: boolean;
   message?: string;
   ts?: number;
 }

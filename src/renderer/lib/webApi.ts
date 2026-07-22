@@ -256,6 +256,10 @@ const webApi: RendererApi = {
     http('GET', `/api/run/jobs/${encodeURIComponent(runId)}`),
   focusRegisterJob: (runId) =>
     http('POST', '/api/run/focus', { runId }),
+  getRunPerf: (runId) => {
+    const q = runId ? `?runId=${encodeURIComponent(runId)}` : '';
+    return http('GET', `/api/run/perf${q}`);
+  },
   clearFinishedRegisterJobs: () =>
     http<{ ok: true; removed: number; removedIds?: string[] }>(
       'POST',

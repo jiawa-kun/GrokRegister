@@ -11,6 +11,11 @@ import type {
   RunStatus,
   StructuredRunEvent
 } from '@shared/runEvents';
+import type {
+  RunPerfRecentItem,
+  RunPerfStageSummary,
+  RunPerfSummary
+} from '@shared/ipc';
 import { EMPTY_STATUS } from '@shared/runEvents';
 import type { AppSettings } from '@shared/settings';
 import {
@@ -73,7 +78,36 @@ interface Job {
   failStages: Record<FailStageId, number>;
   /** 最近若干失败明细（调试/看板） */
   recentFails: { ts: number; stage: FailStageId; message: string; round?: number }[];
+  /** 仅保留最近若干轮的性能样本 */
+  perf: JobPerfState;
 }
+
+type PerfRoundSample = {
+  round: number;
+  ms: number;
+  ok: boolean;
+  ts: number;
+  plan?: string;
+  message?: string;
+};
+
+type PerfStageSample = {
+  stage: string;
+  ms: number;
+  ts: number;
+  round?: number;
+  ok?: boolean;
+  plan?: string;
+  message?: string;
+};
+
+type JobPerfState = {
+  startedAt: number | null;
+  updatedAt: number | null;
+  activeRounds: Map<number, number>;
+  rounds: PerfRoundSample[];
+  stages: PerfStageSample[];
+};
 
 const DEFAULT_MAX_PARALLEL = 3;
 const HARD_MAX_PARALLEL = 8;
@@ -89,6 +123,99 @@ function normalizeSuccessPlan(input?: string | null): SuccessPlan {
   if (s === 'c' || s === 'plan_c' || s === 'plan-c' || /plan\s*c/.test(s)) return 'c';
   if (s === 'b' || s === 'plan_b' || s === 'plan-b' || /plan\s*b/.test(s)) return 'b';
   return 'a';
+}
+
+function createPerfState(): JobPerfState {
+  return {
+    startedAt: null,
+    updatedAt: null,
+    activeRounds: new Map<number, number>(),
+    rounds: [],
+    stages: []
+  };
+}
+
+function pushLimited<T>(list: T[], item: T, limit: number): T[] {
+  const next = [...list, item];
+  if (next.length <= limit) return next;
+  return next.slice(next.length - limit);
+}
+
+function percentile(values: number[], ratio: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.round((sorted.length - 1) * ratio)));
+  return sorted[idx] || 0;
+}
+
+function summarizePerfStages(stages: PerfStageSample[]): RunPerfStageSummary[] {
+  const byStage = new Map<
+    string,
+    {
+      stage: string;
+      count: number;
+      ok: number;
+      failed: number;
+      totalMs: number;
+      samples: number[];
+      maxMs: number;
+      lastMs: number;
+      lastAt: number | null;
+    }
+  >();
+  for (const s of stages) {
+    const key = String(s.stage || '').trim() || 'unknown';
+    const cur =
+      byStage.get(key) ||
+      {
+        stage: key,
+        count: 0,
+        ok: 0,
+        failed: 0,
+        totalMs: 0,
+        samples: [],
+        maxMs: 0,
+        lastMs: 0,
+        lastAt: null
+      };
+    cur.count += 1;
+    if (s.ok === false) cur.failed += 1;
+    else if (s.ok === true) cur.ok += 1;
+    cur.totalMs += Number(s.ms) || 0;
+    cur.samples.push(Number(s.ms) || 0);
+    cur.maxMs = Math.max(cur.maxMs, Number(s.ms) || 0);
+    cur.lastMs = Number(s.ms) || 0;
+    cur.lastAt = Number.isFinite(s.ts) ? s.ts : cur.lastAt;
+    byStage.set(key, cur);
+  }
+  return [...byStage.values()]
+    .map((item) => ({
+      stage: item.stage,
+      count: item.count,
+      ok: item.ok,
+      failed: item.failed,
+      totalMs: item.totalMs,
+      avgMs: item.count > 0 ? Math.round(item.totalMs / item.count) : 0,
+      p50Ms: percentile(item.samples, 0.5),
+      p95Ms: percentile(item.samples, 0.95),
+      maxMs: item.maxMs,
+      lastMs: item.lastMs,
+      lastAt: item.lastAt
+    }))
+    .sort((a, b) => b.totalMs - a.totalMs || b.count - a.count || a.stage.localeCompare(b.stage));
+}
+
+function summarizePerfRounds(rounds: PerfRoundSample[]) {
+  const samples = rounds.map((r) => Number(r.ms) || 0).filter((n) => Number.isFinite(n));
+  return {
+    rounds: rounds.length,
+    successRounds: rounds.filter((r) => r.ok).length,
+    failedRounds: rounds.filter((r) => !r.ok).length,
+    avgRoundMs: rounds.length > 0 ? Math.round(samples.reduce((a, b) => a + b, 0) / rounds.length) : 0,
+    p50RoundMs: percentile(samples, 0.5),
+    p95RoundMs: percentile(samples, 0.95),
+    maxRoundMs: samples.length > 0 ? Math.max(...samples) : 0
+  };
 }
 
 /**
@@ -349,6 +476,115 @@ export class RegisterBot extends EventEmitter {
     };
   }
 
+  getRunPerf(runId?: string): RunPerfSummary {
+    const rid = String(runId || '').trim();
+    const job = rid ? this.jobs.get(rid) : this.resolveFocusJob();
+    if (!job) {
+      return {
+        runId: null,
+        phase: null,
+        startedAt: null,
+        updatedAt: null,
+        rounds: 0,
+        successRounds: 0,
+        failedRounds: 0,
+        avgRoundMs: 0,
+        p50RoundMs: 0,
+        p95RoundMs: 0,
+        maxRoundMs: 0,
+        slowestStage: null,
+        stages: [],
+        recent: []
+      };
+    }
+    const stageSummaries = summarizePerfStages(job.perf.stages);
+    const roundStats = summarizePerfRounds(job.perf.rounds);
+    const recent: RunPerfRecentItem[] = [
+      ...job.perf.rounds.map((r) => ({
+        type: 'round' as const,
+        round: r.round,
+        ms: r.ms,
+        ok: r.ok,
+        plan: r.plan,
+        message: r.message,
+        ts: r.ts
+      })),
+      ...job.perf.stages.map((s) => ({
+        type: 'stage' as const,
+        round: s.round,
+        stage: s.stage,
+        ms: s.ms,
+        ok: s.ok,
+        plan: s.plan,
+        message: s.message,
+        ts: s.ts
+      }))
+    ]
+      .sort((a, b) => b.ts - a.ts)
+      .slice(0, 20);
+    return {
+      runId: job.runId,
+      phase: job.status.phase,
+      startedAt: job.status.startedAt || job.perf.startedAt,
+      updatedAt: job.perf.updatedAt || job.status.finishedAt || job.status.startedAt,
+      ...roundStats,
+      slowestStage: stageSummaries[0] || null,
+      stages: stageSummaries.slice(0, 24),
+      recent
+    };
+  }
+
+  private recordPerfEvent(job: Job, payload: StructuredRunEvent): void {
+    const now = Number(payload.ts) || Date.now();
+    const round = Math.floor(Number(payload.round ?? payload.current ?? job.status.current ?? 0));
+    job.perf.startedAt = job.perf.startedAt || now;
+    job.perf.updatedAt = now;
+    if (payload.type === 'perf_round_start') {
+      if (round > 0) job.perf.activeRounds.set(round, now);
+      return;
+    }
+    if (payload.type === 'perf_stage') {
+      const stage = String(payload.stage || '').trim();
+      const ms = Math.max(0, Math.round(Number(payload.ms) || 0));
+      if (!stage || ms <= 0) return;
+      job.perf.stages = pushLimited(
+        job.perf.stages,
+        {
+          stage,
+          ms,
+          ts: now,
+          round: round > 0 ? round : undefined,
+          ok: typeof payload.ok === 'boolean' ? payload.ok : undefined,
+          plan: payload.plan ? String(payload.plan) : undefined,
+          message: payload.message ? String(payload.message).slice(0, 160) : undefined
+        },
+        240
+      );
+      return;
+    }
+    if (payload.type === 'perf_round_end') {
+      let ms = Math.max(0, Math.round(Number(payload.ms) || 0));
+      if (ms <= 0 && round > 0) {
+        const started = job.perf.activeRounds.get(round);
+        if (started) ms = Math.max(0, now - started);
+      }
+      if (round > 0) job.perf.activeRounds.delete(round);
+      if (ms <= 0) return;
+      job.perf.rounds = pushLimited(
+        job.perf.rounds,
+        {
+          round: round > 0 ? round : job.perf.rounds.length + 1,
+          ms,
+          ok: payload.ok !== false,
+          ts: now,
+          plan: payload.plan ? String(payload.plan) : undefined,
+          message: payload.message ? String(payload.message).slice(0, 160) : undefined
+        },
+        120
+      );
+    }
+  }
+
   private noteJobFail(
     job: Job,
     message: string,
@@ -582,7 +818,8 @@ export class RegisterBot extends EventEmitter {
       countedResultRounds: new Set<number>(),
       pendingAccount: {},
       failStages: emptyFailStageCounts(),
-      recentFails: []
+      recentFails: [],
+      perf: createPerfState()
     };
     this.jobs.set(runId, job);
     this.focusRunId = runId;
@@ -897,6 +1134,13 @@ export class RegisterBot extends EventEmitter {
     const runId = job.runId;
     const round = Number(payload.round ?? payload.current ?? job.status.current ?? 0);
     switch (payload.type) {
+      case 'perf_round_start':
+      case 'perf_stage':
+      case 'perf_round_end': {
+        job.structuredEventsSeen = true;
+        this.recordPerfEvent(job, payload);
+        return;
+      }
       case 'bootstrap': {
         job.structuredEventsSeen = true;
         return;
