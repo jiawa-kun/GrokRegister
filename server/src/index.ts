@@ -101,6 +101,12 @@ import {
 } from './cpaAuthStore.js';
 import { pushSsoToGrok2apiBatch } from './ssoGrok2apiPush.js';
 import {
+  getAutoTaskStatus,
+  runAutoTaskOnce,
+  startAutoTaskRunner,
+  stopAutoTaskRunner
+} from './autoTaskRunner.js';
+import {
   listPythonJobPoolStats,
   disposeAllPythonJobPools,
   getPythonJobPool
@@ -622,6 +628,19 @@ app.get('/api/auth-queue/metrics', asyncHandler(async (_req, res) => {
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: (err as Error).message });
+  }
+}));
+
+app.get('/api/auto-tasks/status', asyncHandler(async (_req, res) => {
+  res.json(await getAutoTaskStatus());
+}));
+
+app.post('/api/auto-tasks/run-once', asyncHandler(async (_req, res) => {
+  try {
+    res.json(await runAutoTaskOnce('manual'));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(400).json({ error: message });
   }
 }));
 
@@ -2522,6 +2541,7 @@ httpServer.listen(PORT, HOST, () => {
       }
     })
     .catch((err) => console.error('[Grok Register Agent] proxy boot sync failed', err));
+  startAutoTaskRunner();
 });
 
 function sLikeEnabled(st: { domain?: string; running?: boolean; lastError?: string | null }) {
@@ -2866,6 +2886,7 @@ function checkRegisterJobs(): SystemHealthCheck {
 
 async function shutdown(sig: string) {
   console.log(`[Grok Register Agent] received ${sig}, stopping...`);
+  stopAutoTaskRunner();
   await registerBot.stop().catch(() => undefined);
   wss.close();
   httpServer.close(() => process.exit(0));

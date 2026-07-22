@@ -227,6 +227,8 @@ const webApi: RendererApi = {
     await http('PUT', '/api/settings', s);
     return { ok: true };
   },
+  getAutoTaskStatus: () => http('GET', '/api/auto-tasks/status'),
+  runAutoTaskOnce: () => http('POST', '/api/auto-tasks/run-once', {}),
 
   startRegister: (args) => http('POST', '/api/run/start', args ?? {}),
   stopRegister: async (runId, opts) => {

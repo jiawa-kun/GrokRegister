@@ -324,6 +324,47 @@ export interface SystemHealth {
   checks: SystemHealthCheck[];
 }
 
+export interface AutoTaskStepSummary {
+  total?: number;
+  selected?: number;
+  checked?: number;
+  alive?: number;
+  dead?: number;
+  unknown?: number;
+  ok?: number;
+  failed?: number;
+  skipped?: number;
+  deleted?: number;
+  keep?: number;
+  updated?: number;
+  emailsFilled?: number;
+  remoteOk?: number;
+  remoteFailed?: number;
+  botFlagSkipped?: number;
+  ssoDeleted?: number;
+}
+
+export interface AutoTaskRunSummary {
+  reason: string;
+  startedAt: string;
+  finishedAt?: string;
+  durationMs?: number;
+  steps: Record<string, AutoTaskStepSummary>;
+  errors?: string[];
+}
+
+export interface AutoTaskStatus {
+  enabled: boolean;
+  running: boolean;
+  intervalMin: number;
+  batchLimit: number;
+  lastStartedAt: string | null;
+  lastFinishedAt: string | null;
+  nextRunAt: string | null;
+  lastError: string | null;
+  lastSummary: AutoTaskRunSummary | null;
+}
+
 /** preload 暴露给 renderer 的 typed surface（与 src/preload/index.ts 保持一致） */
 export interface RendererApi {
   // auth
@@ -336,6 +377,8 @@ export interface RendererApi {
   // settings
   getSettings(): Promise<AppSettings>;
   saveSettings(s: AppSettings): Promise<{ ok: true }>;
+  getAutoTaskStatus(): Promise<AutoTaskStatus>;
+  runAutoTaskOnce(): Promise<AutoTaskRunSummary>;
   /** Python 进程池健康指标 */
   getPythonPoolStats(): Promise<{
     enabled: boolean;

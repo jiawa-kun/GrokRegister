@@ -38,7 +38,7 @@ import {
   enforceProxyModeMutex,
   validateSettings
 } from '@shared/settings';
-import type { SingBoxLogResult, SingBoxStatus } from '@shared/ipc';
+import type { AutoTaskStatus, SingBoxLogResult, SingBoxStatus } from '@shared/ipc';
 import { cn } from '@renderer/lib/cn';
 
 /** 合并默认值，避免旧 settings 缺字段 / null 导致渲染崩溃 */
@@ -86,6 +86,33 @@ const SECRET_PLACEHOLDER = '********';
 function savedSecret(value: unknown): string | undefined {
   const text = String(value || '').trim();
   return text === SECRET_PLACEHOLDER ? undefined : text;
+}
+
+function formatDateTime(value?: string | null): string {
+  if (!value) return '-';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  return d.toLocaleString();
+}
+
+function compactAutoTaskSummary(status: AutoTaskStatus | null): string {
+  const steps = status?.lastSummary?.steps || {};
+  const parts: string[] = [];
+  const add = (label: string, key: string) => {
+    const s = steps[key];
+    if (!s) return;
+    const selected = Number(s.selected || 0);
+    const ok = Number(s.ok || s.alive || 0);
+    const failed = Number(s.failed || s.dead || s.unknown || 0);
+    parts.push(`${label} ${selected}${ok || failed ? ` / OK ${ok} / 异常 ${failed}` : ''}`);
+  };
+  add('验活', 'ssoCheck');
+  add('Auth', 'authMint');
+  add('测活', 'cpaProbe');
+  add('CPA推', 'pushCpa');
+  add('S2A推', 'pushSub2api');
+  add('G2A推', 'pushGrok2api');
+  return parts.length ? parts.join(' · ') : '暂无运行摘要';
 }
 
 function RepoLink({ href, label }: { href: string; label: string }) {
@@ -197,7 +224,7 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
   const [s2GroupsMsg, setS2GroupsMsg] = useState('');
   /** 外置 Turnstile Solver：默认折叠 */
   const [solverOpen, setSolverOpen] = useState(false);
-  /** 深链展开：mail | proxy | register | auth | push */
+  /** 深链展开：mail | proxy | register | auth | auto | push */
   const [secMail, setSecMail] = useState(false);
   const [secProxy, setSecProxy] = useState(false);
   const [secRegister, setSecRegister] = useState(false);
@@ -219,6 +246,9 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
   } | null>(null);
   const [poolBusy, setPoolBusy] = useState(false);
   const [secPush, setSecPush] = useState(false);
+  const [secAutoTask, setSecAutoTask] = useState(false);
+  const [autoTaskStatus, setAutoTaskStatus] = useState<AutoTaskStatus | null>(null);
+  const [autoTaskBusy, setAutoTaskBusy] = useState(false);
 
   useEffect(() => {
     const s = String(focusSection || '').trim().toLowerCase();
@@ -228,8 +258,10 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
     if (s === 'register') setSecRegister(true);
     if (s === 'auth') setSecAuth(true);
     if (s === 'push') setSecPush(true);
+    if (s === 'auto' || s === 'auto-task' || s === 'auto-tasks') setSecAutoTask(true);
     const t = window.setTimeout(() => {
-      const el = document.getElementById(`settings-${s}`);
+      const id = s === 'auto' || s === 'auto-tasks' ? 'auto-task' : s;
+      const el = document.getElementById(`settings-${id}`);
       el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }, 80);
     return () => window.clearTimeout(t);
@@ -263,7 +295,23 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
     }
   }, [data]);
 
+  const refreshAutoTaskStatus = async () => {
+    try {
+      if (typeof window.api?.getAutoTaskStatus !== 'function') return;
+      setAutoTaskStatus(await window.api.getAutoTaskStatus());
+    } catch {
+      /* 状态读取失败不阻塞设置页 */
+    }
+  };
 
+  useEffect(() => {
+    void refreshAutoTaskStatus();
+    const t = window.setInterval(() => {
+      void refreshAutoTaskStatus();
+    }, 10_000);
+    return () => window.clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft?.autoTaskEnabled, secAutoTask]);
 
 
 
@@ -1797,6 +1845,196 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
                 />
               </Field>
             </div>
+          </div>
+        </CardBody>
+      </Card>
+
+<Card
+        id="settings-auto-task"
+        collapsible
+        defaultCollapsed
+        open={secAutoTask}
+        onOpenChange={setSecAutoTask}
+      >
+        <CardHeader
+          title="自动任务"
+          description={(() => {
+            if (draft.autoTaskEnabled !== true) return '库存巡检关闭';
+            const bits: string[] = [];
+            if (draft.autoTaskSsoCheckEnabled) bits.push('验活');
+            if (draft.autoTaskAuthMintEnabled) bits.push('Auth');
+            if (draft.autoTaskCpaProbeEnabled) bits.push('测活');
+            if (draft.autoTaskPushEnabled) bits.push('推送');
+            return bits.length
+              ? `${bits.join(' + ')} · ${draft.autoTaskIntervalMin ?? 30} 分钟/轮`
+              : '总开关已开，但子任务未开启';
+          })()}
+          right={<CardHeaderIcon icon={Activity} title="自动任务" />}
+        />
+        <CardBody className="space-y-4">
+          <ToggleRow
+            label="启用库存自动任务"
+            hint="默认关。只处理现有号池/Auth 库存；不替代注册成功后的实时授权队列"
+            checked={draft.autoTaskEnabled === true}
+            onChange={(v) => update('autoTaskEnabled', v)}
+          />
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field
+              label="执行周期（分钟）"
+              hint="服务端定时器每轮重新读取设置；范围 5～1440，默认 30"
+              error={errors.autoTaskIntervalMin}
+            >
+              <Input
+                type="number"
+                min={5}
+                max={1440}
+                value={draft.autoTaskIntervalMin ?? 30}
+                onChange={(e) => {
+                  const n = Number(e.target.value);
+                  update(
+                    'autoTaskIntervalMin',
+                    Number.isFinite(n)
+                      ? Math.max(5, Math.min(1440, Math.floor(n)))
+                      : 30
+                  );
+                }}
+              />
+            </Field>
+            <Field
+              label="每轮上限"
+              hint="每个子任务单轮最多处理数量；范围 10～200，避免一次扫爆远端"
+              error={errors.autoTaskBatchLimit}
+            >
+              <Input
+                type="number"
+                min={10}
+                max={200}
+                value={draft.autoTaskBatchLimit ?? 100}
+                onChange={(e) => {
+                  const n = Number(e.target.value);
+                  update(
+                    'autoTaskBatchLimit',
+                    Number.isFinite(n)
+                      ? Math.max(10, Math.min(200, Math.floor(n)))
+                      : 100
+                  );
+                }}
+              />
+            </Field>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2">
+            <ToggleRow
+              label="自动 SSO 验活"
+              hint="扫未验活、未知，以及超过 24 小时的存活快照；写回号池三态"
+              checked={draft.autoTaskSsoCheckEnabled === true}
+              onChange={(v) => update('autoTaskSsoCheckEnabled', v)}
+            />
+            <ToggleRow
+              label="自动 Auth"
+              hint="扫未转 Auth 的 SSO：先验活，存活再 mint；不覆盖已有 Auth"
+              checked={draft.autoTaskAuthMintEnabled === true}
+              onChange={(v) => update('autoTaskAuthMintEnabled', v)}
+            />
+            <ToggleRow
+              label="自动 CPA 测活"
+              hint="扫未测/异常 Auth；删除行为沿用「测活死号自动删除」设置，默认不删"
+              checked={draft.autoTaskCpaProbeEnabled === true}
+              onChange={(v) => update('autoTaskCpaProbeEnabled', v)}
+            />
+            <ToggleRow
+              label="自动推送"
+              hint="只补推「推送设置」里已开启自动的通道：CPA / sub2api / grok2api，且不 force"
+              checked={draft.autoTaskPushEnabled === true}
+              onChange={(v) => update('autoTaskPushEnabled', v)}
+            />
+          </div>
+
+          <div className="space-y-2 rounded-[12px] border border-border/60 bg-muted/20 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-[12px] font-semibold tracking-tight">最近运行状态</div>
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  后端常驻调度；保存设置后下一次 tick 自动生效，无需重启。
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  disabled={autoTaskBusy}
+                  onClick={() => void refreshAutoTaskStatus()}
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  刷新
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  disabled={autoTaskBusy || autoTaskStatus?.running === true}
+                  onClick={() => {
+                    void (async () => {
+                      setAutoTaskBusy(true);
+                      try {
+                        const r = await window.api.runAutoTaskOnce();
+                        await refreshAutoTaskStatus();
+                        push({
+                          tone: r.errors?.length ? 'warn' : 'ok',
+                          title: r.errors?.length ? '自动任务执行完成，有错误' : '自动任务已执行',
+                          description: compactAutoTaskSummary({
+                            enabled: draft.autoTaskEnabled === true,
+                            running: false,
+                            intervalMin: draft.autoTaskIntervalMin ?? 30,
+                            batchLimit: draft.autoTaskBatchLimit ?? 100,
+                            lastStartedAt: r.startedAt,
+                            lastFinishedAt: r.finishedAt ?? null,
+                            nextRunAt: null,
+                            lastError: r.errors?.join('；') ?? null,
+                            lastSummary: r
+                          })
+                        });
+                      } catch (err) {
+                        push({
+                          tone: 'danger',
+                          title: '自动任务执行失败',
+                          description: err instanceof Error ? err.message : String(err)
+                        });
+                      } finally {
+                        setAutoTaskBusy(false);
+                      }
+                    })();
+                  }}
+                >
+                  <Activity className="h-3.5 w-3.5" />
+                  立即跑一轮
+                </Button>
+              </div>
+            </div>
+            <div className="grid gap-2 text-[11px] text-muted-foreground sm:grid-cols-2">
+              <p>
+                状态：
+                <span className="font-medium text-foreground">
+                  {autoTaskStatus?.running
+                    ? '运行中'
+                    : autoTaskStatus?.enabled
+                      ? '等待下一轮'
+                      : '关闭'}
+                </span>
+              </p>
+              <p>下次执行：{formatDateTime(autoTaskStatus?.nextRunAt)}</p>
+              <p>上次开始：{formatDateTime(autoTaskStatus?.lastStartedAt)}</p>
+              <p>上次结束：{formatDateTime(autoTaskStatus?.lastFinishedAt)}</p>
+            </div>
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              {compactAutoTaskSummary(autoTaskStatus)}
+            </p>
+            {autoTaskStatus?.lastError && (
+              <p className="text-[11px] leading-relaxed text-danger">
+                最近错误：{autoTaskStatus.lastError}
+              </p>
+            )}
           </div>
         </CardBody>
       </Card>

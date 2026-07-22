@@ -348,6 +348,36 @@ function merge(partial: unknown): AppSettings {
         : DEFAULT_SETTINGS.randomFingerprint,
     autoAuthExport:
       typeof p.autoAuthExport === 'boolean' ? p.autoAuthExport : DEFAULT_SETTINGS.autoAuthExport,
+    autoTaskEnabled:
+      typeof p.autoTaskEnabled === 'boolean'
+        ? p.autoTaskEnabled
+        : DEFAULT_SETTINGS.autoTaskEnabled,
+    autoTaskIntervalMin: (() => {
+      const n = Number((p as AppSettings).autoTaskIntervalMin);
+      if (!Number.isFinite(n) || n < 5) return DEFAULT_SETTINGS.autoTaskIntervalMin;
+      return Math.min(Math.floor(n), 1440);
+    })(),
+    autoTaskBatchLimit: (() => {
+      const n = Number((p as AppSettings).autoTaskBatchLimit);
+      if (!Number.isFinite(n) || n < 10) return DEFAULT_SETTINGS.autoTaskBatchLimit;
+      return Math.min(Math.floor(n), 200);
+    })(),
+    autoTaskSsoCheckEnabled:
+      typeof p.autoTaskSsoCheckEnabled === 'boolean'
+        ? p.autoTaskSsoCheckEnabled
+        : DEFAULT_SETTINGS.autoTaskSsoCheckEnabled,
+    autoTaskAuthMintEnabled:
+      typeof p.autoTaskAuthMintEnabled === 'boolean'
+        ? p.autoTaskAuthMintEnabled
+        : DEFAULT_SETTINGS.autoTaskAuthMintEnabled,
+    autoTaskCpaProbeEnabled:
+      typeof p.autoTaskCpaProbeEnabled === 'boolean'
+        ? p.autoTaskCpaProbeEnabled
+        : DEFAULT_SETTINGS.autoTaskCpaProbeEnabled,
+    autoTaskPushEnabled:
+      typeof p.autoTaskPushEnabled === 'boolean'
+        ? p.autoTaskPushEnabled
+        : DEFAULT_SETTINGS.autoTaskPushEnabled,
     autoAuthDelayMinSec: (() => {
       const n = Number((p as AppSettings).autoAuthDelayMinSec);
       if (!Number.isFinite(n)) return DEFAULT_SETTINGS.autoAuthDelayMinSec;

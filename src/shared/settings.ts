@@ -181,6 +181,23 @@ export interface AppSettings {
   /** 注册成功后自动 SSO→CPA auth 导出（后台队列，延迟后执行） */
   autoAuthExport: boolean;
   /**
+   * 库存自动任务总开关。
+   * 只处理号池/Auth 目录里已有库存，不替代注册成功后的实时队列；默认关闭。
+   */
+  autoTaskEnabled: boolean;
+  /** 库存自动任务周期（分钟），默认 30，范围 5～1440。 */
+  autoTaskIntervalMin: number;
+  /** 库存自动任务每个子任务单轮最多处理数量，默认 100，范围 10～200。 */
+  autoTaskBatchLimit: number;
+  /** 库存自动 SSO 验活：扫未验活/未知/过期存活快照。 */
+  autoTaskSsoCheckEnabled: boolean;
+  /** 库存自动 Auth：扫未转 Auth 的 SSO，先验活，存活再 mint。 */
+  autoTaskAuthMintEnabled: boolean;
+  /** 库存自动 CPA 测活：扫未测/异常 Auth，沿用死号删除设置。 */
+  autoTaskCpaProbeEnabled: boolean;
+  /** 库存自动推送：补推已开启自动推送通道的未推/失败目标。 */
+  autoTaskPushEnabled: boolean;
+  /**
    * 拿到 SSO 后延迟再 mint 的下限（秒）。默认 60。
    * 与 autoAuthDelayMaxSec 组成随机等待，提高 auth 存活率。
    */
@@ -431,6 +448,13 @@ export const DEFAULT_SETTINGS: AppSettings = {
   browserPath: '',
   randomFingerprint: true,
   autoAuthExport: true,
+  autoTaskEnabled: false,
+  autoTaskIntervalMin: 30,
+  autoTaskBatchLimit: 100,
+  autoTaskSsoCheckEnabled: false,
+  autoTaskAuthMintEnabled: false,
+  autoTaskCpaProbeEnabled: false,
+  autoTaskPushEnabled: false,
   autoAuthDelayMinSec: 60,
   autoAuthDelayMaxSec: 120,
   authExportWorkers: 2,
@@ -1293,6 +1317,18 @@ export function validateSettings(s: AppSettings): Record<string, string> {
       s.turnstileAutoWaitMax > 180
     ) {
       errors.turnstileAutoWaitMax = '人机验证自动等待上限须在 30 到 180 秒之间';
+    }
+    {
+      const n = Number(s.autoTaskIntervalMin);
+      if (!Number.isInteger(n) || n < 5 || n > 1440) {
+        errors.autoTaskIntervalMin = '自动任务周期须在 5～1440 分钟';
+      }
+    }
+    {
+      const n = Number(s.autoTaskBatchLimit);
+      if (!Number.isInteger(n) || n < 10 || n > 200) {
+        errors.autoTaskBatchLimit = '自动任务每轮上限须在 10～200 之间';
+      }
     }
     {
       const dMin = Number(s.autoAuthDelayMinSec);
