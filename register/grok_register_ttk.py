@@ -3,53 +3,90 @@
 Compatibility shim: regkit / browser.token_harvester import ``grok_register_ttk``.
 
 本仓库主引擎是 DrissionPage_example，在此转发常用符号，避免 hybrid 因缺模块失败。
+
+重要：runner.py 用 runpy 以 __main__ 加载引擎时，sys.modules['__main__'] 才有 page/browser；
+若只 import DrissionPage_example 会得到另一份空模块 → hybrid 误起第二浏览器。
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import ModuleType
+from typing import Any, Optional
 
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# 主注册引擎
-import DrissionPage_example as _engine  # noqa: E402
 
-# 浏览器（hybrid/token_harvester 常传 log_callback；主引擎无此参，需吞掉）
-def _with_log_callback(fn):
+def _resolve_engine() -> ModuleType:
+    """Prefer the live process engine (__main__ or already-loaded module)."""
+    main = sys.modules.get("__main__")
+    if main is not None and (
+        hasattr(main, "start_browser") or getattr(main, "page", None) is not None
+    ):
+        return main  # type: ignore[return-value]
+    eng = sys.modules.get("DrissionPage_example")
+    if eng is not None and (
+        hasattr(eng, "start_browser") or getattr(eng, "page", None) is not None
+    ):
+        return eng  # type: ignore[return-value]
+    import DrissionPage_example as eng  # noqa: E402
+
+    return eng
+
+
+def _engine() -> ModuleType:
+    return _resolve_engine()
+
+
+def _with_log_callback(fn_name: str):
     def _wrap(*args, log_callback=None, **kwargs):
-        if log_callback is not None and callable(log_callback):
-            try:
-                # 不改主引擎签名；仅在有回调时把关键 print 行透传可选（当前静默忽略）
-                pass
-            except Exception:
-                pass
-        # 去掉未知 kwargs 中仅 log_callback；其余原样
         kwargs.pop("log_callback", None)
+        fn = getattr(_engine(), fn_name)
         return fn(*args, **kwargs)
 
     return _wrap
 
 
-start_browser = _with_log_callback(_engine.start_browser)
-stop_browser = _engine.stop_browser
-restart_browser = getattr(_engine, "restart_browser", None)
-open_signup_page = _with_log_callback(_engine.open_signup_page)
+def start_browser(*args, log_callback=None, **kwargs):
+    kwargs.pop("log_callback", None)
+    return _engine().start_browser(*args, **kwargs)
+
+
+def stop_browser(*args, **kwargs):
+    return _engine().stop_browser(*args, **kwargs)
+
+
+def restart_browser(*args, **kwargs):
+    eng = _engine()
+    fn = getattr(eng, "restart_browser", None)
+    if callable(fn):
+        return fn(*args, **kwargs)
+    stop_browser()
+    return start_browser()
+
+
+def open_signup_page(*args, log_callback=None, **kwargs):
+    kwargs.pop("log_callback", None)
+    return _engine().open_signup_page(*args, **kwargs)
 
 
 def click_email_signup_button(timeout=10, log_callback=None, **kwargs):
     kwargs.pop("log_callback", None)
-    return _engine.click_email_signup_button(timeout=timeout, **kwargs)
+    return _engine().click_email_signup_button(timeout=timeout, **kwargs)
 
 
 def getTurnstileToken(timeout=50, log_callback=None, **kwargs):
     kwargs.pop("log_callback", None)
-    # forward fast / auto_wait_cap to engine (P0.5 short-path retry)
-    return _engine.getTurnstileToken(timeout=timeout, log_callback=None, **kwargs)
+    return _engine().getTurnstileToken(timeout=timeout, log_callback=None, **kwargs)
 
 
-refresh_active_page = getattr(_engine, "refresh_active_page", None)
+def refresh_active_page(*args, **kwargs):
+    fn = getattr(_engine(), "refresh_active_page", None)
+    if callable(fn):
+        return fn(*args, **kwargs)
+    return None
 
 
 def shutdown_browser(*_a, **_k):
@@ -57,11 +94,35 @@ def shutdown_browser(*_a, **_k):
 
 
 def _get_page():
-    return getattr(_engine, "page", None)
+    eng = _engine()
+    page = getattr(eng, "page", None)
+    if page is not None:
+        return page
+    # secondary: scan modules that expose page
+    for name, mod in list(sys.modules.items()):
+        if mod is None:
+            continue
+        if name in ("__main__", "DrissionPage_example") or (
+            hasattr(mod, "start_browser") and hasattr(mod, "page")
+        ):
+            p = getattr(mod, "page", None)
+            if p is not None:
+                return p
+    return None
 
 
 def _get_browser():
-    return getattr(_engine, "browser", None)
+    eng = _engine()
+    b = getattr(eng, "browser", None)
+    if b is not None:
+        return b
+    for name in ("__main__", "DrissionPage_example"):
+        mod = sys.modules.get(name)
+        if mod is not None:
+            b = getattr(mod, "browser", None)
+            if b is not None:
+                return b
+    return None
 
 
 # 邮件（若引擎侧无同名则从 email_register 兜底）
@@ -71,14 +132,13 @@ except Exception:  # pragma: no cover
     create_temp_email = None  # type: ignore
     get_oai_code = None  # type: ignore
 
-# 可选 post-success（本仓库用 auth 队列，hybrid 侧可不依赖）
-schedule_post_registration = getattr(_engine, "schedule_post_registration", None)
-wait_post_success_queue = getattr(_engine, "wait_post_success_queue", None)
-cleanup_runtime_memory = getattr(_engine, "cleanup_runtime_memory", None)
-apply_resolved_proxy_to_config = getattr(_engine, "apply_resolved_proxy_to_config", None)
-sleep_with_cancel = getattr(_engine, "sleep_with_cancel", None)
-cli_log = getattr(_engine, "cli_log", print)
-config = getattr(_engine, "config", {}) or {}
+schedule_post_registration = None
+wait_post_success_queue = None
+cleanup_runtime_memory = None
+apply_resolved_proxy_to_config = None
+sleep_with_cancel = None
+cli_log = print
+config: dict = {}
 
 
 class CliStopController:

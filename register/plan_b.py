@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import re
 import secrets
 import time
 from pathlib import Path
@@ -306,3 +307,24 @@ def load_plan_c_enabled_from_config() -> bool:
         )
     mode = str(conf.get("register_mode") or conf.get("registerMode") or "").strip().lower()
     return mode == "hybrid"
+
+
+def load_plan_order_from_config() -> list[str]:
+    """config.json: register_plan_order，如 ["C","A","B"]；缺省 A→B→C。"""
+    conf = _load_register_config()
+    raw = conf.get("register_plan_order")
+    if raw is None:
+        raw = conf.get("registerPlanOrder")
+    out: list[str] = []
+    if isinstance(raw, str) and raw.strip():
+        parts = [p for p in re.split(r"[>,\s|/·]+", raw.strip()) if p]
+        raw = parts
+    if isinstance(raw, (list, tuple)):
+        for x in raw:
+            u = str(x or "").strip().upper()
+            if u in ("A", "B", "C") and u not in out:
+                out.append(u)
+    for p in ("A", "B", "C"):
+        if p not in out:
+            out.append(p)
+    return out

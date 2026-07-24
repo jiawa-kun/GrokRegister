@@ -202,6 +202,12 @@ export interface CpaAuthItem {
   ssoG2Error?: string | null;
   authCpaError?: string | null;
   authSub2apiError?: string | null;
+  /** 已成功推送到远程 CPA 时为 true（仅成功显示 CPA tag） */
+  pushedCpa?: boolean;
+  pushedCpaAt?: string | null;
+  /** 已成功推送到 sub2api (S2A) 时为 true */
+  pushedS2a?: boolean;
+  pushedS2aAt?: string | null;
 }
 
 export interface CpaAuthListResult {

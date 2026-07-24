@@ -125,7 +125,7 @@ const STATUS_FILTER_KEY = 'gra-auth-status-filter';
 const PUSH_FILTER_KEY = 'gra-auth-push-filter';
 
 /** 行内标记筛选：全部 / 无sso / 无邮箱 / 待补全 */
-type MetaFilter = 'all' | 'no_sso' | 'no_email' | 'need_fill';
+type MetaFilter = 'all' | 'no_sso' | 'no_email' | 'need_fill' | 'pushed_cpa' | 'pushed_s2a' | 'not_pushed';
 
 /** 状态列（HTTP）筛选：全部 / 未测 / 200 / 401 / 403 / 其它错误 */
 type StatusFilter = 'all' | 'unprobed' | '200' | '401' | '403' | 'other_err';
@@ -152,6 +152,17 @@ function loadMetaFilter(): MetaFilter {
   if (fromUrl) return fromUrl;
   try {
     const v = localStorage.getItem(META_FILTER_KEY);
+    if (
+      v === 'pushed_cpa' ||
+      v === 'pushed_s2a' ||
+      v === 'not_pushed' ||
+      v === 'no_sso' ||
+      v === 'no_email' ||
+      v === 'need_fill' ||
+      v === 'all'
+    ) {
+      return v as MetaFilter;
+    }
     if (v === 'no_sso' || v === 'no_email' || v === 'need_fill' || v === 'all') return v;
   } catch {
     /* ignore */
@@ -695,6 +706,10 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
     else if (metaFilter === 'no_email') list = list.filter((i) => !hasEmail(i));
     else if (metaFilter === 'need_fill')
       list = list.filter((i) => !hasSso(i) || !hasEmail(i));
+    else if (metaFilter === 'pushed_cpa') list = list.filter((i) => i.pushedCpa === true);
+    else if (metaFilter === 'pushed_s2a') list = list.filter((i) => i.pushedS2a === true);
+    else if (metaFilter === 'not_pushed')
+      list = list.filter((i) => i.pushedCpa !== true && i.pushedS2a !== true);
     if (statusFilter !== 'all') {
       list = list.filter((i) => matchStatusFilter(i, statusFilter));
     }
@@ -2802,6 +2817,18 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
 
   const progPct =
     prog && prog.total > 0 ? Math.min(100, Math.round((prog.done / prog.total) * 100)) : 0;
+  const pushedCpaCount = useMemo(
+    () => items.filter((i) => i.pushedCpa === true).length,
+    [items]
+  );
+  const pushedS2aCount = useMemo(
+    () => items.filter((i) => i.pushedS2a === true).length,
+    [items]
+  );
+  const notPushedCount = useMemo(
+    () => items.filter((i) => i.pushedCpa !== true && i.pushedS2a !== true).length,
+    [items]
+  );
   const missingSsoCount = useMemo(
     () =>
       facets?.noSso ??
@@ -3393,7 +3420,10 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                 { id: 'all', label: '全部', count: authTotalCount, title: '不限制标记' },
                 { id: 'no_sso', label: '无SSO', count: missingSsoCount, title: '无 sso 字段，可回填', tone: 'warn' },
                 { id: 'no_email', label: '无邮箱', count: noEmailAuthCount, title: '无邮箱，无法 email 回填', tone: 'warn' },
-                { id: 'need_fill', label: '待补全', count: needFillCount, title: '无 sso 或无邮箱' }
+                { id: 'need_fill', label: '待补全', count: needFillCount, title: '无 sso 或无邮箱' },
+                { id: 'pushed_cpa', label: 'CPA', count: pushedCpaCount, title: '已推送远程 CPA', tone: 'ok' },
+                { id: 'pushed_s2a', label: 'S2A', count: pushedS2aCount, title: '已推送 sub2api', tone: 'ok' },
+                { id: 'not_pushed', label: '未推', count: notPushedCount, title: 'CPA/S2A 均未推送', tone: 'muted' }
               ]}
             />
             <FilterSegmentGroup
@@ -4070,6 +4100,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
       ) : (
         <>
         <div className="overflow-x-auto rounded-[16px] border border-border bg-card shadow-[var(--ios-shadow)]">
+          {/* auto 布局：内容列 nowrap 自撑；邮箱截断吃剩余；避免 fixed+w-0 把字挤竖 */}
           <table className="w-full min-w-[880px] text-left text-[13px]">
             <thead className="border-b border-border/70 text-[11px] text-muted-foreground">
               <tr>
@@ -4119,7 +4150,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                       selected.has(item.filename) && 'bg-primary/5'
                     )}
                   >
-                    <td className="px-3 py-2.5">
+                    <td className="w-10 px-2 py-2.5 align-middle">
                       <Switch
                         size="sm"
                         checked={selected.has(item.filename)}
@@ -4129,7 +4160,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                       />
                     </td>
                     <td
-                      className="max-w-[14rem] truncate px-3 py-2.5 font-medium"
+                      className="max-w-[12rem] truncate px-2 py-2.5 align-middle font-medium"
                       title={
                         rowNoEmail
                           ? '无邮箱：email 回填无效，需重 mint 或手补 sso'
@@ -4145,7 +4176,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                       )}
                     </td>
                     <td
-                      className="w-[7rem] max-w-[7rem] truncate px-2 py-2.5 font-mono text-[11px] text-muted-foreground"
+                      className="w-[6.5rem] max-w-[6.5rem] truncate px-1.5 py-2.5 align-middle font-mono text-[11px] text-muted-foreground"
                       title={item.filename}
                     >
                       {item.filename}
@@ -4194,7 +4225,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                       )}
                     </td>
                     <td className="px-1.5 py-2.5 align-middle">
-                      {/* TAG 单行 nowrap：列宽随可见标签自撑 */}
+                      {/* TAG 单行 nowrap：列宽随可见标签自撑，绝不竖排 */}
                       <div className="flex flex-nowrap items-center gap-1 whitespace-nowrap">
                         {item.xai ? (
                           <span
@@ -4257,6 +4288,7 @@ export function AuthPage({ onOpenPool }: { onOpenPool?: () => void } = {}) {
                       {item.expired ? fmtBeijingPlain(item.expired) : '—'}
                     </td>
                     <td className="w-[14.5rem] px-1.5 py-2 align-middle">
+                      {/* 两行×两按钮：列宽足够「密码重登」横排，禁止字竖排 */}
                       <div className="flex w-[13.75rem] flex-col gap-1">
                         {rowStage && (
                           <span

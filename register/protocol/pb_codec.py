@@ -90,14 +90,13 @@ VERIFY_CODE_FIELDS = {"email": 1, "code": 2}
 VALIDATE_PASSWORD_FIELDS = {"email": 4, "password": 5}
 
 
-def encode_create_email_validation_code(email: str, castle_token: str) -> bytes:
-    payload = join_fields(
-        [
-            encode_string(CREATE_EMAIL_FIELDS["email"], email),
-            encode_string(CREATE_EMAIL_FIELDS["castle_request_token"], castle_token),
-        ]
-    )
-    return wrap_grpc_web(payload)
+def encode_create_email_validation_code(email: str, castle_token: str = "") -> bytes:
+    """Field 1 = email; field 3 = castle only when non-empty (main-3 / browser short body)."""
+    parts = [encode_string(CREATE_EMAIL_FIELDS["email"], email)]
+    tok = (castle_token or "").strip()
+    if tok:
+        parts.append(encode_string(CREATE_EMAIL_FIELDS["castle_request_token"], tok))
+    return wrap_grpc_web(join_fields(parts))
 
 
 def encode_verify_email_validation_code(email: str, code: str) -> bytes:

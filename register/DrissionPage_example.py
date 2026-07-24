@@ -416,13 +416,21 @@ def _new_chromium_options() -> ChromiumOptions:
         opts.headless(False)
     except Exception:
         pass
-    opts.set_argument("--no-sandbox")
-    opts.set_argument("--disable-dev-shm-usage")
+    # Windows 手动 Chrome 不用 --no-sandbox（常见自动化画像）
+    if _IS_LINUX:
+        opts.set_argument("--no-sandbox")
+        opts.set_argument("--disable-dev-shm-usage")
     opts.set_argument(f"--window-size={_WINDOW_W},{_WINDOW_H}")
     opts.set_argument("--window-position=0,0")
     opts.set_argument("--disable-blink-features=AutomationControlled")
     opts.set_argument("--lang=en-US,en")
     opts.set_argument("--accept-lang=en-US,en")
+    try:
+        opts.set_argument("--no-first-run")
+        opts.set_argument("--no-default-browser-check")
+        opts.set_argument("--disable-infobars")
+    except Exception:
+        pass
     if _IS_LINUX:
         opts.set_argument("--disable-gpu-compositing")
         opts.set_argument("--use-gl=angle")
@@ -562,25 +570,70 @@ def _real_chrome_major() -> int | None:
     """
     读取本机 Chromium 大版本号，供 UA 对齐（避免 150 二进制 + 137 UA）。
     失败返回 None，由 build_fingerprint 走默认版本表。
+    Windows 上 chrome.exe --version 常超时：改扫 Application 版本目录 / 文件属性。
     """
+    import re
+    import subprocess
+
     path = _resolve_browser_binary_path()
     ver_text = ""
     if path:
         try:
-            import subprocess
-
             out = subprocess.check_output(
-                [path, "--version"], stderr=subprocess.STDOUT, timeout=8
+                [path, "--version"], stderr=subprocess.STDOUT, timeout=3
             )
             ver_text = out.decode("utf-8", "replace").strip()
         except Exception:
             ver_text = ""
     if not ver_text:
-        # 兜底：环境变量（Docker 可注入）
-        ver_text = str(os.environ.get("CHROME_VERSION") or os.environ.get("CHROMIUM_VERSION") or "")
-    # 例: "Chromium 150.0.7871.114 built on Debian..." / "Google Chrome 150.0.7339.127"
-    import re
-
+        ver_text = str(
+            os.environ.get("CHROME_VERSION") or os.environ.get("CHROMIUM_VERSION") or ""
+        )
+    # Windows: Application\144.0.x.x\ 目录名
+    if path:
+        try:
+            app_dir = os.path.dirname(path)
+            best = 0
+            for name in os.listdir(app_dir):
+                mdir = re.match(r"^(\d{2,3})\.\d+", name)
+                if mdir:
+                    best = max(best, int(mdir.group(1)))
+            if 80 <= best <= 200 and not ver_text:
+                return best
+            if 80 <= best <= 200 and ver_text:
+                # prefer folder major if --version missing digits
+                pass
+            if 80 <= best <= 200 and not re.search(r"\d{2,3}\.\d+", ver_text or ""):
+                return best
+        except Exception:
+            pass
+        if not ver_text:
+            try:
+                ps = (
+                    "(Get-Item -LiteralPath '"
+                    + path.replace("'", "''")
+                    + "').VersionInfo.ProductVersion"
+                )
+                out = subprocess.check_output(
+                    ["powershell", "-NoProfile", "-Command", ps],
+                    stderr=subprocess.STDOUT,
+                    timeout=5,
+                )
+                ver_text = out.decode("utf-8", "replace").strip()
+            except Exception:
+                pass
+            # folder scan again as last resort
+            try:
+                app_dir = os.path.dirname(path)
+                best = 0
+                for name in os.listdir(app_dir):
+                    mdir = re.match(r"^(\d{2,3})\.\d+", name)
+                    if mdir:
+                        best = max(best, int(mdir.group(1)))
+                if 80 <= best <= 200:
+                    return best
+            except Exception:
+                pass
     m = re.search(r"(?:Chromium|Chrome)[\s/]+(\d{2,3})\.", ver_text, re.I)
     if not m:
         m = re.search(r"\b(\d{2,3})\.\d+\.\d+", ver_text)
@@ -1999,134 +2052,318 @@ return true;
 
 
 def fill_email_and_submit(timeout=15):
-    # 复用 `email_register.py` 里的邮箱获取逻辑，保留邮箱与 token 供后续验证码步骤继续使用。
+    """填邮箱并提交。优先 CDP 真人键入 + 表单内 submit（避免假成功 / Something went wrong）。"""
     _step_pause(250, 800)
     email, dev_token = get_email_and_token()
     if not email or not dev_token:
         raise Exception("获取邮箱失败")
 
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        filled = page.run_js(
-            """
+    # 优先协议发码（UI Sign up 自动化常 Something went wrong / Trace ID:-）
+    try:
+        from protocol_mail import protocol_create_email_code as _pce
+
+        _pr0 = _pce(email, log=lambda m: print(m, flush=True))
+        if _pr0.get("ok"):
+            print(f"[*] 协议 CreateEmail 优先成功: {email}（跳过 UI 提交发码）", flush=True)
+            # 仍尽量把邮箱填进页面，便于后续 OTP/资料页
+            try:
+                page.run_js(
+                    """
 const email = arguments[0];
-
-function isVisible(node) {
-    if (!node) {
-        return false;
-    }
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-        return false;
-    }
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-
-const input = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]')).find((node) => {
-    return isVisible(node) && !node.disabled && !node.readOnly;
-}) || null;
-
-if (!input) {
-    return 'not-ready';
-}
-
+const input = document.querySelector(
+  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
+);
+if (!input) return false;
 input.focus();
-input.click();
-
-// 不能只写 `input.value = xxx`，否则 React / 受控表单可能没有同步内部状态。
-const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
 const tracker = input._valueTracker;
-if (tracker) {
-    tracker.setValue('');
-}
-if (valueSetter) {
-    valueSetter.call(input, email);
-} else {
-    input.value = email;
-}
-
-input.dispatchEvent(new InputEvent('beforeinput', {
-    bubbles: true,
-    data: email,
-    inputType: 'insertText',
-}));
-input.dispatchEvent(new InputEvent('input', {
-    bubbles: true,
-    data: email,
-    inputType: 'insertText',
-}));
+if (tracker) tracker.setValue('');
+if (setter) setter.call(input, email); else input.value = email;
+input.dispatchEvent(new Event('input', { bubbles: true }));
 input.dispatchEvent(new Event('change', { bubbles: true }));
+return true;
+""",
+                    email,
+                )
+            except Exception:
+                pass
+            _step_pause(200, 600)
+            return email, dev_token
+        print(f"[Warn] 协议 CreateEmail 优先失败，回退 UI: {_pr0}", flush=True)
+    except Exception as _pe0:
+        print(f"[Warn] 协议 CreateEmail 不可用，回退 UI: {_pe0}", flush=True)
 
-if ((input.value || '').trim() !== email || !input.checkValidity()) {
-    return false;
-}
+    def _page_error_snapshot():
+        try:
+            return page.run_js(
+                r"""
+const body = (document.body && (document.body.innerText || document.body.textContent) || '');
+const err = /something went wrong|try again|出错了|出了点问题|trace id/i.test(body);
+const otp = !!document.querySelector(
+  'input[data-input-otp="true"], input[name="code"], input[autocomplete="one-time-code"]'
+);
+return {
+  err: err,
+  otp: otp,
+  url: location.href.slice(0, 160),
+  snippet: body.replace(/\s+/g, ' ').trim().slice(0, 220),
+};
+"""
+            )
+        except Exception as e:
+            return {"err": False, "otp": False, "error": str(e)}
 
-input.blur();
-return 'filled';
-            """,
-            email,
-        )
-
-        if filled == 'not-ready':
-            time.sleep(0.5)
-            continue
-
-        if filled != 'filled':
-            print(f"[Debug] 邮箱输入框已出现，但写入失败: {filled}")
-            time.sleep(0.5)
-            continue
-
-        if filled == 'filled':
-            time.sleep(0.8)
-            clicked = page.run_js(
+    def _cdp_type_email(value: str) -> str:
+        """CDP 点击输入框后逐字 insertText，尽量触发 React 受控状态。"""
+        try:
+            loc = page.run_js(
                 r"""
 function isVisible(node) {
-    if (!node) {
-        return false;
-    }
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-        return false;
-    }
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
 }
-
-const input = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]')).find((node) => {
-    return isVisible(node) && !node.disabled && !node.readOnly;
-}) || null;
-
-if (!input || !input.checkValidity() || !(input.value || '').trim()) {
-    return false;
-}
-
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const submitButton = buttons.find((node) => {
-    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
-    const t = text.toLowerCase(); return text === '注册' || text.includes('注册') || t === 'signup' || t === 'sign up' || t.includes('sign up');
-});
-
-if (!submitButton || submitButton.disabled) {
-    return false;
-}
-
-submitButton.click();
-return true;
+const input = Array.from(document.querySelectorAll(
+  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
+)).find((n) => isVisible(n) && !n.disabled && !n.readOnly) || null;
+if (!input) return null;
+input.scrollIntoView({ block: 'center', inline: 'center' });
+const r = input.getBoundingClientRect();
+input.focus();
+try { input.click(); } catch (e) {}
+try { input.select(); } catch (e) {}
+return { x: r.x + r.width / 2, y: r.y + r.height / 2, val: String(input.value || '') };
+"""
+            )
+        except Exception as e:
+            return f"locate-fail:{e}"
+        if not isinstance(loc, dict):
+            return "no-input"
+        try:
+            page.run_cdp(
+                "Input.dispatchKeyEvent",
+                type="keyDown",
+                key="a",
+                code="KeyA",
+                modifiers=2,
+                windowsVirtualKeyCode=65,
+            )
+            page.run_cdp(
+                "Input.dispatchKeyEvent",
+                type="keyUp",
+                key="a",
+                code="KeyA",
+                modifiers=2,
+                windowsVirtualKeyCode=65,
+            )
+            page.run_cdp(
+                "Input.dispatchKeyEvent",
+                type="keyDown",
+                key="Backspace",
+                code="Backspace",
+                windowsVirtualKeyCode=8,
+            )
+            page.run_cdp(
+                "Input.dispatchKeyEvent",
+                type="keyUp",
+                key="Backspace",
+                code="Backspace",
+                windowsVirtualKeyCode=8,
+            )
+            time.sleep(0.05)
+            for ch in str(value):
+                page.run_cdp("Input.insertText", text=ch)
+                time.sleep(0.012 + secrets.randbelow(18) / 1000.0)
+            time.sleep(0.15)
+            cur = page.run_js(
+                r"""
+const input = document.querySelector(
+  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
+);
+return input ? String(input.value || '') : '';
+"""
+            )
+            if str(cur or "").strip() == str(value).strip():
+                return "cdp-ok"
+            fb = page.run_js(
                 """
+const email = arguments[0];
+const input = document.querySelector(
+  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
+);
+if (!input) return 'no-input';
+input.focus();
+const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+const tracker = input._valueTracker;
+if (tracker) tracker.setValue(input.value || '');
+if (setter) setter.call(input, email); else input.value = email;
+const rk = Object.keys(input).find((k) => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+if (rk && input[rk]) {
+  const p = input[rk];
+  const ev = { target: input, currentTarget: input, bubbles: true };
+  try { if (p.onChange) p.onChange({ ...ev, type: 'change' }); } catch (e) {}
+  try { if (p.onInput) p.onInput({ ...ev, type: 'input' }); } catch (e) {}
+}
+input.dispatchEvent(new InputEvent('input', { bubbles: true, data: email, inputType: 'insertText' }));
+input.dispatchEvent(new Event('change', { bubbles: true }));
+return (input.value || '') === email ? 'react-ok' : 'mismatch:' + (input.value || '');
+""",
+                value,
+            )
+            return str(fb or "fallback-fail")
+        except Exception as e:
+            return f"cdp-err:{e}"
+
+    def _submit_email_form():
+        """只点邮箱 input 所在 form 内的 submit，避免点到外层 Sign up Sign up。"""
+        return page.run_js(
+            r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+function btnText(node) {
+  return [node.innerText, node.textContent, node.getAttribute('aria-label')]
+    .filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+function isSocial(t) {
+  const c = String(t || '').replace(/\s+/g, '').toLowerCase();
+  return c.includes('google') || c.includes('apple') || c.includes('github')
+    || c.includes('microsoft') || c.includes('twitter') || c.includes('withemail');
+}
+const input = Array.from(document.querySelectorAll(
+  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
+)).find((n) => isVisible(n) && !n.disabled) || null;
+if (!input || !(input.value || '').trim()) return { ok: false, why: 'no-email-value' };
+
+const form = input.closest('form');
+const scope = form || document;
+const candidates = Array.from(scope.querySelectorAll(
+  'button[type="submit"], input[type="submit"], button'
+)).filter((n) => isVisible(n) && !n.disabled && n.getAttribute('aria-disabled') !== 'true');
+
+function score(n) {
+  const raw = btnText(n);
+  const c = raw.replace(/\s+/g, '');
+  const t = c.toLowerCase();
+  if (isSocial(raw)) return -1;
+  if (c === '注册' || t === 'signup' || t === 'register' || t === 'continue' || c === '继续') return 100;
+  if (n.type === 'submit') return 90;
+  if (t.includes('signup') && !t.includes('with')) return 80;
+  if (t.includes('continue') || t.includes('next') || c.includes('下一步')) return 75;
+  return 0;
+}
+const ranked = candidates.map((n) => ({ n, s: score(n), t: btnText(n) }))
+  .filter((x) => x.s > 0).sort((a, b) => b.s - a.s);
+if (ranked.length) {
+  const btn = ranked[0].n;
+  btn.focus();
+  btn.click();
+  return { ok: true, how: 'form-btn', btn: (ranked[0].t || '').slice(0, 48), score: ranked[0].s };
+}
+if (form) {
+  try {
+    if (form.requestSubmit) form.requestSubmit();
+    else form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    return { ok: true, how: 'requestSubmit' };
+  } catch (e) {
+    return { ok: false, why: 'requestSubmit-fail:' + String(e) };
+  }
+}
+input.focus();
+input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
+input.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
+input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
+return { ok: true, how: 'enter' };
+"""
+        )
+
+    deadline = time.time() + max(20, int(timeout or 15))
+    while time.time() < deadline:
+        snap0 = _page_error_snapshot()
+        if isinstance(snap0, dict) and snap0.get("err"):
+            raise AccountRetryNeeded(
+                f"注册页错误: {(snap0.get('snippet') or 'Something went wrong')[:120]}",
+                reason="page_error",
             )
 
-            if clicked:
-                print(f"[*] 已填写邮箱并点击注册: {email}")
-                _step_pause(200, 600)
-                return email, dev_token
+        typed = _cdp_type_email(email)
+        print(f"[*] 邮箱键入: {typed}", flush=True)
+        if (
+            "cdp-ok" not in str(typed)
+            and "react-ok" not in str(typed)
+            and not str(typed).endswith("ok")
+        ):
+            time.sleep(0.5)
+            continue
 
-        time.sleep(0.4 + secrets.randbelow(25) / 100.0)
+        time.sleep(0.35)
+        clicked = _submit_email_form()
+        detail = ""
+        ok = False
+        if isinstance(clicked, dict):
+            ok = bool(clicked.get("ok"))
+            detail = f" how={clicked.get('how')} btn={clicked.get('btn') or ''}"
+        else:
+            ok = bool(clicked)
+        if not ok:
+            print(f"[Debug] 提交失败: {clicked}", flush=True)
+            time.sleep(0.5)
+            continue
 
-    raise Exception("未找到邮箱输入框或注册按钮")
+        print(f"[*] 已填写邮箱并点击注册: {email}{detail}", flush=True)
 
+        otp_ok = False
+        page_err = None
+        for _ in range(24):
+            snap = _page_error_snapshot()
+            if isinstance(snap, dict):
+                if snap.get("err"):
+                    page_err = snap.get("snippet") or "Something went wrong"
+                    break
+                if snap.get("otp"):
+                    otp_ok = True
+                    break
+            time.sleep(0.5)
+
+        if otp_ok:
+            print(f"[*] 已进入验证码页: {email}", flush=True)
+            _step_pause(200, 600)
+            return email, dev_token
+
+        if page_err:
+            print(
+                f"[Warn] UI 提交报错（常见 Something went wrong），改走协议发码: "
+                f"{str(page_err)[:100]}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[Warn] 提交后未出现 OTP 页，改走协议 CreateEmail: {email}",
+                flush=True,
+            )
+        break  # leave UI loop → protocol below
+
+    # —— 协议发码（已验证 curl_cffi+proxy 可 grpc-status:0 且入信）——
+    try:
+        from protocol_mail import protocol_create_email_code
+
+        pr = protocol_create_email_code(email, log=lambda m: print(m, flush=True))
+    except Exception as pe:
+        pr = {"ok": False, "error": str(pe)}
+    if pr.get("ok"):
+        print(f"[*] 协议 CreateEmail 成功: {email}", flush=True)
+        _step_pause(200, 600)
+        return email, dev_token
+    raise AccountRetryNeeded(
+        f"协议 CreateEmail 失败: {pr}",
+        reason="protocol_create_fail",
+    )
 
 
 class AccountRetryNeeded(Exception):
@@ -2139,12 +2376,40 @@ class AccountRetryNeeded(Exception):
 
 def fill_code_and_submit(email, dev_token, timeout=60):
     # 复用 `email_register.py` 里的验证码轮询逻辑，等待邮件到达后自动填写 OTP。
-    code = get_oai_code(dev_token, email)
+    code = get_oai_code(dev_token, email, timeout=90)
     if not code:
         raise AccountRetryNeeded("获取验证码失败", reason="code_timeout")
 
     _step_pause(180, 550)
-    deadline = time.time() + timeout
+    # 协议发码后通常无 OTP UI：只短等几秒，再协议 VerifyEmail
+    try:
+        has_otp = page.run_js(
+            r"""
+const n = document.querySelectorAll(
+  'input[data-input-otp="true"], input[name="code"], input[autocomplete="one-time-code"]'
+).length;
+return n > 0;
+"""
+        )
+    except Exception:
+        has_otp = False
+    if not has_otp:
+        print("[*] 无 OTP 输入框，直接协议 VerifyEmail…", flush=True)
+        try:
+            from protocol_mail import protocol_verify_email_code
+
+            vr = protocol_verify_email_code(
+                email, code, log=lambda m: print(m, flush=True)
+            )
+            if vr.get("ok"):
+                print(
+                    f"[*] 协议 VerifyEmail 成功: {email} code={str(code).replace('-','')}",
+                    flush=True,
+                )
+                return code
+        except Exception as ve:
+            print(f"[Warn] 协议 VerifyEmail: {ve}", flush=True)
+    deadline = time.time() + (timeout if has_otp else min(8, int(timeout or 60)))
     while time.time() < deadline:
         try:
             filled = page.run_js(
@@ -2405,25 +2670,59 @@ return { url: location.href, inputs, buttons };
         """
     )
     print(f"[Debug] 验证码页 DOM 摘要: {debug_snapshot}")
+    # 协议发码后浏览器通常无 OTP 页：协议 VerifyEmail，后续资料/Turnstile 由 hybrid 或资料页接
+    try:
+        from protocol_mail import protocol_verify_email_code
+
+        vr = protocol_verify_email_code(
+            email, code, log=lambda m: print(m, flush=True)
+        )
+        if vr.get("ok"):
+            print(
+                f"[*] 协议 VerifyEmail 成功（无 UI OTP）: {email} code={code}",
+                flush=True,
+            )
+            # 标记：后续 fill_profile 若无表单，run_single 应走 hybrid 收尾
+            try:
+                page.run_js(
+                    "window.__protocol_email_verified = true;"
+                    "window.__protocol_email = arguments[0];"
+                    "window.__protocol_code = arguments[1]; true;",
+                    email,
+                    code,
+                )
+            except Exception:
+                pass
+            return code
+        print(f"[Warn] 协议 VerifyEmail 失败: {vr}", flush=True)
+    except Exception as ve:
+        print(f"[Warn] 协议 VerifyEmail 异常: {ve}", flush=True)
     raise Exception("未找到验证码输入框或确认邮箱按钮")
 
 
 def _read_turnstile_token():
-    # 优先读官方 API，再读隐藏 input（页面有时只填其中一个）。
+    # hybrid inject 回调 / 官方 API / 隐藏 input（页面有时只填其中一个）。
     try:
         token = page.run_js(
             """
+try {
+    const hv = String(window.__hybrid_turnstile || '').trim();
+    if (hv) return hv;
+} catch (e) {}
 try {
     if (typeof turnstile !== 'undefined' && turnstile.getResponse) {
         const t = turnstile.getResponse();
         if (t) return String(t);
     }
 } catch (e) {}
-const input = document.querySelector('input[name="cf-turnstile-response"]');
-if (input && String(input.value || '').trim()) {
-    return String(input.value).trim();
+// 可能存在多个 response input（原生 + inject）
+const inputs = Array.from(document.querySelectorAll('input[name="cf-turnstile-response"]'));
+let best = '';
+for (const input of inputs) {
+  const v = String(input.value || '').trim();
+  if (v.length > best.length) best = v;
 }
-return '';
+return best;
             """
         )
         if token:
@@ -2431,15 +2730,27 @@ return '';
     except Exception:
         pass
     try:
-        el = page.ele("@name=cf-turnstile-response", timeout=0.3)
-        if el:
-            val = (el.value or "").strip()
-            if val:
-                return val
+        els = page.eles("@name=cf-turnstile-response", timeout=0.3) or []
+        best = ""
+        for el in els:
+            try:
+                val = (el.value or "").strip()
+            except Exception:
+                val = ""
+            if len(val) > len(best):
+                best = val
+        if best:
+            return best
     except Exception:
-        pass
+        try:
+            el = page.ele("@name=cf-turnstile-response", timeout=0.3)
+            if el:
+                val = (el.value or "").strip()
+                if val:
+                    return val
+        except Exception:
+            pass
     return ""
-
 
 def _inject_turnstile_token(token: str) -> bool:
     """将已有 Turnstile token 写回隐藏 input（二次复用）。"""
@@ -3012,6 +3323,127 @@ return false;
         pass
 
 
+
+def _try_turnstile_shadow_click_main2() -> bool:
+    """对齐 grok-register-main-2：shadow_root iframe → body.shadow_root input 点击。
+
+    不依赖 CDP 宿主框坐标；对 turnstilePatch 扩展更友好。
+    会遍历全部 cf-turnstile-response（原生 + hybrid inject）。
+    """
+    if page is None:
+        return False
+    try:
+        # 已有 token 则不必点
+        tok = _read_turnstile_token()
+        if tok:
+            return True
+    except Exception:
+        pass
+
+    candidates = []
+    try:
+        found = page.eles("@name=cf-turnstile-response", timeout=0.4) or []
+        candidates.extend(list(found))
+    except Exception:
+        pass
+    if not candidates:
+        try:
+            one = page.ele("@name=cf-turnstile-response", timeout=0.3)
+            if one:
+                candidates.append(one)
+        except Exception:
+            pass
+    # hybrid inject host 也可能直接挂 iframe
+    try:
+        host = page.ele("#hybrid-turnstile-host", timeout=0.2) or page.ele(
+            "css:.cf-turnstile", timeout=0.2
+        )
+        if host is not None:
+            candidates.append(host)
+    except Exception:
+        pass
+
+    for node in candidates:
+        try:
+            if node is None:
+                continue
+            wrapper = None
+            try:
+                name = ""
+                try:
+                    name = str(node.attr("name") or "")
+                except Exception:
+                    name = ""
+                wrapper = node.parent() if name == "cf-turnstile-response" else node
+            except Exception:
+                wrapper = node
+            if wrapper is None:
+                continue
+            iframe = None
+            try:
+                sr = getattr(wrapper, "shadow_root", None)
+                if sr is not None:
+                    iframe = sr.ele("tag:iframe", timeout=0.5)
+            except Exception:
+                iframe = None
+            if iframe is None:
+                try:
+                    iframe = wrapper.ele("tag:iframe", timeout=0.3)
+                except Exception:
+                    iframe = None
+            if iframe is None:
+                continue
+            try:
+                # 勿写死 screenX/Y value（turnstilePatch 用动态 getter；固定 value 更像机器人）
+                iframe.run_js(
+                    """
+window.dtp = 1;
+try {
+  const sx = Object.getOwnPropertyDescriptor(MouseEvent.prototype, 'screenX');
+  if (!sx || !sx.get) {
+    const ox = Math.floor(Math.random()*100)+40;
+    const oy = Math.floor(Math.random()*80)+80;
+    Object.defineProperty(MouseEvent.prototype, 'screenX', {
+      get: function(){ return (this.clientX||0)+(window.screenX||0)+ox; },
+      configurable: true
+    });
+    Object.defineProperty(MouseEvent.prototype, 'screenY', {
+      get: function(){ return (this.clientY||0)+(window.screenY||0)+oy; },
+      configurable: true
+    });
+  }
+} catch (e) {}
+"""
+                )
+            except Exception:
+                pass
+            try:
+                body = iframe.ele("tag:body", timeout=0.8)
+                if body is None:
+                    continue
+                body_sr = getattr(body, "shadow_root", None)
+                if body_sr is None:
+                    continue
+                btn = (
+                    body_sr.ele("tag:input", timeout=0.5)
+                    or body_sr.ele("css:input[type=checkbox]", timeout=0.3)
+                    or body_sr.ele("css:[role=checkbox]", timeout=0.3)
+                )
+                if btn:
+                    try:
+                        btn.click(by_js=False)
+                    except Exception:
+                        btn.click()
+                    print("[*] Turnstile main2-shadow click ok", flush=True)
+                    return True
+            except Exception as e:
+                print(f"[Debug] main2-shadow click: {e}", flush=True)
+                continue
+        except Exception as e:
+            print(f"[Debug] main2-shadow path: {e}", flush=True)
+            continue
+    return False
+
 def getTurnstileToken(timeout=50, log_callback=None, *, fast=False, auto_wait_cap=None):
     """
     求解最终注册页 Turnstile。
@@ -3071,13 +3503,24 @@ def getTurnstileToken(timeout=50, log_callback=None, *, fast=False, auto_wait_ca
             print("[Warn] 自动等待阶段检测到 Turnstile failure 反馈页。")
             break
         elapsed = time.time() - auto_start
+        # main-2 风格：优先 shadow checkbox（比 soft reset 温和）
+        if elapsed >= 2 and int(elapsed) % 3 == 0 and not state.get("failure"):
+            try:
+                if _try_turnstile_shadow_click_main2():
+                    time.sleep(1.0)
+                    tok = _read_turnstile_token()
+                    if tok:
+                        print("[*] Turnstile main2-shadow 点击后已出 token。")
+                        return tok
+            except Exception:
+                pass
         if (
-            elapsed >= 4
+            elapsed >= 8
             and state.get("collapsedOnly")
             and state.get("hostSized")
             and not state.get("failure")
-            and reset_count < 4
-            and (not mid_reset_done or elapsed >= 9)
+            and reset_count < 2
+            and (not mid_reset_done or elapsed >= 14)
         ):
             print("[*] 自动等待中控件仍 1x1，执行 mid soft reset…")
             _soft_reset_turnstile()
@@ -4645,7 +5088,7 @@ def run_single_registration(
                 ok=True,
             )
             _stage_t = _perf_now()
-            fill_code_and_submit(email, dev_token)
+            code = fill_code_and_submit(email, dev_token)
             _emit_perf_stage(
                 "mail_code",
                 _stage_t,
@@ -4653,47 +5096,153 @@ def run_single_registration(
                 plan=plan_mode,
                 ok=True,
             )
-            print(f"[*] 填写注册资料并提交（Plan {plan_mode.upper()}）…")
-            _stage_t = _perf_now()
+            # 协议发码后通常无资料页：A/B 走 hybrid 收尾（Turnstile + Server Action + SSO）
+            need_hybrid_finish = True
             try:
-                profile = fill_profile_and_submit(mode=plan_mode)
-                _emit_perf_stage(
-                    "profile_turnstile_submit",
-                    _stage_t,
-                    round_no=round_no,
-                    plan=plan_mode,
-                    ok=True,
+                if has_profile_form():
+                    need_hybrid_finish = False
+            except Exception:
+                need_hybrid_finish = True
+            if need_hybrid_finish:
+                print(
+                    f"[plan-{plan_mode}] 无资料表单（协议发码路径）→ hybrid 收尾…",
+                    flush=True,
                 )
-            except Exception as pe:
-                em = str(pe)
-                # Turnstile 通过后提交触发导航时 Drission 偶发整段抛刷新
-                if "刷新" in em or "连接已断开" in em or "disconnected" in em.lower():
-                    print(f"[Warn] 资料提交遇导航断开，继续等 SSO（密码可能未落盘）: {em[:120]}")
-                    profile = {
-                        "given_name": "",
-                        "family_name": "",
-                        "password": "",
-                        "plan": plan_mode,
-                        "nav_soft": True,
-                    }
-                    _emit_perf_stage(
-                        "profile_turnstile_submit",
-                        _stage_t,
-                        round_no=round_no,
-                        plan=plan_mode,
-                        ok=True,
-                        message="soft_nav",
-                    )
-                else:
+                if plan_mode == "b":
+                    try:
+                        from plan_b import human_pause_major
+
+                        human_pause_major(400, 900)
+                    except Exception:
+                        pass
+                from hybrid_register import hybrid_register
+
+                clean_code = str(code or "").replace("-", "").replace(" ", "").strip()
+                _stage_t = _perf_now()
+                hy = hybrid_register(
+                    email=email,
+                    mail_token=str(dev_token or ""),
+                    create_email_done=True,
+                    email_code=clean_code,
+                    log=lambda m: print(m, flush=True),
+                )
+                if not hy.get("ok"):
                     _emit_perf_stage(
                         "profile_turnstile_submit",
                         _stage_t,
                         round_no=round_no,
                         plan=plan_mode,
                         ok=False,
-                        message=em,
+                        message=str(hy.get("error") or hy),
                     )
-                    raise
+                    raise Exception(
+                        f"plan-{plan_mode} hybrid 收尾失败: {hy.get('error') or hy}"
+                    )
+                profile = {
+                    "given_name": "",
+                    "family_name": "",
+                    "password": str(hy.get("password") or ""),
+                    "plan": plan_mode,
+                    "via": "protocol+hybrid",
+                    "hybrid_done": True,
+                    "sso": str(hy.get("sso") or ""),
+                    "cookies": hy.get("cookies") or [],
+                    "cf_clearance": hy.get("cf_clearance") or "",
+                    "nav_soft": True,
+                }
+                _emit_perf_stage(
+                    "profile_turnstile_submit",
+                    _stage_t,
+                    round_no=round_no,
+                    plan=plan_mode,
+                    ok=True,
+                    message="hybrid_finish",
+                )
+                print(
+                    f"[plan-{plan_mode}] hybrid 收尾成功 sso_len={len(profile.get('sso') or '')}",
+                    flush=True,
+                )
+            else:
+                print(f"[*] 填写注册资料并提交（Plan {plan_mode.upper()}）…")
+                _stage_t = _perf_now()
+                try:
+                    profile = fill_profile_and_submit(mode=plan_mode)
+                    _emit_perf_stage(
+                        "profile_turnstile_submit",
+                        _stage_t,
+                        round_no=round_no,
+                        plan=plan_mode,
+                        ok=True,
+                    )
+                except Exception as pe:
+                    em = str(pe)
+                    # Turnstile 通过后提交触发导航时 Drission 偶发整段抛刷新
+                    if "刷新" in em or "连接已断开" in em or "disconnected" in em.lower():
+                        print(f"[Warn] 资料提交遇导航断开，继续等 SSO（密码可能未落盘）: {em[:120]}")
+                        profile = {
+                            "given_name": "",
+                            "family_name": "",
+                            "password": "",
+                            "plan": plan_mode,
+                            "nav_soft": True,
+                        }
+                        _emit_perf_stage(
+                            "profile_turnstile_submit",
+                            _stage_t,
+                            round_no=round_no,
+                            plan=plan_mode,
+                            ok=True,
+                            message="soft_nav",
+                        )
+                    else:
+                        print(
+                            f"[Warn] 资料页失败，改 hybrid 收尾: {em[:120]}",
+                            flush=True,
+                        )
+                        from hybrid_register import hybrid_register
+
+                        clean_code = (
+                            str(code or "").replace("-", "").replace(" ", "").strip()
+                        )
+                        hy = hybrid_register(
+                            email=email,
+                            mail_token=str(dev_token or ""),
+                            create_email_done=True,
+                            email_code=clean_code,
+                            log=lambda m: print(m, flush=True),
+                        )
+                        if not hy.get("ok"):
+                            _emit_perf_stage(
+                                "profile_turnstile_submit",
+                                _stage_t,
+                                round_no=round_no,
+                                plan=plan_mode,
+                                ok=False,
+                                message=str(hy.get("error") or hy),
+                            )
+                            raise Exception(
+                                f"plan-{plan_mode} hybrid 收尾失败: {hy.get('error') or hy}"
+                            ) from pe
+                        profile = {
+                            "given_name": "",
+                            "family_name": "",
+                            "password": str(hy.get("password") or ""),
+                            "plan": plan_mode,
+                            "via": "protocol+hybrid",
+                            "hybrid_done": True,
+                            "sso": str(hy.get("sso") or ""),
+                            "cookies": hy.get("cookies") or [],
+                            "cf_clearance": hy.get("cf_clearance") or "",
+                            "nav_soft": True,
+                        }
+                        _emit_perf_stage(
+                            "profile_turnstile_submit",
+                            _stage_t,
+                            round_no=round_no,
+                            plan=plan_mode,
+                            ok=True,
+                            message="hybrid_finish_fallback",
+                        )
             last_mail_err = None
             break
         except AccountRetryNeeded as re:
@@ -4738,48 +5287,87 @@ def run_single_registration(
             raise
     if profile is None:
         raise Exception(f"邮箱/收码阶段失败: {last_mail_err or 'unknown'}")
-    # 注册完成后等浏览器跑完 SSO 重定向链落到 grok.com 并登录——grok.com 域的
-    # 会话 cookie（含 cf_clearance / sso / sso-rw）此时才会真正写下来。
-    # soft-nav：提交已触发导航，禁止最终页二次点「完成注册」
-    _nav_soft = bool(isinstance(profile, dict) and profile.get("nav_soft"))
-    _stage_t = _perf_now()
-    if not wait_for_grok_com_landing(skip_cf_retry=_nav_soft):
-        print("[Warn] 未能落到 grok.com 登录态，sso 质量可能受影响")
-    _emit_perf_stage(
-        "grok_landing",
-        _stage_t,
-        round_no=round_no,
-        plan=plan_mode,
-        ok=True,
-        message=("soft_nav" if _nav_soft else None),
-    )
+    # hybrid 收尾已带 SSO：跳过 grok.com 落地 / 年龄门 cookie 等待
+    if isinstance(profile, dict) and profile.get("hybrid_done") and profile.get("sso"):
+        print("[*] hybrid 收尾已含 SSO，跳过浏览器落地等待", flush=True)
+        age_status = {
+            "submitted": False,
+            "skipped": True,
+            "reason": "protocol+hybrid",
+        }
+        sso_value = str(profile.get("sso") or "")
+        password = str(profile.get("password") or "")
+        _emit_perf_stage(
+            "grok_landing",
+            _perf_now(),
+            round_no=round_no,
+            plan=plan_mode,
+            ok=True,
+            message="hybrid_skip",
+        )
+        _emit_perf_stage(
+            "age_gate",
+            _perf_now(),
+            round_no=round_no,
+            plan=plan_mode,
+            ok=False,
+            message="hybrid_skip",
+        )
+        _emit_perf_stage(
+            "sso_cookie",
+            _perf_now(),
+            round_no=round_no,
+            plan=plan_mode,
+            ok=bool(sso_value),
+            message="hybrid_skip",
+        )
+    else:
+        # 注册完成后等浏览器跑完 SSO 重定向链落到 grok.com 并登录——grok.com 域的
+        # 会话 cookie（含 cf_clearance / sso / sso-rw）此时才会真正写下来。
+        # soft-nav：提交已触发导航，禁止最终页二次点「完成注册」
+        _nav_soft = bool(isinstance(profile, dict) and profile.get("nav_soft"))
+        _stage_t = _perf_now()
+        if not wait_for_grok_com_landing(skip_cf_retry=_nav_soft):
+            print("[Warn] 未能落到 grok.com 登录态，sso 质量可能受影响")
+        _emit_perf_stage(
+            "grok_landing",
+            _stage_t,
+            round_no=round_no,
+            plan=plan_mode,
+            ok=True,
+            message=("soft_nav" if _nav_soft else None),
+        )
 
-    # 发随机英文短消息触发生日/年龄确认弹窗，并自动填随机成年出生年（失败不阻断写 sso）
-    _stage_t = _perf_now()
-    age_status = ensure_age_gate_completed(timeout=45)
-    _emit_perf_stage(
-        "age_gate",
-        _stage_t,
-        round_no=round_no,
-        plan=plan_mode,
-        ok=bool(isinstance(age_status, dict) and age_status.get("submitted")),
-    )
+        # 发随机英文短消息触发生日/年龄确认弹窗，并自动填随机成年出生年（失败不阻断写 sso）
+        _stage_t = _perf_now()
+        age_status = ensure_age_gate_completed(timeout=45)
+        _emit_perf_stage(
+            "age_gate",
+            _stage_t,
+            round_no=round_no,
+            plan=plan_mode,
+            ok=bool(isinstance(age_status, dict) and age_status.get("submitted")),
+        )
 
-    _stage_t = _perf_now()
-    sso_value = wait_for_sso_cookie()
-    _emit_perf_stage(
-        "sso_cookie",
-        _stage_t,
-        round_no=round_no,
-        plan=plan_mode,
-        ok=bool(sso_value),
-    )
-    password = str(profile.get("password", "") or "")
+        _stage_t = _perf_now()
+        sso_value = wait_for_sso_cookie()
+        _emit_perf_stage(
+            "sso_cookie",
+            _stage_t,
+            round_no=round_no,
+            plan=plan_mode,
+            ok=bool(sso_value),
+        )
+        password = str(profile.get("password", "") or "")
     if isinstance(profile, dict):
         profile = {**profile, "plan": plan_mode}
 
     # W3 · SSO 指纹账本去重（重复不算成功，不入队、不占目标）
-    if sso_value:
+    # hybrid 收尾已在 hybrid_register.claim_sso 登记：此处再 claim 会误报 duplicate
+    _hybrid_already_claimed = bool(
+        isinstance(profile, dict) and profile.get("hybrid_done") and sso_value
+    )
+    if sso_value and not _hybrid_already_claimed:
         try:
             from sso_ledger import claim_sso
 
@@ -4802,6 +5390,8 @@ def run_single_registration(
             raise
         except Exception as le:
             print(f"[Warn] sso ledger: {le}", flush=True)
+    elif _hybrid_already_claimed:
+        print("[*] hybrid 已 claim SSO，跳过主流程二次入账", flush=True)
 
     # ZDR：已从注册主路径断开（2026-07-16）。
     # 模块 register/zdr_toggle.py、account_tags.set_zdr_tag 仍保留，后续研究再接回。
@@ -5287,20 +5877,24 @@ def main():
             load_plan_a_enabled_from_config,
             load_plan_b_enabled_from_config,
             load_plan_c_enabled_from_config,
+            load_plan_order_from_config,
         )
 
         plan_a_enabled = load_plan_a_enabled_from_config()
         plan_b_enabled = load_plan_b_enabled_from_config()
         plan_c_enabled = load_plan_c_enabled_from_config()
+        plan_order = load_plan_order_from_config()
     except Exception:
         plan_a_enabled = True
         plan_b_enabled = True
         plan_c_enabled = False
+        plan_order = ["A", "B", "C"]
     # 机器可读 on/off，前端渲染为「本轮启用Plan: A B C」且启绿禁红
     print(
         f"[plan] 本轮启用Plan: A:{'on' if plan_a_enabled else 'off'} "
         f"B:{'on' if plan_b_enabled else 'off'} "
-        f"C:{'on' if plan_c_enabled else 'off'}",
+        f"C:{'on' if plan_c_enabled else 'off'} "
+        f"order={'>'.join(plan_order)}",
         flush=True,
     )
 
@@ -5441,183 +6035,202 @@ def main():
                 )
                 return any(k in s for k in keys)
 
-            # ---------- Plan A ----------
-            if result is None and plan_a_enabled:
-                _plan_t = _perf_now()
-                try:
-                    print("═══ Plan A 注册开始 ═══")
-                    result = run_single_registration(
-                        args.output,
-                        extract_numbers=args.extract_numbers,
-                        plan="a",
-                        round_no=current_round,
-                    )
-                    used_plan = "a"
-                    _emit_perf_stage(
-                        "plan_a",
-                        _plan_t,
-                        round_no=current_round,
-                        plan="a",
-                        ok=True,
-                    )
-                except KeyboardInterrupt:
-                    _emit_perf_stage(
-                        "plan_a",
-                        _plan_t,
-                        round_no=current_round,
-                        plan="a",
-                        ok=False,
-                        message="KeyboardInterrupt",
-                    )
-                    print("")
-                    print("[Info] 收到中断信号，停止后续轮次。")
+            # ---------- Plans by register_plan_order (default A→B→C) ----------
+            plan_enabled = {
+                "A": bool(plan_a_enabled),
+                "B": bool(plan_b_enabled),
+                "C": bool(plan_c_enabled),
+            }
+            _abort_rounds = False
+            for plan_key in plan_order:
+                if result is not None or _abort_rounds:
                     break
-                except AccountRetryNeeded as e:
-                    _emit_perf_stage(
-                        "plan_a",
-                        _plan_t,
-                        round_no=current_round,
-                        plan="a",
-                        ok=False,
-                        message=str(e),
-                    )
-                    # 含 W3 重复 SSO：不记成功，可换号继续（不占成功配额）
-                    last_err = e
-                    err_parts.append(f"A:retry:{str(e)[:50]}")
-                    print(f"[plan-a] ⟳ 可重试: {e}")
-                except Exception as e:
-                    _emit_perf_stage(
-                        "plan_a",
-                        _plan_t,
-                        round_no=current_round,
-                        plan="a",
-                        ok=False,
-                        message=str(e),
-                    )
-                    last_err = e
-                    err_parts.append(f"A:{str(e)[:60]}")
-                    print(f"[plan-a] ✘ 失败: {e}")
+                pk = str(plan_key or "").strip().upper()
+                if pk not in plan_enabled or not plan_enabled[pk]:
+                    continue
 
-            # ---------- Plan B ----------
-            # 硬代理失败跳过 B：换代理已在 open_signup 内做，拟人无法打通 can't be reached
-            skip_b_hard = result is None and plan_b_enabled and _is_hard_proxy_fail(last_err)
-            if skip_b_hard:
-                print(
-                    "[plan-b] 跳过：Plan A 为代理/网络硬失败（chrome-error），"
-                    "拟人兜底无效；已/将降级代理后进入下一方案或下一轮",
-                    flush=True,
-                )
-                err_parts.append("B:skipped_hard_proxy")
-
-            if result is None and plan_b_enabled and not skip_b_hard:
-                _plan_t = _perf_now()
-                try:
-                    print("═══ Plan B 注册开始 ═══")
+                if pk == "A":
+                    _plan_t = _perf_now()
                     try:
-                        stop_browser()
-                    except Exception:
-                        pass
-                    time.sleep(0.5 + secrets.randbelow(40) / 100.0)
-                    start_browser()
-                    log_runtime_fingerprint(page, force=False)
-                    result = run_single_registration(
-                        args.output,
-                        extract_numbers=args.extract_numbers,
-                        plan="b",
-                        round_no=current_round,
-                    )
-                    used_plan = "b"
-                    _emit_perf_stage(
-                        "plan_b",
-                        _plan_t,
-                        round_no=current_round,
-                        plan="b",
-                        ok=True,
-                    )
-                except KeyboardInterrupt:
-                    _emit_perf_stage(
-                        "plan_b",
-                        _plan_t,
-                        round_no=current_round,
-                        plan="b",
-                        ok=False,
-                        message="KeyboardInterrupt",
-                    )
-                    print("")
-                    print("[Info] 收到中断信号，停止后续轮次。")
-                    break
-                except Exception as e:
-                    _emit_perf_stage(
-                        "plan_b",
-                        _plan_t,
-                        round_no=current_round,
-                        plan="b",
-                        ok=False,
-                        message=str(e),
-                    )
-                    last_err = e
-                    err_parts.append(f"B:{str(e)[:60]}")
-                    print(f"[plan-b] ✘ 失败: {e}")
-
-            # ---------- Plan C (hybrid) ----------
-            if result is None and plan_c_enabled:
-                _plan_t = _perf_now()
-                try:
-                    from hybrid_register import run_hybrid_registration
-
-                    print("═══ Plan C 注册开始 ═══")
-                    hy = run_hybrid_registration(
-                        args.output, extract_numbers=args.extract_numbers
-                    )
-                    if hy and hy.get("sso"):
-                        result = hy
-                        used_plan = "c"
+                        print("═══ Plan A 注册开始 ═══")
+                        result = run_single_registration(
+                            args.output,
+                            extract_numbers=args.extract_numbers,
+                            plan="a",
+                            round_no=current_round,
+                        )
+                        used_plan = "a"
                         _emit_perf_stage(
-                            "plan_c",
+                            "plan_a",
                             _plan_t,
                             round_no=current_round,
-                            plan="c",
+                            plan="a",
                             ok=True,
                         )
-                    else:
-                        detail = ""
-                        if isinstance(hy, dict):
-                            detail = str(hy.get("error") or "").strip()
-                        msg = detail if detail else "hybrid 未返回 sso"
-                        err_parts.append(f"C:{msg[:80]}")
-                        print(f"[plan-c] ✘ {msg}")
+                    except KeyboardInterrupt:
+                        _emit_perf_stage(
+                            "plan_a",
+                            _plan_t,
+                            round_no=current_round,
+                            plan="a",
+                            ok=False,
+                            message="KeyboardInterrupt",
+                        )
+                        print("")
+                        print("[Info] 收到中断信号，停止后续轮次。")
+                        _abort_rounds = True
+                        break
+                    except AccountRetryNeeded as e:
+                        _emit_perf_stage(
+                            "plan_a",
+                            _plan_t,
+                            round_no=current_round,
+                            plan="a",
+                            ok=False,
+                            message=str(e),
+                        )
+                        # 含 W3 重复 SSO：不记成功，可换号继续（不占成功配额）
+                        last_err = e
+                        err_parts.append(f"A:retry:{str(e)[:50]}")
+                        print(f"[plan-a] ⟳ 可重试: {e}")
+                    except Exception as e:
+                        _emit_perf_stage(
+                            "plan_a",
+                            _plan_t,
+                            round_no=current_round,
+                            plan="a",
+                            ok=False,
+                            message=str(e),
+                        )
+                        last_err = e
+                        err_parts.append(f"A:{str(e)[:60]}")
+                        print(f"[plan-a] ✘ 失败: {e}")
+                    continue
+
+                if pk == "B":
+                    # 硬代理失败跳过 B：拟人无法打通 can't be reached
+                    if _is_hard_proxy_fail(last_err):
+                        print(
+                            "[plan-b] 跳过：上一方案为代理/网络硬失败（chrome-error），"
+                            "拟人兜底无效；已/将降级代理后进入下一方案或下一轮",
+                            flush=True,
+                        )
+                        err_parts.append("B:skipped_hard_proxy")
+                        continue
+                    _plan_t = _perf_now()
+                    try:
+                        print("═══ Plan B 注册开始 ═══")
+                        try:
+                            stop_browser()
+                        except Exception:
+                            pass
+                        time.sleep(0.5 + secrets.randbelow(40) / 100.0)
+                        start_browser()
+                        log_runtime_fingerprint(page, force=False)
+                        result = run_single_registration(
+                            args.output,
+                            extract_numbers=args.extract_numbers,
+                            plan="b",
+                            round_no=current_round,
+                        )
+                        used_plan = "b"
+                        _emit_perf_stage(
+                            "plan_b",
+                            _plan_t,
+                            round_no=current_round,
+                            plan="b",
+                            ok=True,
+                        )
+                    except KeyboardInterrupt:
+                        _emit_perf_stage(
+                            "plan_b",
+                            _plan_t,
+                            round_no=current_round,
+                            plan="b",
+                            ok=False,
+                            message="KeyboardInterrupt",
+                        )
+                        print("")
+                        print("[Info] 收到中断信号，停止后续轮次。")
+                        _abort_rounds = True
+                        break
+                    except Exception as e:
+                        _emit_perf_stage(
+                            "plan_b",
+                            _plan_t,
+                            round_no=current_round,
+                            plan="b",
+                            ok=False,
+                            message=str(e),
+                        )
+                        last_err = e
+                        err_parts.append(f"B:{str(e)[:60]}")
+                        print(f"[plan-b] ✘ 失败: {e}")
+                    continue
+
+                if pk == "C":
+                    _plan_t = _perf_now()
+                    try:
+                        from hybrid_register import run_hybrid_registration
+
+                        print("═══ Plan C 注册开始 ═══")
+                        hy = run_hybrid_registration(
+                            args.output, extract_numbers=args.extract_numbers
+                        )
+                        if hy and hy.get("sso"):
+                            result = hy
+                            used_plan = "c"
+                            _emit_perf_stage(
+                                "plan_c",
+                                _plan_t,
+                                round_no=current_round,
+                                plan="c",
+                                ok=True,
+                            )
+                        else:
+                            detail = ""
+                            if isinstance(hy, dict):
+                                detail = str(hy.get("error") or "").strip()
+                            msg = detail if detail else "hybrid 未返回 sso"
+                            err_parts.append(f"C:{msg[:80]}")
+                            print(f"[plan-c] ✘ {msg}")
+                            _emit_perf_stage(
+                                "plan_c",
+                                _plan_t,
+                                round_no=current_round,
+                                plan="c",
+                                ok=False,
+                                message=msg,
+                            )
+                    except KeyboardInterrupt:
                         _emit_perf_stage(
                             "plan_c",
                             _plan_t,
                             round_no=current_round,
                             plan="c",
                             ok=False,
-                            message=msg,
+                            message="KeyboardInterrupt",
                         )
-                except KeyboardInterrupt:
-                    _emit_perf_stage(
-                        "plan_c",
-                        _plan_t,
-                        round_no=current_round,
-                        plan="c",
-                        ok=False,
-                        message="KeyboardInterrupt",
-                    )
-                    print("")
-                    print("[Info] 收到中断信号，停止后续轮次。")
-                    break
-                except Exception as e:
-                    _emit_perf_stage(
-                        "plan_c",
-                        _plan_t,
-                        round_no=current_round,
-                        plan="c",
-                        ok=False,
-                        message=str(e),
-                    )
-                    last_err = e
-                    err_parts.append(f"C:{str(e)[:60]}")
-                    print(f"[plan-c] ✘ 失败: {e}")
+                        print("")
+                        print("[Info] 收到中断信号，停止后续轮次。")
+                        _abort_rounds = True
+                        break
+                    except Exception as e:
+                        _emit_perf_stage(
+                            "plan_c",
+                            _plan_t,
+                            round_no=current_round,
+                            plan="c",
+                            ok=False,
+                            message=str(e),
+                        )
+                        last_err = e
+                        err_parts.append(f"C:{str(e)[:60]}")
+                        print(f"[plan-c] ✘ 失败: {e}")
+                    continue
+
+            if _abort_rounds:
+                break
 
             if result is None:
                 fail_count += 1

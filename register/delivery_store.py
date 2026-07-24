@@ -397,6 +397,137 @@ def mark_failed(job_id: str, error: str, *, retry_after_sec: float = 60) -> Opti
     )
 
 
+
+
+def has_success_for_email(channel: str, email: str) -> bool:
+    em = str(email or '').strip().lower()
+    ch = str(channel or '').strip()
+    if not em or not ch:
+        return False
+    p = store_path()
+    with _lock:
+        data = _load(p)
+        for j in data.get('jobs') or []:
+            if not isinstance(j, dict):
+                continue
+            if str(j.get('channel') or '') != ch:
+                continue
+            if str(j.get('status') or '') != 'success':
+                continue
+            if str(j.get('email') or '').strip().lower() == em:
+                return True
+    return False
+
+
+def success_emails_for_channel(channel: str) -> set:
+    ch = str(channel or '').strip()
+    out = set()
+    if not ch:
+        return out
+    p = store_path()
+    with _lock:
+        data = _load(p)
+        for j in data.get('jobs') or []:
+            if not isinstance(j, dict):
+                continue
+            if str(j.get('channel') or '') != ch:
+                continue
+            if str(j.get('status') or '') != 'success':
+                continue
+            em = str(j.get('email') or '').strip().lower()
+            if em:
+                out.add(em)
+    return out
+
+
+
+def stamp_auth_file_push_flags(
+    paths: list[str] | list[Path] | str | Path | None,
+    *,
+    pushed_cpa: bool = False,
+    pushed_s2a: bool = False,
+) -> int:
+    """Write pushed_cpa / pushed_s2a flags into auth JSON files. Returns stamped count."""
+    if not paths:
+        return 0
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    n = 0
+    for raw in paths:
+        p = Path(str(raw or "")).expanduser()
+        if not p.is_file():
+            continue
+        try:
+            doc = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(doc, dict):
+                continue
+            if pushed_cpa:
+                doc["pushed_cpa"] = True
+                doc["pushedCpa"] = True
+                doc["pushed_cpa_at"] = now
+                doc["pushedCpaAt"] = now
+            if pushed_s2a:
+                doc["pushed_s2a"] = True
+                doc["pushedS2a"] = True
+                doc["pushed_s2a_at"] = now
+                doc["pushedS2aAt"] = now
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(p)
+            n += 1
+        except Exception:
+            continue
+    return n
+
+
+def mark_accounts_pushed_g2a(email: str = "", sso: str = "") -> bool:
+    """Best-effort: set pushedG2a on matching accounts.json row."""
+    em = str(email or "").strip().lower()
+    if not em and not sso:
+        return False
+    import os
+    candidates = []
+    data = os.environ.get("DATA_DIR", "").strip()
+    if data:
+        candidates.append(Path(data) / "accounts.json")
+    candidates.extend(
+        [
+            Path("/data/accounts.json"),
+            Path(__file__).resolve().parent.parent / "data" / "accounts.json",
+            Path.cwd() / "data" / "accounts.json",
+        ]
+    )
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for ap in candidates:
+        if not ap.is_file():
+            continue
+        try:
+            arr = json.loads(ap.read_text(encoding="utf-8"))
+            if not isinstance(arr, list):
+                continue
+            changed = False
+            for row in arr:
+                if not isinstance(row, dict):
+                    continue
+                hit = False
+                if em and str(row.get("email") or "").strip().lower() == em:
+                    hit = True
+                if hit and row.get("pushedG2a") is not True:
+                    row["pushedG2a"] = True
+                    row["pushedG2aAt"] = now
+                    changed = True
+            if changed:
+                tmp = ap.with_suffix(".tmp")
+                tmp.write_text(json.dumps(arr, ensure_ascii=False, indent=2), encoding="utf-8")
+                tmp.replace(ap)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+# ── 后台补传 worker ──────────────────────────────────────────
 _retry_thread: Optional[threading.Thread] = None
 _retry_stop = threading.Event()
 _handlers: dict[str, Callable[[dict[str, Any], LogFn], bool]] = {}

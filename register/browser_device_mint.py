@@ -192,6 +192,188 @@ return '';
     return False
 
 
+def mint_with_sso_browser(
+    *,
+    sso: str,
+    proxy: str = "",
+    headless: bool = False,
+    timeout: float = 120.0,
+    log: Optional[LogFn] = None,
+) -> dict[str, Any]:
+    """SSO cookie + accounts.x.ai frontend Device consent (forum 2026-07).
+
+    Flow:
+      device_code → open https://accounts.x.ai/oauth2/device?user_code=…
+      → 继续 → consent 允许 → poll token
+    Injects sso/sso-rw on .x.ai before navigation.
+    """
+    log = log or _noop
+    sso = str(sso or "").strip()
+    if not sso:
+        return {"ok": False, "error": "empty sso", "mode": "browser_sso_device"}
+
+    dc = _request_device_code(proxy=proxy)
+    if not dc.get("ok"):
+        return {
+            "ok": False,
+            "error": dc.get("error") or "device_code failed",
+            "mode": "browser_sso_device",
+        }
+    device_code = str(dc["device_code"])
+    user_code = str(dc.get("user_code") or "")
+    verify_uri = str(
+        dc.get("verification_uri_complete")
+        or f"https://accounts.x.ai/oauth2/device?user_code={user_code}"
+    )
+    if "accounts.x.ai" not in verify_uri and user_code:
+        verify_uri = f"https://accounts.x.ai/oauth2/device?user_code={user_code}"
+    interval = float(dc.get("interval") or 5)
+    log(f"[browser-sso-mint] user_code={user_code} uri={verify_uri[:90]}")
+
+    try:
+        from DrissionPage import Chromium, ChromiumOptions  # type: ignore
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"DrissionPage unavailable: {e}",
+            "mode": "browser_sso_device",
+        }
+
+    co = ChromiumOptions()
+    try:
+        co.headless(bool(headless))
+    except Exception:
+        pass
+    for arg in ("--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--lang=en-US"):
+        try:
+            co.set_argument(arg)
+        except Exception:
+            pass
+    if proxy:
+        try:
+            co.set_proxy(str(proxy).strip())
+        except Exception as e:
+            log(f"[browser-sso-mint] set_proxy: {e}")
+
+    browser = None
+    try:
+        browser = Chromium(co)
+        page = browser.latest_tab
+        # Seed SSO cookies on accounts.x.ai
+        try:
+            page.get("https://accounts.x.ai/")
+            time.sleep(0.6)
+            for name in ("sso", "sso-rw"):
+                try:
+                    page.set.cookies(
+                        {
+                            "name": name,
+                            "value": sso,
+                            "domain": ".x.ai",
+                            "path": "/",
+                        }
+                    )
+                except Exception:
+                    try:
+                        page.run_js(
+                            "document.cookie = arguments[0]+'='+arguments[1]+'; domain=.x.ai; path=/';",
+                            name,
+                            sso,
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            log(f"[browser-sso-mint] seed sso: {e}")
+
+        log(f"[browser-sso-mint] open {verify_uri}")
+        page.get(verify_uri)
+        time.sleep(1.0)
+
+        # Fill user_code if empty field, click 继续 / Continue, then 允许 / Allow
+        deadline = time.time() + min(70.0, timeout * 0.7)
+        consented = False
+        while time.time() < deadline:
+            try:
+                url = str(page.url or "")
+                if user_code:
+                    try:
+                        page.run_js(
+                            """
+const code = String(arguments[0]||'');
+const inp = document.querySelector("input[name='user_code'], input[autocomplete='one-time-code'], input[type='text']");
+if (inp && code && !(inp.value||'').trim()) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;
+  if (setter) setter.call(inp, code); else inp.value = code;
+  inp.dispatchEvent(new Event('input',{bubbles:true}));
+  inp.dispatchEvent(new Event('change',{bubbles:true}));
+}
+true;
+""",
+                            user_code,
+                        )
+                    except Exception:
+                        pass
+                # Continue / Next first (device code step)
+                for lab in ("继续", "Continue", "Next", "下一步"):
+                    try:
+                        el = page.ele(
+                            f"xpath://button[normalize-space(.)='{lab}']", timeout=0.25
+                        )
+                        if el:
+                            el.click()
+                            log(f"[browser-sso-mint] clicked {lab}")
+                            time.sleep(0.9)
+                            break
+                    except Exception:
+                        continue
+                if _click_consent(page, log):
+                    consented = True
+                    break
+                if "consent" in url or "done" in url:
+                    if _click_consent(page, log):
+                        consented = True
+                        break
+                    if "done" in url:
+                        consented = True
+                        break
+            except Exception as e:
+                log(f"[browser-sso-mint] step: {e}")
+            time.sleep(0.7)
+
+        for _ in range(6):
+            if consented or _click_consent(page, log):
+                consented = True
+                break
+            time.sleep(0.5)
+
+        log(f"[browser-sso-mint] consented={consented} url={(page.url or '')[:90]}")
+        polled = _poll_token(
+            device_code,
+            interval=interval,
+            timeout=max(40.0, timeout - 40),
+            proxy=proxy,
+            log=log,
+        )
+        if polled.get("ok"):
+            polled["mode"] = "browser_sso_device"
+            log(
+                f"[browser-sso-mint] ✔ access_len="
+                f"{len(str(polled.get('access_token') or ''))}"
+            )
+        else:
+            log(f"[browser-sso-mint] ✘ {polled.get('error')}")
+            polled["mode"] = "browser_sso_device"
+        return polled
+    except Exception as e:
+        return {"ok": False, "error": str(e), "mode": "browser_sso_device"}
+    finally:
+        if browser is not None:
+            try:
+                browser.quit()
+            except Exception:
+                pass
+
+
 def mint_with_password_browser(
     *,
     email: str,
@@ -225,6 +407,9 @@ def mint_with_password_browser(
         or dc.get("verification_uri")
         or f"{ISSUER}/oauth2/device/verify"
     )
+    # Prefer accounts.x.ai frontend (2026-07 migration)
+    if "accounts.x.ai" not in verify_uri and user_code:
+        verify_uri = f"https://accounts.x.ai/oauth2/device?user_code={user_code}"
     interval = float(dc.get("interval") or 5)
     log(f"[browser-mint] device_code ok user_code={user_code} uri={verify_uri[:80]}")
 

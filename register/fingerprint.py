@@ -115,11 +115,10 @@ def build_fingerprint(
 
     rnd = random.Random(seed) if seed else random.Random(secrets.randbits(64))
     if chrome_major and 80 <= int(chrome_major) <= 200:
-        # 贴近真实版本：多数用精确 major，少数 ±1（仍在合理范围）
-        base = int(chrome_major)
-        jitter = rnd.choice([0, 0, 0, 0, 1, -1])
-        chrome = max(100, base + jitter)
+        # 已知真实 major 时禁止 jitter：UA 与二进制差 1 也会抬 600010
+        chrome = int(chrome_major)
     else:
+        # 未知版本时宁可用池中值，但 Windows 上尽量别太离谱
         chrome = rnd.choice(_CHROME_VERS)
 
     sys_name = (_plat.system() or "").lower()
@@ -133,8 +132,8 @@ def build_fingerprint(
         else:
             choice = 1
     elif prefer_native_os and sys_name == "windows":
-        r = rnd.random()
-        choice = 0 if r < 0.80 else (1 if r < 0.90 else 2)
+        # 手动 Chrome 就是 Win32；混 Mac UA 在真 Win 主机上抬 bot 分
+        choice = 0
     elif prefer_native_os and sys_name == "darwin":
         r = rnd.random()
         choice = 1 if r < 0.80 else (0 if r < 0.95 else 2)
@@ -242,19 +241,7 @@ def stealth_js(fp: BrowserFingerprint) -> str:
   try {{
     Object.defineProperty(navigator, 'maxTouchPoints', {{ get: () => {fp.max_touch_points} }});
   }} catch (e) {{}}
-  try {{
-    // 伪造 plugins 长度，避免 headless 常见 empty plugins
-    const fakePlugins = {{
-      length: 5,
-      item: function(i) {{ return this[i] || null; }},
-      namedItem: function() {{ return null; }},
-      refresh: function() {{}},
-      0: {{ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }},
-      1: {{ name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' }},
-      2: {{ name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }},
-    }};
-    Object.defineProperty(navigator, 'plugins', {{ get: () => fakePlugins }});
-  }} catch (e) {{}}
+  // 不再伪造 plugins：假 PluginArray 比真 Chrome 插件列表更容易被 600010 打中
   try {{
     const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
     if (originalQuery) {{
@@ -274,23 +261,26 @@ def stealth_js(fp: BrowserFingerprint) -> str:
       return r;
     }};
   }} catch (e) {{}}
+  // 默认不伪装 WebGL unmasked 串：假 NVIDIA 盖真 Intel 会被 Turnstile 交叉校验打成
+  // Verification failed。仅当显式 window.__fp_force_webgl_spoof=1 时才覆盖。
   try {{
-    // WebGL vendor/renderer 伪装（降低全员同 GPU 串；不保证）
-    const vendor = {json_dumps(fp.webgl_vendor)};
-    const renderer = {json_dumps(fp.webgl_renderer)};
-    const patchGetParam = (proto) => {{
-      if (!proto || !proto.getParameter) return;
-      const orig = proto.getParameter;
-      proto.getParameter = function (param) {{
-        const UNMASKED_VENDOR = 0x9245;
-        const UNMASKED_RENDERER = 0x9246;
-        if (param === UNMASKED_VENDOR) return vendor;
-        if (param === UNMASKED_RENDERER) return renderer;
-        return orig.apply(this, arguments);
+    if (window.__fp_force_webgl_spoof) {{
+      const vendor = {json_dumps(fp.webgl_vendor)};
+      const renderer = {json_dumps(fp.webgl_renderer)};
+      const patchGetParam = (proto) => {{
+        if (!proto || !proto.getParameter) return;
+        const orig = proto.getParameter;
+        proto.getParameter = function (param) {{
+          const UNMASKED_VENDOR = 0x9245;
+          const UNMASKED_RENDERER = 0x9246;
+          if (param === UNMASKED_VENDOR) return vendor;
+          if (param === UNMASKED_RENDERER) return renderer;
+          return orig.apply(this, arguments);
+        }};
       }};
-    }};
-    try {{ patchGetParam(WebGLRenderingContext && WebGLRenderingContext.prototype); }} catch (e) {{}}
-    try {{ patchGetParam(WebGL2RenderingContext && WebGL2RenderingContext.prototype); }} catch (e) {{}}
+      try {{ patchGetParam(WebGLRenderingContext && WebGLRenderingContext.prototype); }} catch (e) {{}}
+      try {{ patchGetParam(WebGL2RenderingContext && WebGL2RenderingContext.prototype); }} catch (e) {{}}
+    }}
   }} catch (e) {{}}
   try {{
     // 弱化 AutomationControlled / cdc_ 痕迹（尽力）

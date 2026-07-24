@@ -26,6 +26,55 @@ export type MailProvider = 'cloudflare' | 'duckmail' | 'yyds' | 'gptmail';
  */
 export type RegisterMode = 'browser' | 'hybrid';
 
+/** 注册方案 ID（执行顺序可配置） */
+export type RegisterPlanId = 'A' | 'B' | 'C';
+
+export const DEFAULT_REGISTER_PLAN_ORDER: RegisterPlanId[] = ['A', 'B', 'C'];
+
+/** 规范化 A/B/C 执行顺序：去重、补全缺失项，默认 A→B→C */
+export function normalizeRegisterPlanOrder(raw: unknown): RegisterPlanId[] {
+  const out: RegisterPlanId[] = [];
+  const push = (v: unknown) => {
+    const u = String(v ?? '')
+      .trim()
+      .toUpperCase();
+    if ((u === 'A' || u === 'B' || u === 'C') && !out.includes(u)) {
+      out.push(u);
+    }
+  };
+  if (Array.isArray(raw)) {
+    for (const x of raw) push(x);
+  } else if (typeof raw === 'string' && raw.trim()) {
+    for (const part of raw.split(/[>,\s|/·]+/)) push(part);
+  }
+  for (const p of DEFAULT_REGISTER_PLAN_ORDER) {
+    if (!out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
+/** 在 order 内把 from 索引项移到 to 索引（0-based） */
+export function moveRegisterPlanOrder(
+  order: RegisterPlanId[],
+  from: number,
+  to: number
+): RegisterPlanId[] {
+  const base = normalizeRegisterPlanOrder(order);
+  if (
+    from < 0 ||
+    to < 0 ||
+    from >= base.length ||
+    to >= base.length ||
+    from === to
+  ) {
+    return base;
+  }
+  const next = base.slice();
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  return next;
+}
+
 /**
  * SSO→CPA mint 路径：
  * - pkce：Auth Code + PKCE（mode=A，默认，referrer=grok-build）
@@ -389,7 +438,7 @@ export interface AppSettings {
   proxyFetchUrl: string;
   /**
    * 注册方案 Plan A：全程 Drission + 临时邮 + Turnstile（约 1～3 分钟）。
-   * 可与 B/C 同时开：按 A→B→C 顺序兜底。
+   * 可与 B/C 同时开：按 registerPlanOrder 顺序兜底。
    */
   registerPlanAEnabled: boolean;
   /**
@@ -402,6 +451,12 @@ export interface AppSettings {
    * 写入 Python config：register_plan_c_enabled；兼容旧 registerMode=hybrid。
    */
   registerPlanCEnabled: boolean;
+  /**
+   * 注册方案执行顺序（含未开启项的完整排列）。
+   * 首页左右拖动 / 配置页上下拖动双向同步。
+   * 写入 Python config：register_plan_order（如 ["C","A","B"]）。
+   */
+  registerPlanOrder: RegisterPlanId[];
   /**
    * @deprecated 使用 registerPlanCEnabled。hybrid 时视为 Plan C 开启。
    * 写入兼容：register_mode
@@ -538,6 +593,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   registerPlanAEnabled: true,
   registerPlanBEnabled: true,
   registerPlanCEnabled: false,
+  registerPlanOrder: ['A', 'B', 'C'],
   registerMode: 'browser',
   cpaMintMode: 'pkce',
   grok2apiAutoUpload: false,

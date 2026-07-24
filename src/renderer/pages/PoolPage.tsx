@@ -55,6 +55,7 @@ const PAGE_SIZE_KEY = 'gra-pool-page-size';
 const AUTH_FILTER_KEY = 'gra-pool-auth-filter';
 const ALIVE_FILTER_KEY = 'gra-pool-alive-filter';
 const SSO_FILTER_KEY = 'gra-pool-sso-filter';
+const G2A_FILTER_KEY = 'gra-pool-g2a-filter';
 const MINT_CHUNK = 5;
 /** SSO 验活分块：每块请求服务端（服务端内并发 5） */
 const VERIFY_CHUNK = 25;
@@ -65,6 +66,7 @@ type AuthFilter = 'all' | 'unconverted' | 'converted';
 type AliveFilter = 'all' | 'unchecked' | 'alive' | 'dead' | 'unknown';
 /** 是否含 SSO 筛选（分页/列表基于此） */
 type SsoFilter = 'all' | 'has_sso' | 'no_sso';
+type G2aFilter = 'all' | 'pushed' | 'not_pushed';
 
 function loadAuthFilter(): AuthFilter {
   const fromUrl = oneOf(getQuery('auth'), ['all', 'unconverted', 'converted'] as const, '' as AuthFilter | '');
@@ -88,6 +90,16 @@ function loadAliveFilter(): AliveFilter {
   try {
     const v = localStorage.getItem(ALIVE_FILTER_KEY);
     if (v === 'unchecked' || v === 'alive' || v === 'dead' || v === 'unknown' || v === 'all') return v;
+  } catch {
+    /* ignore */
+  }
+  return 'all';
+}
+
+function loadG2aFilter(): G2aFilter {
+  try {
+    const v = localStorage.getItem(G2A_FILTER_KEY);
+    if (v === 'pushed' || v === 'not_pushed' || v === 'all') return v;
   } catch {
     /* ignore */
   }
@@ -266,6 +278,7 @@ export function PoolPage() {
   const [authFilter, setAuthFilter] = useState<AuthFilter>(() => loadAuthFilter());
   const [aliveFilter, setAliveFilter] = useState<AliveFilter>(() => loadAliveFilter());
   const [ssoFilter, setSsoFilter] = useState<SsoFilter>(() => loadSsoFilter());
+  const [g2aFilter, setG2aFilter] = useState<G2aFilter>(() => loadG2aFilter());
   const [searchQuery, setSearchQuery] = useState(() => getQuery('q'));
 
   // 筛选/页码同步到 URL（刷新可恢复）；切到号池时清 Auth 专用 key
@@ -584,8 +597,20 @@ export function PoolPage() {
     return ssoCheckVerdict({ alive: r.alive, status: r.status });
   };
 
-  // 服务端分页：accounts 已是当前页（含 auth 筛选）
-  const filteredAccounts = accounts;
+  // 服务端分页：accounts 已是当前页（含 auth 筛选）；G2A 在当前页再滤一层
+  const filteredAccounts = (() => {
+    if (g2aFilter === 'pushed') {
+      return accounts.filter(
+        (a) => a.pushedG2a === true || (a.ssoG2Status ?? 'none') === 'ok'
+      );
+    }
+    if (g2aFilter === 'not_pushed') {
+      return accounts.filter(
+        (a) => a.pushedG2a !== true && (a.ssoG2Status ?? 'none') !== 'ok'
+      );
+    }
+    return accounts;
+  })();
   const poolTotal = facets.all || listTotal || accounts.length;
   const convertedCount = facets.authConverted ?? 0;
   const unconvertedCount =
@@ -610,7 +635,7 @@ export function PoolPage() {
   const currentPage = Math.min(page, totalPages);
   const pageStart = (currentPage - 1) * pageSize;
   const pageAccounts = serverPaged
-    ? accounts
+    ? filteredAccounts
     : filteredAccounts.slice(pageStart, pageStart + pageSize);
   const rangeFrom = totalForPager === 0 ? 0 : pageStart + 1;
   const rangeTo = Math.min(pageStart + pageSize, totalForPager);
@@ -641,6 +666,16 @@ export function PoolPage() {
     resetPage();
     try {
       localStorage.setItem(ALIVE_FILTER_KEY, f);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const changeG2aFilter = (f: G2aFilter) => {
+    setG2aFilter(f);
+    resetPage();
+    try {
+      localStorage.setItem(G2A_FILTER_KEY, f);
     } catch {
       /* ignore */
     }
@@ -1982,6 +2017,12 @@ export function PoolPage() {
             (failedTargets.length ? ' · 可点原因复检' : '')
         });
       }
+      // 刷新号池以显示 G2A tag
+      try {
+        await reload();
+      } catch {
+        /* ignore */
+      }
     } catch (err) {
       if (
         (err instanceof Error && err.name === 'AbortError') ||
@@ -2081,10 +2122,16 @@ export function PoolPage() {
       ? Math.min(100, Math.round((verifyProg.done / verifyProg.total) * 100))
       : 0;
   const busy = verifying || minting || deleting || importing || pushingG2a || !!g2aProg?.running;
+  const g2aPushedCount = useMemo(
+    () => accounts.filter((a) => a.pushedG2a === true || (a.ssoG2Status ?? 'none') === 'ok').length,
+    [accounts]
+  );
+
   const hasActiveFilter =
     authFilter !== 'all' ||
     aliveFilter !== 'all' ||
     ssoFilter !== 'all' ||
+    g2aFilter !== 'all' ||
     Boolean(searchQuery.trim());
 
   const mintPct =
@@ -2349,6 +2396,7 @@ export function PoolPage() {
               changeSsoFilter('all');
               changeAuthFilter('all');
               changeAliveFilter('all');
+              changeG2aFilter('all');
               setSearchQuery('');
             }}
           >
@@ -2376,7 +2424,24 @@ export function PoolPage() {
                 { id: 'no_sso', label: '无SSO', count: noSsoCount, title: '无 SSO 的账号' }
               ]}
             />
-            <FilterSegmentGroup
+                        <FilterSegmentGroup
+              label="G2A"
+              value={g2aFilter}
+              onChange={changeG2aFilter}
+              options={[
+                { id: 'all', label: '全部', count: accounts.length, title: '不限制 G2A 推送' },
+                { id: 'pushed', label: '已推', count: g2aPushedCount, title: '已推送 grok2api', tone: 'ok' },
+                {
+                  id: 'not_pushed',
+                  label: '未推',
+                  count: accounts.length - g2aPushedCount,
+                  title: '尚未推送 G2A',
+                  tone: 'muted'
+                }
+              ]}
+            />
+
+<FilterSegmentGroup
               label="Auth"
               value={authFilter}
               onChange={changeAuthFilter}
@@ -2805,6 +2870,7 @@ export function PoolPage() {
                   changeSsoFilter('all');
                   changeAuthFilter('all');
                   changeAliveFilter('all');
+              changeG2aFilter('all');
                 }}
               >
                 清空筛选
@@ -3062,6 +3128,11 @@ function AccountCard({
                   : 'none')
               }
               error={account.nsfwError}
+            />
+            <PushChannelBadge
+              channel="G2A"
+              pushed={account.pushedG2a === true}
+              at={account.pushedG2aAt}
             />
             <span
               className="inline-flex"

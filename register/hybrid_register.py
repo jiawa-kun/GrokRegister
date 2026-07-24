@@ -151,11 +151,19 @@ def hybrid_register(
     log: Optional[LogFn] = None,
     mail_token: str = "",
     should_stop: Optional[Callable[[], bool]] = None,
+    create_email_done: bool = False,
+    email_code: str = "",
 ) -> dict[str, Any]:
-    """单账号 hybrid。可传入已有 email/password/mail_token，否则自建。"""
+    """单账号 hybrid。可传入已有 email/password/mail_token，否则自建。
+
+    create_email_done=True：跳过 CreateEmail（Plan A/B 协议已发码）。
+    email_code：已有 OTP 时跳过收件箱轮询。
+    """
     log = log or _noop
     stop = should_stop or (lambda: False)
     _ = birth_year  # 协议路径用 profile 生日字段时由 server action 隐式处理
+    create_email_done = bool(create_email_done)
+    email_code = str(email_code or "").replace("-", "").replace(" ", "").strip()
 
     if not protocol_available():
         return {
@@ -194,33 +202,76 @@ def hybrid_register(
             family = parts[1]
 
     try:
-        with BrowserTokenSession(log=log) as browser:
+        reuse_br = bool(create_email_done)
+        with BrowserTokenSession(
+            log=log, reuse=reuse_br, keep_alive=reuse_br
+        ) as browser:
             if stop():
                 return {"ok": False, "error": "stopped", "mode": "hybrid"}
-            browser.open_signup()
+            if create_email_done:
+                try:
+                    from grok_register_ttk import _get_page
+
+                    pg = _get_page()
+                    url = ""
+                    try:
+                        url = str(
+                            getattr(pg, "url", "")
+                            or pg.run_js("return location.href")
+                            or ""
+                        )
+                    except Exception:
+                        url = ""
+                    if "sign-up" not in url.lower() and "accounts.x.ai" not in url.lower():
+                        browser.open_signup()
+                    else:
+                        log(f"[hybrid] reuse page url={url[:80]}")
+                except Exception as re:
+                    log(f"[hybrid] reuse page check: {re}")
+                    try:
+                        browser.open_signup()
+                    except Exception:
+                        pass
+            else:
+                browser.open_signup()
             browser.install_network_hook()
             action = action or browser.scrape_next_action() or action
 
-            # UI 提交邮箱：优先让浏览器原生发出 CreateEmail（日志常见 body~33B 且 200）。
-            # 站点当前 CreateEmail 可不带 castle；勿在此处因抓不到 IBYIll 整轮失败。
-            castle = browser.harvest_castle_via_email_submit(email, timeout=50)
+            # UI 提交邮箱：优先 harvest 原生 IBYIll castle。
+            # 空 castle 的 CreateEmail 会触发 Castle bot_flag → SSO 可登录但 CPA mint 恒 Access denied。
+            if create_email_done:
+                castle = ""
+                log("[hybrid] create_email_done=1 · skip castle harvest / CreateEmail RPC")
+            else:
+                log("[hybrid] harvest castle via UI email submit…")
+                castle = browser.harvest_castle_via_email_submit(email, timeout=50) or ""
             browser_cookies = browser.export_cookies()
-            browser_sent = browser.create_email_sent_via_browser()
+            # create_email_done 表示上游（Plan A/B 协议）已发码，不等于浏览器 UI 已发出 CreateEmail
+            browser_sent = (not create_email_done) and bool(
+                browser.create_email_sent_via_browser()
+            )
             clen = len(str(castle or ""))
             if castle and clen >= 1000 and str(castle).startswith("IBYIll"):
                 log(f"[hybrid] native castle ok len={clen}")
             else:
-                # second chance: page-side mint + re-read capture (no CDN inject)
+                # second chance: re-read capture + short native mint
                 try:
-                    harv = getattr(browser, "_harvester", None) or browser
                     if hasattr(browser, "read_captured_castle"):
                         c2 = browser.read_captured_castle()
                         if c2 and len(c2) > clen:
                             castle, clen = c2, len(c2)
-                    # TokenHarvester methods via session wrapper
-                    if hasattr(browser, "get_castle_token"):
-                        # only accept long IBYIll — short CDN tokens are useless for x.ai
-                        pass
+                    if (
+                        (not castle or clen < 1000 or not str(castle).startswith("IBYIll"))
+                        and hasattr(browser, "get_castle_token")
+                    ):
+                        minted = browser.get_castle_token(timeout=12) or ""
+                        if (
+                            minted
+                            and len(minted) >= 1000
+                            and str(minted).startswith("IBYIll")
+                        ):
+                            castle, clen = minted, len(minted)
+                            log(f"[hybrid] castle via get_castle_token len={clen}")
                 except Exception as e:
                     log(f"[hybrid] castle second-chance skip: {e}")
                 if castle and clen >= 1000 and str(castle).startswith("IBYIll"):
@@ -229,7 +280,7 @@ def hybrid_register(
                     log(
                         f"[hybrid] no usable castle yet len={clen} "
                         f"browser_create_email={browser_sent} "
-                        f"(defer castle to Server Action)"
+                        f"create_email_done={bool(create_email_done)}"
                     )
                     castle = str(castle or "")
 
@@ -247,63 +298,100 @@ def hybrid_register(
             if action:
                 client.next_action = action
 
-            if browser_sent:
+            castle_ok = bool(
+                castle and clen >= 1000 and str(castle).startswith("IBYIll")
+            )
+            if create_email_done:
+                # A/B 已在 fill_email/fill_code 完成 CreateEmail+收码；勿再 RPC 发码
+                log("[hybrid] skip CreateEmail (upstream protocol already sent code)")
+            elif browser_sent and castle_ok:
+                # UI already fired CreateEmail with IBYIll — do NOT force a 2nd RPC
+                # (double CreateEmail correlates with Castle policy=deny / high risk).
                 log(
                     f"[hybrid] CreateEmail via browser OK (skip protocol) "
                     f"castle_len={clen}"
                 )
+            elif browser_sent and not castle_ok:
+                # 浏览器已发 CreateEmail 但未抓到 IBYIll → 高概率空 castle bot 号
+                log(
+                    f"[hybrid] CreateEmail browser-sent but castle missing/weak "
+                    f"len={clen} — abort (avoid unmintable bot SSO)"
+                )
+                return {
+                    "ok": False,
+                    "error": f"CreateEmail browser-sent without castle len={clen}",
+                    "mode": "hybrid",
+                }
             else:
-                # 浏览器未真正发出 CreateEmail 时，协议路径需要有效 castle
-                if clen < 1000 or not str(castle).startswith("IBYIll"):
+                # CreateEmail：必须 IBYIll。优先浏览器页内 fetch（同源 cookie），再 curl 重试。
+                if not castle_ok:
                     log(
-                        f"[hybrid] CreateEmail not confirmed by browser and "
-                        f"castle unusable len={clen}"
+                        f"[hybrid] CreateEmail not confirmed and castle unusable "
+                        f"len={clen}"
                     )
                     return {
                         "ok": False,
                         "error": f"CreateEmail 未确认且 castle 无效 len={clen}",
                         "mode": "hybrid",
                     }
-                r1 = client.create_email_validation_code(email, castle)
-                log(
-                    f"[hybrid] CreateEmail status={r1.get('status')} "
-                    f"castle_len={len(castle)}"
-                )
-                if int(r1.get("status") or 0) >= 400:
-                    body_hint = ""
+                ce_ok = False
+                # browser page-fetch often more reliable than curl through flaky proxy
+                if hasattr(browser, "force_create_email_via_page"):
                     try:
-                        raw = r1.get("raw") or b""
-                        if b"cloudflare" in raw[:500].lower() or b"<!DOCTYPE" in raw[:200]:
-                            body_hint = " (Cloudflare block)"
-                    except Exception:
-                        pass
-                    log(
-                        f"[hybrid] CreateEmail fail{body_hint} "
-                        f"strings={r1.get('strings')[:2] if r1.get('strings') else []}"
-                    )
-                    return {
-                        "ok": False,
-                        "error": f"CreateEmail fail status={r1.get('status')}",
-                        "mode": "hybrid",
-                    }
+                        fr = browser.force_create_email_via_page(
+                            email, timeout=25.0, castle_token=str(castle)
+                        )
+                        log(f"[hybrid] CreateEmail page-fetch: {fr}")
+                        if isinstance(fr, dict) and fr.get("ok"):
+                            ce_ok = True
+                    except Exception as fe:
+                        log(f"[hybrid] CreateEmail page-fetch err: {fe}")
+                if not ce_ok:
+                    last_st = 0
+                    for attempt in range(3):
+                        try:
+                            r1 = client.create_email_validation_code(
+                                email, str(castle)
+                            )
+                            last_st = int(r1.get("status") or 0)
+                            log(
+                                f"[hybrid] CreateEmail protocol attempt={attempt + 1} "
+                                f"status={last_st} castle_len={clen}"
+                            )
+                            if 200 <= last_st < 300:
+                                ce_ok = True
+                                break
+                        except Exception as cee:
+                            log(
+                                f"[hybrid] CreateEmail protocol attempt={attempt + 1} "
+                                f"err={cee}"
+                            )
+                        time.sleep(1.2 * (attempt + 1))
+                    if not ce_ok:
+                        return {
+                            "ok": False,
+                            "error": f"CreateEmail fail status={last_st}",
+                            "mode": "hybrid",
+                        }
             if stop():
                 return {"ok": False, "error": "stopped", "mode": "hybrid"}
 
-            clean = _get_mail_code(mail_token, email, log)
+            if email_code:
+                clean = email_code
+                log(f"[hybrid] reuse email_code={clean}")
+            else:
+                clean = _get_mail_code(mail_token, email, log)
             if not clean:
                 log("[hybrid] no mail code")
                 return {"ok": False, "error": "no mail code", "mode": "hybrid"}
             log(f"[hybrid] code={clean}")
 
+            # Protocol verify keeps server state; UI finish must NOT open_signup (wipes SPA step).
             r2 = client.verify_email_validation_code(email, clean)
             log(f"[hybrid] VerifyEmail status={r2.get('status')}")
+            # soft-fail: even if protocol verify flakes, browser code submit may still work
             if int(r2.get("status") or 0) >= 400:
-                log(f"[hybrid] VerifyEmail fail {r2.get('strings')}")
-                return {
-                    "ok": False,
-                    "error": f"VerifyEmail fail status={r2.get('status')}",
-                    "mode": "hybrid",
-                }
+                log(f"[hybrid] VerifyEmail soft-fail {r2.get('strings')} — continue UI")
             if stop():
                 return {"ok": False, "error": "stopped", "mode": "hybrid"}
 
@@ -312,197 +400,312 @@ def hybrid_register(
             except Exception:
                 pass
 
-            # 协议已 VerifyEmail：先把浏览器推到资料/Turnstile 页，再取 token。
-            # 先 inject 浮层再 prepare 会在错误页点 Turnstile，且 open_signup 会冲掉进度。
+            # ── Pure browser finish: stay on harvest session ──
+            # harvest already did email+CreateEmail; fill OTP → profile → native submit.
+            # Hardcoded next-action is currently 404 on server; React submit is the reliable path.
+            import time as _tfin
+            from grok_register_ttk import _get_page
+
             turnstile = ""
-            try:
-                ready = browser.prepare_profile_step_for_turnstile(
-                    email, clean, timeout=75
-                )
-                log(f"[hybrid] profile/turnstile page ready={ready}")
-            except Exception as te:
-                log(f"[hybrid] prepare profile: {te}")
-            try:
-                turnstile = browser.get_turnstile_token(timeout=90, inject=True)
-            except Exception as te:
-                log(f"[hybrid] turnstile get: {te}")
-            if len(str(turnstile or "")) < 80:
-                # P0.5: 首次失败后走短路径 — 刷新 + soft reset 准备 + 跳过长 auto-wait
-                log(
-                    "[hybrid] turnstile first miss → short-path retry "
-                    "(refresh + soft-reset prep + fast host-click)"
-                )
-                try:
-                    from grok_register_ttk import refresh_active_page
+            r3: dict = {}
+            sso = ""
+            body_txt = ""
+            used_action = "browser-ui"
+            castle2 = str(castle or "") if str(castle or "").startswith("IBYIll|") else str(castle or "")
 
-                    if callable(refresh_active_page):
-                        refresh_active_page()
-                except Exception:
-                    pass
+            def _ui_state():
+                pg = _get_page()
+                if pg is None:
+                    return {}
                 try:
-                    browser.prepare_profile_step_for_turnstile(email, clean, timeout=30)
-                except Exception as pe:
-                    log(f"[hybrid] prepare profile retry: {pe}")
-                try:
-                    turnstile = browser.get_turnstile_token(
-                        timeout=50, inject=True, fast=True
-                    )
-                except TypeError:
-                    # older harvester without fast=
-                    try:
-                        turnstile = browser.get_turnstile_token(
-                            timeout=50, inject=True
+                    return (
+                        pg.run_js(
+                            r"""
+function vis(n){if(!n)return false;const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden')return false;const r=n.getBoundingClientRect();return r.width>0&&r.height>0;}
+const pw=[...document.querySelectorAll('input[type="password"]')].some(vis);
+const gn=[...document.querySelectorAll('input[name="givenName"],input[autocomplete="given-name"],input[name="familyName"]')].some(vis);
+const email=[...document.querySelectorAll('input[type="email"],input[name="email"],input[data-testid="email"]')].some(vis);
+const code=[...document.querySelectorAll('input[data-input-otp="true"],input[autocomplete="one-time-code"]')].some(vis)
+  || [...document.querySelectorAll('input')].filter(n=>vis(n)&&Number(n.maxLength||0)===1).length>=4;
+return {pw:!!pw, gn:!!gn, email:!!email, code:!!code, url: location.href};
+"""
                         )
-                    except Exception as te:
-                        log(f"[hybrid] turnstile retry: {te}")
+                        or {}
+                    )
+                except Exception:
+                    return {}
+
+            log("[hybrid] UI finish: fill OTP on harvest session (no open_signup)…")
+            st0 = _ui_state()
+            log(f"[hybrid] UI state0={st0}")
+            # If still on email (unexpected), re-submit email once without full reload
+            if isinstance(st0, dict) and st0.get("email") and not st0.get("code") and not st0.get("pw"):
+                if hasattr(browser, "_set_input_and_submit"):
+                    log(f"[hybrid] UI re-submit email: {browser._set_input_and_submit(email, 'email')}")
+                    _tfin.sleep(1.8)
+            # Fill OTP
+            if hasattr(browser, "_set_input_and_submit"):
+                for _ in range(3):
+                    st = _ui_state()
+                    if isinstance(st, dict) and (st.get("pw") or st.get("gn")):
+                        break
+                    if isinstance(st, dict) and (st.get("code") or not st.get("pw")):
+                        r_cd = browser._set_input_and_submit(clean, "code")
+                        log(f"[hybrid] UI code submit: {r_cd} state={st}")
+                        _tfin.sleep(2.0)
+            # Wait profile fields
+            profile_ok = False
+            for i in range(25):
+                st = _ui_state()
+                if i % 3 == 0:
+                    log(f"[hybrid] UI wait profile state={st}")
+                if isinstance(st, dict) and (st.get("pw") or st.get("gn")):
+                    profile_ok = True
+                    break
+                # if stuck on email after protocol path, one open_signup then code-only is useless;
+                # try code again
+                if isinstance(st, dict) and st.get("code") and hasattr(browser, "_set_input_and_submit"):
+                    browser._set_input_and_submit(clean, "code")
+                _tfin.sleep(0.9)
+            log(f"[hybrid] profile fields ready={profile_ok}")
+
+            # Turnstile on current page (prefer inject; native often empty under automation)
+            try:
+                log("[hybrid] turnstile on current step…")
+                turnstile = browser.get_turnstile_token(timeout=45, inject=True, fast=False)
+            except TypeError:
+                try:
+                    turnstile = browser.get_turnstile_token(timeout=45, inject=True)
                 except Exception as te:
-                    log(f"[hybrid] turnstile short-path retry: {te}")
+                    log(f"[hybrid] turnstile: {te}")
+            except Exception as te:
+                log(f"[hybrid] turnstile: {te}")
             if len(str(turnstile or "")) < 80:
-                # 外置 Solver 最终兜底（与页内/短路径无关）
                 try:
-                    from turnstile_solver_client import (
-                        solve_turnstile,
-                        solver_enabled,
-                        yescaptcha_key,
-                    )
-
-                    if solver_enabled() or yescaptcha_key():
-                        log("[hybrid] turnstile page paths failed → external solver…")
-                        ext = solve_turnstile(
-                            siteurl="https://accounts.x.ai/sign-up",
-                            sitekey="",
-                            max_wait=90,
-                            log=log,
-                        )
-                        if ext and len(str(ext)) >= 80:
-                            turnstile = ext
-                            log(f"[hybrid] turnstile external len={len(ext)}")
-                except Exception as xe:
-                    log(f"[hybrid] external turnstile: {xe}")
-            if len(str(turnstile or "")) < 80:
-                log(f"[hybrid] turnstile short len={len(str(turnstile or ''))}")
-                return {
-                    "ok": False,
-                    "error": f"turnstile short len={len(str(turnstile or ''))}",
-                    "mode": "hybrid",
-                }
-
-            # Server Action: prefer native IBYIll; skip long CDN mint when CreateEmail
-            # was already castle-less (AA: minting||[] wastes ~25s; SA still 200).
-            castle2 = browser.read_captured_castle() or castle
-            cl2 = len(str(castle2 or ""))
-            if cl2 < 1000 or not str(castle2 or "").startswith("IBYIll"):
-                # one more capture read only — no 25s CDN inject
-                try:
-                    c3 = browser.read_captured_castle()
-                    if c3 and len(c3) > cl2:
-                        castle2, cl2 = c3, len(c3)
+                    turnstile = browser.get_turnstile_token(timeout=50, inject=True)
                 except Exception:
                     pass
-                # brief native-only probe if page exposes Castle (rare)
-                if cl2 < 800:
-                    try:
-                        page_has = False
-                        harv = getattr(browser, "_harvester", None) or browser
-                        # BrowserTokenSession may expose get_castle_token; use tiny timeout
-                        if hasattr(browser, "get_castle_token") and hasattr(
-                            harv, "_extract_castle_pk"
-                        ):
-                            # only if globals already minting / SDK present would help;
-                            # skip entirely when prior CreateEmail was castle-less
-                            if cl2 == 0 and not str(castle or ""):
-                                log(
-                                    "[hybrid] sign-up castle skip CDN mint "
-                                    "(CreateEmail castle-less path)"
-                                )
-                            else:
-                                minted = browser.get_castle_token(timeout=4)
-                                if (
-                                    minted
-                                    and len(str(minted)) >= 800
-                                    and str(minted).startswith("IBYIll")
-                                ):
-                                    castle2 = minted
-                                    cl2 = len(castle2)
-                                    log(
-                                        f"[hybrid] castle for sign-up via capture "
-                                        f"len={cl2} head={str(castle2)[:16]}"
-                                    )
-                    except Exception as ce:
-                        log(f"[hybrid] castle mint for sign-up: {ce}")
-            if len(str(castle2 or "")) < 40:
-                log(f"[hybrid] sign-up castle still weak len={len(str(castle2 or ''))}")
-            browser_cookies = browser.export_cookies()
-            jar2 = dict(browser_cookies or {})
-            for stale in ("sso", "sso-rw"):
-                jar2.pop(stale, None)
-            sess.set_cookies(jar2)
+            log(f"[hybrid] turnstile_len={len(str(turnstile or ''))}")
 
-            action = (
-                action
-                or browser.scrape_next_action()
-                or load_next_action_from_capture()
-            )
-            if not action:
-                client.next_action = ""
+            # Inject token into DOM for React form
+            try:
+                pg = _get_page()
+                if pg is not None and turnstile:
+                    pg.run_js(
+                        """
+const tok = String(arguments[0]||'');
+window.__hybrid_turnstile = tok;
+for (const el of document.querySelectorAll(
+  'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], input[name*="turnstile" i]'
+)) {
+  try {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+    if (setter) setter.call(el, tok); else el.value = tok;
+    el.dispatchEvent(new Event('input', {bubbles:true}));
+    el.dispatchEvent(new Event('change', {bubbles:true}));
+  } catch (e) {}
+}
+return true;
+""",
+                        turnstile,
+                    )
+            except Exception:
+                pass
+
+            # Fresh castle + conversionId before CreateUser (registration risk event)
+            try:
+                if hasattr(browser, "_kick_page_castle_mint"):
+                    browser._kick_page_castle_mint(_get_page())
+                if hasattr(browser, "read_captured_castle"):
+                    c_fresh = browser.read_captured_castle() or ""
+                    if (
+                        c_fresh
+                        and len(c_fresh) >= 1000
+                        and str(c_fresh).startswith("IBYIll")
+                        and len(c_fresh) >= len(str(castle2 or ""))
+                    ):
+                        castle2 = c_fresh
+                        log(f"[hybrid] fresh castle pre-profile len={len(castle2)}")
+                # Inject conversionId + castle into any matching form fields React may bind
+                pg_pre = _get_page()
+                if pg_pre is not None:
+                    import uuid as _uuid_pre
+
+                    conv_id = str(_uuid_pre.uuid4())
+                    pg_pre.run_js(
+                        """
+const castle = String(arguments[0]||'');
+const conv = String(arguments[1]||'');
+window.__hybrid_conversion_id = conv;
+if (castle) {
+  window.__hybrid_castle = castle;
+  window.__hybrid_castles = window.__hybrid_castles || [];
+  window.__hybrid_castles.push(castle);
+}
+function setNamed(name, val) {
+  if (!val) return 0;
+  let n = 0;
+  for (const el of document.querySelectorAll(
+    'input[name="'+name+'"], textarea[name="'+name+'"], input[id="'+name+'"]'
+  )) {
+    try {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set
+        || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set;
+      if (setter) setter.call(el, val); else el.value = val;
+      el.dispatchEvent(new Event('input', {bubbles:true}));
+      el.dispatchEvent(new Event('change', {bubbles:true}));
+      n++;
+    } catch (e) {}
+  }
+  return n;
+}
+const nC = setNamed('castleRequestToken', castle) + setNamed('castle_request_token', castle);
+const nV = setNamed('conversionId', conv) + setNamed('conversion_id', conv);
+return {nC, nV, clen: castle.length, conv: conv.slice(0,8)};
+""",
+                        str(castle2 or ""),
+                        conv_id,
+                    )
+                    log(f"[hybrid] pre-profile inject conversionId={conv_id[:8]}… castle_len={len(str(castle2 or ''))}")
+            except Exception as pe0:
+                log(f"[hybrid] pre-profile castle/conversion inject skip: {pe0}")
+
+            # Native profile submit (React binds valid Server Action)
+            if hasattr(browser, "submit_profile_and_wait_sso"):
+                log("[hybrid] native profile submit…")
                 try:
-                    action = client.discover_next_action(timeout=60) or ""
-                    if action:
-                        log(f"[hybrid] next-action discovered={action[:20]}...")
-                except Exception as de:
-                    log(f"[hybrid] next-action discover fail: {de}")
-                    action = ""
-            known = "7f50061dd2f5b389a530e4a048d5fdf0c48d1d9259"
-            if not action:
-                # Last resort hardcode (may be stale); prefer discover/capture above.
-                action = known
-                log(
-                    f"[hybrid] next-action fallback hardcode={action[:16]}... "
-                    f"(capture_out empty / discover failed)"
-                )
-            else:
-                log(f"[hybrid] next-action={action[:20]}...")
-            client.next_action = action
-            if stop():
-                return {"ok": False, "error": "stopped", "mode": "hybrid"}
+                    sso = (
+                        browser.submit_profile_and_wait_sso(
+                            given_name=given,
+                            family_name=family,
+                            password=prof_password,
+                            timeout=55.0,
+                        )
+                        or ""
+                    )
+                    if sso:
+                        used_action = "browser-form"
+                        r3 = {
+                            "status": 200,
+                            "text": "browser-profile-submit",
+                            "cookies": browser.export_cookies() or {},
+                            "sso": sso,
+                        }
+                        log(f"[hybrid] native profile sso_len={len(sso)}")
+                except Exception as pe:
+                    log(f"[hybrid] native profile: {pe}")
 
-            def _do_signup(act: str):
-                return client.create_user_via_server_action(
-                    email=email,
-                    code=clean,
-                    given_name=given,
-                    family_name=family,
-                    password=prof_password,
-                    turnstile_token=turnstile,
-                    castle_token=castle2,
-                    next_action=act,
-                    conversion_id=str(uuid.uuid4()),
-                )
-
-            r3 = _do_signup(action)
-            sso = r3.get("sso") or ""
+            # Fallback: browser SA if we got a live action after profile hydration
+            action_cands: list[str] = []
             if not sso:
-                ck = r3.get("cookies") or {}
-                sso = ck.get("sso") or ck.get("sso-rw") or ""
-            body_txt = str(r3.get("text") or "")
-            if (not sso) and action != known and (
-                "isLoggedInWithSSO" in body_txt or int(r3.get("status") or 0) == 200
-            ):
-                log(f"[hybrid] retry sign-up with known next-action={known[:16]}...")
-                jar3 = dict(browser.export_cookies() or {})
-                for stale in ("sso", "sso-rw"):
-                    jar3.pop(stale, None)
-                sess.set_cookies(jar3)
-                r3 = _do_signup(known)
-                sso = r3.get("sso") or ""
-                if not sso:
-                    ck = r3.get("cookies") or {}
-                    sso = ck.get("sso") or ck.get("sso-rw") or ""
-                body_txt = str(r3.get("text") or "")
+                try:
+                    live = str(browser.scrape_next_action() or "").strip()
+                    if live:
+                        action_cands.append(live)
+                        log(f"[hybrid] live next-action after profile={live[:20]}...")
+                except Exception:
+                    pass
+            for src in (action, load_next_action_from_capture()):
+                s = str(src or "").strip()
+                if s and s not in action_cands:
+                    action_cands.append(s)
+
+            # Prefer browser-context Server Action (same CF cookies / deploy as page)
+            if (not sso) and hasattr(browser, "submit_create_user_server_action") and action_cands:
+                for ai, act in enumerate(action_cands[:4]):
+                    if stop():
+                        break
+                    used_action = f"browser-sa:{act[:16]}"
+                    log(
+                        f"[hybrid] browser SA try[{ai + 1}] {act[:20]}... "
+                        f"castle_len={len(str(castle2 or ''))}"
+                    )
+                    try:
+                        br = browser.submit_create_user_server_action(
+                            email=email,
+                            code=clean,
+                            given_name=given,
+                            family_name=family,
+                            password=prof_password,
+                            turnstile_token=turnstile,
+                            castle_token=castle2,
+                            next_action=act,
+                        )
+                    except Exception as se:
+                        log(f"[hybrid] browser SA err: {se}")
+                        continue
+                    sso = str(br.get("sso") or "")
+                    body_txt = str(br.get("text") or "")
+                    r3 = {
+                        "status": br.get("status"),
+                        "text": body_txt,
+                        "cookies": browser.export_cookies() if hasattr(browser, "export_cookies") else {},
+                        "sso": sso,
+                    }
+                    if sso:
+                        break
+                    if int(br.get("status") or 0) == 404 or "Server action not found" in body_txt:
+                        log("[hybrid] browser SA 404 → next action")
+                        continue
+                    log(
+                        f"[hybrid] browser SA no-sso status={br.get('status')} "
+                        f"body={body_txt[:120]!r}"
+                    )
+                    if ai >= 1:
+                        break
+
+            # curl protocol fallback (only if we have a non-404 action id)
+            if not sso and action_cands and len(str(turnstile or "")) >= 80:
+                for ai, act in enumerate(action_cands[:3]):
+                    if stop():
+                        break
+                    used_action = act
+                    client.next_action = act
+                    log(
+                        f"[hybrid] curl SA try[{ai + 1}] {act[:20]}... "
+                        f"castle_len={len(str(castle2 or ''))}"
+                    )
+                    try:
+                        jar3 = dict(browser.export_cookies() or {})
+                        for stale in ("sso", "sso-rw"):
+                            jar3.pop(stale, None)
+                        sess.set_cookies(jar3)
+                    except Exception:
+                        pass
+                    try:
+                        r3 = client.create_user_via_server_action(
+                            email=email,
+                            code=clean,
+                            given_name=given,
+                            family_name=family,
+                            password=prof_password,
+                            turnstile_token=turnstile,
+                            castle_token=castle2,
+                            next_action=act,
+                            conversion_id=str(uuid.uuid4()),
+                        )
+                    except Exception as se:
+                        log(f"[hybrid] curl SA err: {se}")
+                        continue
+                    sso = r3.get("sso") or ""
+                    if not sso:
+                        ck = r3.get("cookies") or {}
+                        sso = ck.get("sso") or ck.get("sso-rw") or ""
+                    body_txt = str(r3.get("text") or "")
+                    st = int(r3.get("status") or 0)
+                    if sso:
+                        break
+                    if st == 404 or "Server action not found" in body_txt:
+                        log("[hybrid] curl SA 404 → next")
+                        continue
+                    log(f"[hybrid] curl SA no-sso status={st} body={body_txt[:120]!r}")
+                    if ai >= 1:
+                        break
 
             log(
                 f"[hybrid] sign-up status={r3.get('status')} sso_len={len(sso)} "
-                f"elapsed={time.time() - t0:.1f}s"
+                f"action={(used_action or '')[:16]} elapsed={time.time() - t0:.1f}s"
             )
             if not sso:
                 return {

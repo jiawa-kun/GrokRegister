@@ -328,6 +328,12 @@ def _run_sso_push_g2(
                 mark_success(job_id)
             except Exception:
                 pass
+        try:
+            from delivery_store import mark_accounts_pushed_g2a
+
+            mark_accounts_pushed_g2a(email=email or "", sso=sso or "")
+        except Exception:
+            pass
         return {"attempted": True, "ok": True, "mode": up.get("mode"), "result": up}
     except Exception as e:
         log(f"[auth-queue] ✘ SSO→grok2api 失败: {e}")
@@ -747,6 +753,12 @@ def _run_mint_and_auth_push(
                             mark_success(cpa_job_id)
                         except Exception:
                             pass
+                    try:
+                        from delivery_store import stamp_auth_file_push_flags
+
+                        stamp_auth_file_push_flags(paths, pushed_cpa=True)
+                    except Exception:
+                        pass
                 elif remote and not remote.get("ok"):
                     log(f"[auth-queue] ✘ Auth→CPA 推送失败: {remote.get('error')}")
                     try:

@@ -13,7 +13,8 @@ import {
   type PoolMode,
   type RegisterMode,
   DEFAULT_SETTINGS,
-  enforceProxyModeMutex
+  enforceProxyModeMutex,
+  normalizeRegisterPlanOrder
 } from '@shared/settings';
 import {
   isEncryptedSecret,
@@ -628,6 +629,9 @@ function merge(partial: unknown): AppSettings {
       const mode = asRegisterMode(pAny.registerMode, DEFAULT_SETTINGS.registerMode);
       return mode === 'hybrid' ? true : DEFAULT_SETTINGS.registerPlanCEnabled;
     })(),
+    registerPlanOrder: normalizeRegisterPlanOrder(
+      (p as AppSettings & { registerPlanOrder?: unknown }).registerPlanOrder
+    ),
     registerMode: asRegisterMode(
       (p as AppSettings).registerMode,
       // 若仅写了 plan C 开关，同步兼容字段

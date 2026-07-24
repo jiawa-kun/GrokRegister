@@ -638,7 +638,10 @@ async function attachTagsToRecords(records: AccountRecord[]): Promise<AccountRec
         zdrStatus: zdr.zdrStatus,
         ssoG2Status: push.ssoG2Status,
         ssoG2At: push.ssoG2At || null,
-        ssoG2Error: push.ssoG2Error || null
+        ssoG2Error: push.ssoG2Error || null,
+        // beta UI 用 pushedG2a；与 account_tags 推送状态对齐
+        pushedG2a: a.pushedG2a === true || push.ssoG2Status === 'ok' ? true : a.pushedG2a,
+        pushedG2aAt: a.pushedG2aAt || push.ssoG2At || null
       } as AccountRecord;
     });
   } catch {
@@ -1543,3 +1546,30 @@ export async function applyAccountSsoChecks(
     return { updated, emailsFilled };
   });
 }
+
+
+/** 标记号池账号已成功推送 G2A（按 id 或 email） */
+export async function markAccountsPushedG2a(input: {
+  ids?: string[];
+  emails?: string[];
+}): Promise<number> {
+  const idSet = new Set((input.ids || []).map((x) => String(x || '').trim()).filter(Boolean));
+  const emailSet = new Set(
+    (input.emails || []).map((x) => String(x || '').trim().toLowerCase()).filter(Boolean)
+  );
+  if (idSet.size === 0 && emailSet.size === 0) return 0;
+  const all = await readAll();
+  const now = new Date().toISOString();
+  let n = 0;
+  const next = all.map((a) => {
+    const hit =
+      (a.id && idSet.has(a.id)) ||
+      (a.email && emailSet.has(String(a.email).trim().toLowerCase()));
+    if (!hit || a.pushedG2a === true) return a;
+    n++;
+    return { ...a, pushedG2a: true, pushedG2aAt: now };
+  });
+  if (n > 0) await writeAll(next);
+  return n;
+}
+

@@ -20,7 +20,11 @@ import { useRunStore } from '@renderer/store/runStore';
 import { useSettingsStore } from '@renderer/store/settingsStore';
 import { useToastStore } from '@renderer/store/toastStore';
 import { cn } from '@renderer/lib/cn';
-import type { AppSettings, CpaMintMode } from '@shared/settings';
+import type { AppSettings, CpaMintMode, RegisterPlanId } from '@shared/settings';
+import {
+  normalizeRegisterPlanOrder
+} from '@shared/settings';
+import { RegisterPlanOrderControl } from '@renderer/components/domain/RegisterPlanOrderControl';
 import type { RunPerfSummary } from '@shared/ipc';
 import {
   FAIL_STAGE_LABELS,
@@ -289,6 +293,7 @@ function RuntimeSettingsInline() {
   const planB = draft.registerPlanBEnabled !== false;
   const planC =
     draft.registerPlanCEnabled === true || draft.registerMode === 'hybrid';
+  const planOrder = normalizeRegisterPlanOrder(draft.registerPlanOrder);
 
   const mintMode: CpaMintMode =
     draft.cpaMintMode === 'device' || draft.cpaMintMode === 'double'
@@ -300,6 +305,7 @@ function RuntimeSettingsInline() {
     Math.max(1, Math.floor(Number(draft.maxParallelWorkers) || 3))
   );
 
+  const orderKey = (o: unknown) => normalizeRegisterPlanOrder(o).join('>');
   const dirty =
     !!data &&
     (data.runCount !== draft.runCount ||
@@ -308,13 +314,14 @@ function RuntimeSettingsInline() {
       (data.registerPlanAEnabled !== false) !== planA ||
       (data.registerPlanBEnabled !== false) !== planB ||
       (data.registerPlanCEnabled === true || data.registerMode === 'hybrid') !== planC ||
+      orderKey(data.registerPlanOrder) !== orderKey(draft.registerPlanOrder) ||
       (data.cpaMintMode || 'pkce') !== (draft.cpaMintMode || 'pkce'));
 
   const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) =>
     setDraft({ ...draft, [key]: value });
 
   /** 注册方案 A/B/C 可多选共存；至少保留一个开启 */
-  const togglePlan = (which: 'A' | 'B' | 'C') => {
+  const togglePlan = (which: RegisterPlanId) => {
     let nextA = planA;
     let nextB = planB;
     let nextC = planC;
@@ -332,7 +339,15 @@ function RuntimeSettingsInline() {
       registerPlanAEnabled: nextA,
       registerPlanBEnabled: nextB,
       registerPlanCEnabled: nextC,
+      registerPlanOrder: planOrder,
       registerMode: nextC ? 'hybrid' : 'browser'
+    });
+  };
+
+  const setPlanOrder = (next: RegisterPlanId[]) => {
+    setDraft({
+      ...draft,
+      registerPlanOrder: normalizeRegisterPlanOrder(next)
     });
   };
 
@@ -355,6 +370,7 @@ function RuntimeSettingsInline() {
         registerPlanAEnabled: draft.registerPlanAEnabled !== false,
         registerPlanBEnabled: draft.registerPlanBEnabled !== false,
         registerPlanCEnabled: planC,
+        registerPlanOrder: normalizeRegisterPlanOrder(draft.registerPlanOrder),
         registerMode: planC ? ('hybrid' as const) : ('browser' as const),
         cpaMintMode: mintMode
       };
@@ -379,7 +395,8 @@ function RuntimeSettingsInline() {
     'bg-transparent text-muted-foreground hover:bg-card/70 hover:text-foreground';
 
   const planSummary =
-    [planA ? 'A' : '', planB ? 'B' : '', planC ? 'C' : ''].filter(Boolean).join('/') || '—';
+    planOrder.filter((p) => (p === 'A' ? planA : p === 'B' ? planB : planC)).join('>') ||
+    '—';
   const mintSummary =
     mintMode === 'device' ? 'Mint B' : mintMode === 'double' ? 'Mint C' : 'Mint A';
 
@@ -454,36 +471,15 @@ function RuntimeSettingsInline() {
         <div className="rounded-xl border border-border/60 bg-muted/50 p-3">
           <div className="mb-2 flex items-center justify-between gap-2">
             <div className="field-label mb-0">注册方案</div>
-            <span className="text-[10px] font-medium text-muted-foreground">可多选</span>
+            <span className="text-[10px] font-medium text-muted-foreground">可多选 · 可拖序</span>
           </div>
-          <div
-            className={segTrack}
-            role="group"
-            aria-label="注册方案 A B C 可多选"
-            title="A/B/C 可同时开启（与配置页同步）"
-          >
-            {(
-              [
-                { k: 'A' as const, on: planA, label: 'A', tip: '浏览器主流程' },
-                { k: 'B' as const, on: planB, label: 'B', tip: '拟人兜底' },
-                { k: 'C' as const, on: planC, label: 'C', tip: 'Hybrid 协议' }
-              ] as const
-            ).map((item) => (
-              <button
-                key={item.k}
-                type="button"
-                aria-pressed={item.on}
-                title={`${item.label} · ${item.tip}${item.on ? '（开）' : '（关）'}`}
-                onClick={() => togglePlan(item.k)}
-                className={cn(segBtn, item.on ? segOn : segOff)}
-              >
-                {item.label}
-              </button>
-            ))}
-          </div>
-          <p className="mt-2 text-[10px] leading-snug text-muted-foreground">
-            A 浏览器 · B 拟人 · C Hybrid · 至少开一个
-          </p>
+          <RegisterPlanOrderControl
+            layout="horizontal"
+            order={planOrder}
+            enabled={{ A: planA, B: planB, C: planC }}
+            onOrderChange={setPlanOrder}
+            onToggle={togglePlan}
+          />
         </div>
         <div className="rounded-xl border border-border/60 bg-muted/50 p-3">
           <div className="mb-2 flex items-center justify-between gap-2">

@@ -70,44 +70,92 @@ class AuthManagementClient:
             "html_len": len(html),
         }
 
-    def discover_next_action_from_html(self, html: str, timeout: int = 30) -> str:
-        """Scan Next.js chunks for createServerReference(hash) of sign-up submit only."""
+    def discover_next_action_candidates_from_html(
+        self, html: str, timeout: int = 30
+    ) -> list[str]:
+        """Scan Next.js chunks for sign-up Server Action ids (ordered, de-duped).
+
+        Prefer createServerReference bound to signup-related names; fall back to
+        hashes co-located with emailValidationCode / createUserAndSessionRequest.
+        """
         chunks = re.findall(r"/_next/static/chunks/[^\"']+\.js", html or "")
-        # Must contain signup submit markers — avoid picking unrelated server actions.
-        must_any = ("emailValidationCode", "createUserAndSessionRequest", "castleRequestToken")
-        best = ""
+        # Prefer app/page chunks first; cap count to avoid multi-minute hangs
+        def _score(path: str) -> int:
+            p = path.lower()
+            sc = 0
+            for kw, w in (
+                ("sign", 5),
+                ("auth", 4),
+                ("app", 3),
+                ("page", 2),
+                ("main", 1),
+            ):
+                if kw in p:
+                    sc += w
+            return -sc
+
+        chunks = sorted(list(dict.fromkeys(chunks)), key=_score)[:18]
+        must_any = (
+            "emailValidationCode",
+            "createUserAndSessionRequest",
+            "castleRequestToken",
+        )
+        name_ok = re.compile(
+            r"createUser|CreateUser|signUp|SignUp|emailValidation|submitSign|default",
+            re.I,
+        )
+        strong: list[str] = []
+        weak: list[str] = []
+        # Named: createServerReference("hash", callServer, ..., "fnName")
+        named_re = re.compile(
+            r'createServerReference\)\("([a-f0-9]{40,})"[^)]{0,240},"([A-Za-z0-9_]+)"\)',
+            re.I,
+        )
+        plain_re = re.compile(
+            r"createServerReference\)?\([\'\"]([a-f0-9]{40,})[\'\"]",
+            re.I,
+        )
+        per_chunk_to = max(4, min(10, int(timeout or 30) // 3))
         for c in chunks:
             url = c if c.startswith("http") else ("https://accounts.x.ai" + c)
             try:
-                r = self.session.get(url, timeout=min(20, timeout))
+                r = self.session.get(url, timeout=per_chunk_to)
                 text = (r.text or "") if r is not None else ""
             except Exception:
                 continue
             if not text or not any(k in text for k in must_any):
                 continue
-            # Prefer createServerReference in the same chunk as signup payload fields.
-            m = re.search(
-                r"createServerReference\)?\([\'\"]([a-f0-9]{40,})[\'\"]",
-                text,
-            )
-            if m:
-                return m.group(1)
-            # Hash near emailValidationCode / createUserAndSessionRequest
+            for m in named_re.finditer(text):
+                hid, name = m.group(1), m.group(2)
+                if name_ok.search(name):
+                    strong.append(hid)
+                else:
+                    weak.append(hid)
+            for m in plain_re.finditer(text):
+                weak.append(m.group(1))
             for key in ("emailValidationCode", "createUserAndSessionRequest"):
                 idx = text.find(key)
                 if idx < 0:
                     continue
-                window = text[max(0, idx - 400) : idx + 400]
-                m2 = re.search(
-                    r"createServerReference\)?\([\'\"]([a-f0-9]{40,})[\'\"]",
-                    window,
-                )
-                if m2:
-                    return m2.group(1)
-                m3 = re.search(r"[\'\"]([a-f0-9]{40,64})[\'\"]", window)
-                if m3 and not best:
-                    best = m3.group(1)
-        return best
+                window = text[max(0, idx - 500) : idx + 500]
+                for m2 in plain_re.finditer(window):
+                    strong.append(m2.group(1))
+                for m3 in re.finditer(r"[\'\"]([a-f0-9]{40,64})[\'\"]", window):
+                    weak.append(m3.group(1))
+        out: list[str] = []
+        seen: set[str] = set()
+        for hid in strong + weak:
+            h = str(hid or "").strip()
+            if len(h) < 40 or h in seen:
+                continue
+            seen.add(h)
+            out.append(h)
+        return out
+
+    def discover_next_action_from_html(self, html: str, timeout: int = 30) -> str:
+        """Scan Next.js chunks for createServerReference(hash) of sign-up submit only."""
+        cands = self.discover_next_action_candidates_from_html(html, timeout=timeout)
+        return cands[0] if cands else ""
 
     def discover_next_action(self, timeout: int = 45) -> str:
         """Bootstrap page + chunk scan; caches on self.next_action."""
@@ -115,6 +163,19 @@ class AuthManagementClient:
             return self.next_action
         info = self.bootstrap_and_discover_action(timeout=timeout)
         return str(info.get("next_action") or self.next_action or "")
+
+    def discover_next_action_candidates(self, timeout: int = 45) -> list[str]:
+        """Fresh bootstrap + multi-candidate discovery (does not rely on cache alone)."""
+        r = self.session.bootstrap(timeout=timeout)
+        html = ""
+        try:
+            html = r.text or ""
+        except Exception:
+            html = ""
+        cands = self.discover_next_action_candidates_from_html(html, timeout=timeout)
+        if cands and not self.next_action:
+            self.next_action = cands[0]
+        return cands
 
     def create_email_validation_code(self, email: str, castle_token: str, timeout: int = 30):
         body = encode_create_email_validation_code(email, castle_token)
@@ -167,7 +228,9 @@ class AuthManagementClient:
         headers = {
             "content-type": "text/plain;charset=UTF-8",
             "accept": "text/x-component",
+            # both casings — Next accepts either; some edges only check one
             "next-action": action,
+            "Next-Action": action,
             "next-router-state-tree": tree,
             "origin": "https://accounts.x.ai",
             "referer": SIGNUP_URL,

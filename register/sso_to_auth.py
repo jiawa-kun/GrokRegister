@@ -203,6 +203,115 @@ def _gen_pkce() -> tuple[str, str, str, str]:
     return verifier, challenge, state, nonce
 
 
+def _consent_via_form_post(
+    session: Any,
+    *,
+    page_html: str,
+    consent_url: str,
+    client_id: str,
+    redirect_uri: str,
+    scope: str,
+    state: str,
+    code_challenge: str,
+    code_challenge_method: str,
+    nonce: str,
+    referrer: str,
+    log=print,
+) -> str | None:
+    """accounts.x.ai consent 页 form → POST auth.x.ai/oauth2/authorize (action=allow)。
+
+    2026-07 前端：Server Action submitOAuth2Consent 常 404；HTML 表单仍可用。
+    返回 authorization code 或 None。
+    """
+    html = str(page_html or "")
+    if len(html) < 400 or "<form" not in html.lower():
+        try:
+            r0 = session.get(
+                consent_url, impersonate="chrome", timeout=15, allow_redirects=True
+            )
+            html = str(getattr(r0, "text", None) or "") or html
+            if str(getattr(r0, "url", "") or ""):
+                consent_url = str(r0.url)
+        except Exception as e:
+            log(f"  ⚠ form fallback re-GET consent: {e}")
+
+    form_m = re.search(r"<form[\s\S]*?</form>", html, re.I)
+    data: dict[str, str] = {}
+    action_url = f"{OIDC_ISSUER}/oauth2/authorize"
+    if form_m:
+        form = form_m.group(0)
+        am = re.search(r'action=["\']([^"\']+)', form, re.I)
+        if am:
+            action_url = am.group(1)
+        for inp in re.findall(r"<input[^>]*>", form, re.I):
+            nm = re.search(r'name=["\']([^"\']+)', inp, re.I)
+            vm = re.search(r'value=["\']([^"\']*)', inp, re.I)
+            if nm:
+                data[nm.group(1)] = vm.group(1) if vm else ""
+    # 表单缺字段时用 PKCE 会话参数补齐
+    data.setdefault("client_id", client_id)
+    data.setdefault("redirect_uri", redirect_uri)
+    data.setdefault("scope", scope)
+    data.setdefault("state", state)
+    data.setdefault("code_challenge", code_challenge)
+    data.setdefault("code_challenge_method", code_challenge_method)
+    data.setdefault("nonce", nonce)
+    data.setdefault("principal_type", "User")
+    data.setdefault("principal_id", "")
+    if referrer:
+        data["referrer"] = referrer
+    # JS 点击 Allow 会写入 action=allow；纯 HTML 无该字段时需显式补
+    data["action"] = "allow"
+
+    try:
+        ar = session.post(
+            action_url,
+            data=data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://accounts.x.ai",
+                "Referer": consent_url,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            impersonate="chrome",
+            timeout=20,
+            allow_redirects=False,
+        )
+    except Exception as e:
+        log(f"  ❌ form consent POST 异常: {e}")
+        return None
+
+    loc = ""
+    try:
+        loc = str(ar.headers.get("location") or ar.headers.get("Location") or "")
+    except Exception:
+        loc = ""
+    log(
+        f"  🔑 form consent status={getattr(ar, 'status_code', '?')} "
+        f"loc={(loc or str(getattr(ar, 'url', '') or ''))[:140]}"
+    )
+    if "error=" in loc:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+        err = (qs.get("error") or [""])[0]
+        desc = (qs.get("error_description") or [""])[0]
+        log(f"  ❌ form consent oauth error={err} {desc}")
+        return None
+    code = None
+    if "code=" in loc:
+        code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query).get("code", [None])[0]
+    if not code and "code=" in str(getattr(ar, "url", "") or ""):
+        code = urllib.parse.parse_qs(
+            urllib.parse.urlparse(str(ar.url)).query
+        ).get("code", [None])[0]
+    if not code:
+        code = _parse_consent_code(str(getattr(ar, "text", None) or ""))
+    if code:
+        log(f"  ✅ form consent code len={len(code)}")
+    else:
+        log(f"  ❌ form consent 无 code body={(str(getattr(ar, 'text', None) or ''))[:160]}")
+    return code
+
+
 def _parse_consent_code(body: str) -> str | None:
     """从 consent 提交的 text/x-component 响应里解析出 authorization code。"""
     text = body or ""
@@ -1526,8 +1635,10 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
                 cand_i = 0
                 action_id = candidates[0] if candidates else ""
                 if not action_id:
-                    log("  ❌ consent next-action 未发现（避免用已知 404 id）")
-                    return None
+                    log(
+                        "  ⚠ consent next-action 未发现 → 改走 form POST fallback"
+                    )
+                    break
                 log(
                     f"  🔑 refresh candidates={len(candidates)} "
                     f"first={action_id[:16]}…"
@@ -1638,34 +1749,63 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
             if r is not None and not _is_action_not_found(r):
                 break
 
-        if r is None:
-            log(f"  ❌ consent 无响应: {last_err_body or 'no response'}")
-            return None
+        if r is None or _is_action_not_found(r):
+            # 2026-07：accounts.x.ai consent 页改为 form POST → auth.x.ai/oauth2/authorize
+            # （localhost 回调走 Server Action；action id 常与服务端脱节 404）
+            # 回退：解析 consent HTML 表单字段 + action=allow 直 POST
+            log("  🔑 consent Server Action 失败 → form POST fallback (auth.x.ai/oauth2/authorize)…")
+            form_code = _consent_via_form_post(
+                s,
+                page_html=page_html,
+                consent_url=final_url,
+                client_id=CLIENT_ID,
+                redirect_uri=REDIRECT_URI,
+                scope=SCOPES,
+                state=state,
+                code_challenge=challenge,
+                code_challenge_method="S256",
+                nonce=nonce,
+                referrer=GROK_REFERRER,
+                log=log,
+            )
+            if form_code:
+                code = form_code
+                r = None  # skip status checks below
+            else:
+                log(f"  ❌ consent 无响应: {last_err_body or 'no response'}")
+                return None
+        else:
+            code = None
     except Exception as e:
         log(f"  ❌ consent 异常: {e}")
         return None
-    if r.status_code < 200 or r.status_code >= 300:
-        log(f"  ❌ consent HTTP {r.status_code}: {str(r.text)[:200]}")
-        return None
-    # 成功后缓存 action id（且不得在黑名单中）
-    if action_id and action_id not in _BAD_NEXT_ACTION_IDS:
-        _CACHED_NEXT_ACTION_ID = action_id
-    code = _parse_consent_code(str(r.text))
+
+    if r is not None:
+        if r.status_code < 200 or r.status_code >= 300:
+            log(f"  ❌ consent HTTP {r.status_code}: {str(r.text)[:200]}")
+            return None
+        # 成功后缓存 action id（且不得在黑名单中）
+        if action_id and action_id not in _BAD_NEXT_ACTION_IDS:
+            _CACHED_NEXT_ACTION_ID = action_id
+        code = _parse_consent_code(str(r.text))
+        if not code:
+            # 重定向 Location 里带 code
+            loc = ""
+            try:
+                loc = str(r.headers.get("location") or r.headers.get("Location") or "")
+            except Exception:
+                pass
+            if "code=" in loc:
+                code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query).get("code", [None])[0]
+            if not code and "code=" in str(r.url):
+                code = urllib.parse.parse_qs(urllib.parse.urlparse(str(r.url)).query).get(
+                    "code", [None]
+                )[0]
+        if not code:
+            log(f"  ❌ consent 未返回 code: {str(r.text)[:200]}")
+            return None
     if not code:
-        # 重定向 Location 里带 code
-        loc = ""
-        try:
-            loc = str(r.headers.get("location") or r.headers.get("Location") or "")
-        except Exception:
-            pass
-        if "code=" in loc:
-            code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query).get("code", [None])[0]
-        if not code and "code=" in str(r.url):
-            code = urllib.parse.parse_qs(urllib.parse.urlparse(str(r.url)).query).get(
-                "code", [None]
-            )[0]
-    if not code:
-        log(f"  ❌ consent 未返回 code: {str(r.text)[:200]}")
+        log("  ❌ consent 未返回 code")
         return None
     log("  ✅ 授权确认")
 
@@ -2072,9 +2212,21 @@ def load_sso_list(path: str | None, single: str | None) -> list[str]:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+        # 支持：纯 jwt / email----sso / email | password | sso
         if "----" in line:
             parts = line.split("----")
             line = parts[-1].strip()
+        elif "|" in line:
+            parts = [p.strip() for p in line.split("|")]
+            # 取最后一段像 JWT 的字段
+            for p in reversed(parts):
+                if p.count(".") >= 2 and len(p) > 40:
+                    line = p
+                    break
+            else:
+                line = parts[-1]
+        if line.lower().startswith("sso="):
+            line = line[4:].strip()
         out.append(line)
     return out
 

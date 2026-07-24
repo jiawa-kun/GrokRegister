@@ -31,13 +31,16 @@ import type {
   CpaMintMode,
   MailProvider,
   PoolMode,
-  RegisterMode
+  RegisterMode,
+  RegisterPlanId
 } from '@shared/settings';
 import {
   DEFAULT_SETTINGS,
   enforceProxyModeMutex,
+  normalizeRegisterPlanOrder,
   validateSettings
 } from '@shared/settings';
+import { RegisterPlanOrderControl } from '@renderer/components/domain/RegisterPlanOrderControl';
 import type { AutoTaskStatus, SingBoxLogResult, SingBoxStatus } from '@shared/ipc';
 import { cn } from '@renderer/lib/cn';
 
@@ -1248,17 +1251,17 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
           title="注册方案"
           right={<CardHeaderIcon icon={Layers} title="注册方案" />}
           description={(() => {
-            const plans: string[] = [];
-            if (draft.registerPlanAEnabled !== false) plans.push('A');
-            if (draft.registerPlanBEnabled !== false) plans.push('B');
-            if (
-              draft.registerPlanCEnabled === true ||
-              draft.registerMode === 'hybrid'
-            ) {
-              plans.push('C');
-            }
+            const order = normalizeRegisterPlanOrder(draft.registerPlanOrder);
+            const enabled: Record<RegisterPlanId, boolean> = {
+              A: draft.registerPlanAEnabled !== false,
+              B: draft.registerPlanBEnabled !== false,
+              C:
+                draft.registerPlanCEnabled === true ||
+                draft.registerMode === 'hybrid'
+            };
+            const plans = order.filter((p) => enabled[p]);
             const planText = plans.length
-              ? `Plan ${plans.join(' · ')}`
+              ? `顺序 ${plans.join(' > ')}`
               : '未启用方案';
             const fp = draft.randomFingerprint ? '随机指纹' : '固定指纹';
             const wait = draft.turnstileAutoWaitMax ?? 60;
@@ -1294,34 +1297,55 @@ export function SettingsForm({ focusSection }: { focusSection?: string | null })
             checked={draft.randomFingerprint}
             onChange={(v) => update('randomFingerprint', v)}
           />
-          <ToggleRow
-            label="Plan A · 浏览器主流程"
-            hint="临时邮 + Drission 填表 + Turnstile（约 1～3 分钟）"
-            checked={draft.registerPlanAEnabled !== false}
-            onChange={(v) => {
-              update('registerPlanAEnabled', v);
-            }}
-          />
-          <ToggleRow
-            label="Plan B · 拟人兜底"
-            hint="重启浏览器、更长延迟、等 Turnstile 自然成功、模拟点击；CF 拦截则放弃（约 2～5 分钟）"
-            checked={draft.registerPlanBEnabled !== false}
-            onChange={(v) => update('registerPlanBEnabled', v)}
-          />
-          <ToggleRow
-            label="Plan C · Hybrid 协议"
-            hint="短浏览器采 token + 协议注册（约 1～2 分钟）"
-            checked={
-              draft.registerPlanCEnabled === true ||
-              draft.registerMode === 'hybrid'
-            }
-            onChange={(v) => {
-              patch({
-                registerPlanCEnabled: v,
-                registerMode: v ? 'hybrid' : 'browser'
-              });
-            }}
-          />
+          <div className="rounded-xl border border-border/60 bg-card/40 p-3">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="field-label mb-0">方案开关与顺序</div>
+              <span className="text-[10px] font-medium text-muted-foreground">
+                上下拖动 · 与首页同步
+              </span>
+            </div>
+            <RegisterPlanOrderControl
+              layout="vertical"
+              order={normalizeRegisterPlanOrder(draft.registerPlanOrder)}
+              enabled={{
+                A: draft.registerPlanAEnabled !== false,
+                B: draft.registerPlanBEnabled !== false,
+                C:
+                  draft.registerPlanCEnabled === true ||
+                  draft.registerMode === 'hybrid'
+              }}
+              onOrderChange={(next) =>
+                update('registerPlanOrder', normalizeRegisterPlanOrder(next))
+              }
+              onToggle={(which) => {
+                const planA = draft.registerPlanAEnabled !== false;
+                const planB = draft.registerPlanBEnabled !== false;
+                const planC =
+                  draft.registerPlanCEnabled === true ||
+                  draft.registerMode === 'hybrid';
+                let nextA = planA;
+                let nextB = planB;
+                let nextC = planC;
+                if (which === 'A') nextA = !planA;
+                if (which === 'B') nextB = !planB;
+                if (which === 'C') nextC = !planC;
+                if (!nextA && !nextB && !nextC) {
+                  if (which === 'A') nextA = true;
+                  if (which === 'B') nextB = true;
+                  if (which === 'C') nextC = true;
+                }
+                patch({
+                  registerPlanAEnabled: nextA,
+                  registerPlanBEnabled: nextB,
+                  registerPlanCEnabled: nextC,
+                  registerPlanOrder: normalizeRegisterPlanOrder(
+                    draft.registerPlanOrder
+                  ),
+                  registerMode: nextC ? 'hybrid' : 'browser'
+                });
+              }}
+            />
+          </div>
           <div className="space-y-0 rounded-xl border border-border/60 bg-muted/40">
             <div className="flex items-center gap-2 px-3 py-2.5">
               <button

@@ -64,6 +64,9 @@ export interface AccountRecord {
   createdAt: string;
   /** 最近一次 SSO 验活结果（可选，服务端持久化） */
   ssoCheck?: AccountSsoCheck;
+  /** 已成功推送到 grok2api（G2A）时为 true；未推送不展示 tag */
+  pushedG2a?: boolean;
+  pushedG2aAt?: string;
   /** NSFW 侧车：true 已开 / false 失败 / null 未尝试 */
   nsfwEnabled?: boolean | null;
   nsfwAttempted?: boolean;

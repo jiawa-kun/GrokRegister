@@ -381,7 +381,7 @@ export function writeConfigForPython(
   config.cpa_auto_add =
     settings.autoAuthExport === undefined ? true : !!settings.autoAuthExport;
 
-  // 注册方案 Plan A/B/C：可单独开关；全开则 A→B→C 顺序兜底
+  // 注册方案 Plan A/B/C：可单独开关；顺序由 registerPlanOrder 决定
   const planA =
     (settings as { registerPlanAEnabled?: boolean }).registerPlanAEnabled !== false;
   const planB = settings.registerPlanBEnabled !== false;
@@ -395,6 +395,22 @@ export function writeConfigForPython(
   config.register_plan_c_enabled = planC;
   // 兼容旧字段：register_mode=hybrid 当 C 开
   config.register_mode = planC ? 'hybrid' : 'browser';
+  // 执行顺序：["C","A","B"] 等；缺省 A→B→C
+  {
+    const rawOrder = (settings as { registerPlanOrder?: unknown }).registerPlanOrder;
+    const order: string[] = [];
+    const src = Array.isArray(rawOrder) ? rawOrder : [];
+    for (const x of src) {
+      const u = String(x || '')
+        .trim()
+        .toUpperCase();
+      if ((u === 'A' || u === 'B' || u === 'C') && !order.includes(u)) order.push(u);
+    }
+    for (const p of ['A', 'B', 'C']) {
+      if (!order.includes(p)) order.push(p);
+    }
+    config.register_plan_order = order;
+  }
 
   // SSO→CPA mint：pkce | device | double（双通道两份 auth）
   const mintMode = String(
@@ -467,6 +483,7 @@ export function writeConfigForPython(
         `planA=${config.register_plan_a_enabled !== false} ` +
         `planB=${config.register_plan_b_enabled !== false} ` +
         `planC=${!!config.register_plan_c_enabled} ` +
+        `planOrder=${Array.isArray(config.register_plan_order) ? (config.register_plan_order as string[]).join('>') : 'A>B>C'} ` +
         `cpa_mint_mode=${config.cpa_mint_mode || 'pkce'} ` +
         `cpa_remote=${config.cpa_remote_url ? 'set' : 'off'}`
     );

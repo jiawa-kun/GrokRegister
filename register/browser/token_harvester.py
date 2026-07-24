@@ -6,6 +6,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Optional
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -25,8 +26,16 @@ class HarvestedTokens:
 class BrowserTokenSession:
     """One Chromium session dedicated to token / cookie harvest."""
 
-    def __init__(self, log: Optional[Callable[[str], None]] = None):
+    def __init__(
+        self,
+        log: Optional[Callable[[str], None]] = None,
+        *,
+        reuse: bool = False,
+        keep_alive: bool = False,
+    ):
         self.log = log or (lambda _m: None)
+        self.reuse = bool(reuse)
+        self.keep_alive = bool(keep_alive)
         self._started = False
         self._hooked = False
         self._listen_started = False
@@ -38,8 +47,16 @@ class BrowserTokenSession:
             pass
 
     def start(self):
-        from grok_register_ttk import start_browser
+        from grok_register_ttk import start_browser, _get_page
 
+        if self.reuse:
+            try:
+                if _get_page() is not None:
+                    self._lg("[*] BrowserTokenSession reuse existing browser")
+                    self._started = True
+                    return self
+            except Exception:
+                pass
         start_browser(log_callback=self.log)
         self._started = True
         return self
@@ -150,22 +167,77 @@ class BrowserTokenSession:
     } catch (e) {}
   }
 
+  function patchSignupServerActionBody(bodyStr) {
+    // Ensure createUser SA carries conversionId + long IBYIll castle.
+    try {
+      if (!bodyStr || typeof bodyStr !== 'string') return null;
+      if (bodyStr.indexOf('createUserAndSessionRequest') < 0
+          && bodyStr.indexOf('emailValidationCode') < 0) return null;
+      const j = JSON.parse(bodyStr);
+      if (!Array.isArray(j) || !j[0] || typeof j[0] !== 'object') return null;
+      const row = j[0];
+      const bestCastle = (function() {
+        let c = String(window.__hybrid_castle || '');
+        try {
+          for (const t of (window.__hybrid_castles || [])) {
+            if (String(t || '').length > c.length) c = String(t);
+          }
+        } catch (e0) {}
+        return c;
+      })();
+      const prev = String(row.castleRequestToken || '');
+      let changed = false;
+      if (bestCastle.indexOf('IBYIll|') === 0 && bestCastle.length >= 1000) {
+        if (prev.length < 1000 || prev.indexOf('IBYIll|') !== 0) {
+          row.castleRequestToken = bestCastle;
+          changed = true;
+        }
+      }
+      if (!row.conversionId) {
+        row.conversionId = String(window.__hybrid_conversion_id || '')
+          || (crypto.randomUUID ? crypto.randomUUID() : (Date.now() + '-' + Math.random()));
+        changed = true;
+      }
+      window.__hybrid_create_user_meta = {
+        prevCastle: prev.length,
+        castle: String(row.castleRequestToken || '').length,
+        conv: String(row.conversionId || '').slice(0, 8),
+        patched: changed,
+      };
+      return changed ? JSON.stringify(j) : null;
+    } catch (e) {
+      window.__hybrid_create_user_meta = { err: String(e) };
+      return null;
+    }
+  }
+
   const ofetch = window.fetch;
   window.fetch = async function(input, init) {
     let url = '';
+    let args = arguments;
     try {
       url = (typeof input === 'string')
         ? input
         : (input && (input.url || (input.href || ''))) || '';
-      const body = (init && init.body != null)
+      let body = (init && init.body != null)
         ? init.body
         : (typeof Request !== 'undefined' && input instanceof Request ? input : null);
+      // Patch React Server Action CreateUser body before it leaves the page
+      if (init && typeof init.body === 'string'
+          && (String(url).includes('sign-up') || String(url).includes('accounts.x.ai'))) {
+        const patched = patchSignupServerActionBody(init.body);
+        if (patched) {
+          init = Object.assign({}, init, { body: patched });
+          body = patched;
+          args = [input, init];
+        }
+      }
       if (body != null) captureBody(body, url);
       else if (typeof Request !== 'undefined' && input instanceof Request) {
         try { captureBody(await input.clone().text(), url); } catch (e) {}
       }
     } catch (e) {}
-    const resp = await ofetch.apply(this, arguments);
+    const resp = await ofetch.apply(this, args.length ? args : arguments);
     try {
       if (String(url).includes('CreateEmailValidationCode')) {
         window.__hybrid_create_email_status = resp.status || 0;
@@ -462,6 +534,21 @@ class BrowserTokenSession:
                                 plen = len(str(post))
                         except Exception:
                             plen = 0
+                        # Best-effort response status from listener packet
+                        resp_status = 0
+                        try:
+                            resp = getattr(pkt, "response", None)
+                            if resp is not None:
+                                for attr in ("status", "status_code", "code"):
+                                    v = getattr(resp, attr, None)
+                                    if v is not None:
+                                        try:
+                                            resp_status = int(v)
+                                            break
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            resp_status = 0
                         if plen and plen < 200 and len(best) < 200:
                             self._lg(
                                 f"[!] CDP CreateEmail postData still short len={plen} "
@@ -470,10 +557,31 @@ class BrowserTokenSession:
                         elif len(best) >= 200:
                             self._lg(
                                 f"[*] CDP CreateEmail castle recovered len={len(best)}"
+                                + (f" resp={resp_status}" if resp_status else "")
                             )
                         try:
+                            # wire=true when body carried long castle; set status if known
                             page.run_js(
-                                "window.__hybrid_create_email_seen=true; true;"
+                                """
+window.__hybrid_create_email_seen = true;
+const plen = Number(arguments[0]||0);
+const st = Number(arguments[1]||0);
+const clen = Number(arguments[2]||0);
+if (plen >= 200 || clen >= 200) {
+  window.__hybrid_create_email_wire = true;
+}
+if (st >= 200 && st < 300) {
+  window.__hybrid_create_email_status = st;
+  window.__hybrid_create_email_ok = true;
+} else if (clen >= 1000 && !window.__hybrid_create_email_status) {
+  // Request body had IBYIll; status may arrive later via fetch hook
+  window.__hybrid_create_email_wire = true;
+}
+true;
+""",
+                                plen,
+                                resp_status,
+                                len(best),
                             )
                         except Exception:
                             pass
@@ -492,6 +600,9 @@ if (t.length > 200) {
   window.__hybrid_castles = window.__hybrid_castles || [];
   window.__hybrid_castles.push(t);
   window.__hybrid_create_email_seen = true;
+  if (t.indexOf('IBYIll|') === 0 && t.length >= 1000) {
+    window.__hybrid_create_email_wire = true;
+  }
 }
 true;
 """,
@@ -503,9 +614,11 @@ true;
         return ""
 
     def create_email_sent_via_browser(self) -> bool:
-        """Strict: only skip protocol CreateEmail when browser request truly succeeded.
+        """Skip protocol CreateEmail only when browser already fired a real request.
 
-        Do NOT treat "captured castle" alone as success — that caused false skip → no mail code.
+        Explicit HTTP 200 is ideal. CDP often captures CreateEmail request body
+        (IBYIll castle) before fetch/XHR status lands — treat wire+long castle as
+        success so hybrid does not double-fire CreateEmail (raises Castle risk).
         """
         from grok_register_ttk import _get_page
 
@@ -517,7 +630,9 @@ return {
   ok: !!window.__hybrid_create_email_ok,
   status: Number(window.__hybrid_create_email_status||0),
   seen: !!window.__hybrid_create_email_seen,
-  castle: (window.__hybrid_castle||'').length
+  wire: !!window.__hybrid_create_email_wire,
+  castle: (window.__hybrid_castle||'').length,
+  head: String(window.__hybrid_castle||'').slice(0, 8)
 };
 """
             )
@@ -525,20 +640,128 @@ return {
                 ok = bool(data.get("ok"))
                 status = int(data.get("status") or 0)
                 seen = bool(data.get("seen"))
-                # Explicit success only
+                wire = bool(data.get("wire"))
+                clen = int(data.get("castle") or 0)
+                head = str(data.get("head") or "")
+                # Explicit success
                 if ok and (status == 0 or (200 <= status < 300)):
                     return True
                 if seen and status == 200:
                     return True
+                # CDP/wire: CreateEmail body carried long IBYIll → request fired
+                if (seen or wire) and clen >= 1000 and head.startswith("IBYIll"):
+                    self._lg(
+                        f"[*] CreateEmail browser wire-ok status={status} "
+                        f"seen={seen} wire={wire} castle_len={clen}"
+                    )
+                    return True
                 self._lg(
                     f"[*] CreateEmail browser status: ok={ok} status={status} "
-                    f"seen={seen} castle_len={data.get('castle')}"
+                    f"seen={seen} wire={wire} castle_len={clen}"
                 )
         except Exception as e:
             self._lg(f"[*] CreateEmail browser status probe fail: {e}")
         return False
 
+    def force_create_email_via_page(
+        self, email: str, timeout: float = 20.0, castle_token: str = ""
+    ) -> dict:
+        """In-page fetch CreateEmailValidationCode (browser cookies + TLS).
+
+        UI click often never fires RPC even after React fill; page fetch still uses
+        real document origin/cookies. Pass castle_token (IBYIll) when available.
+        """
+        from grok_register_ttk import _get_page
+        import base64
+        import time as _time
+
+        page = _get_page()
+        if page is None:
+            return {"ok": False, "error": "no-page"}
+        try:
+            from protocol.pb_codec import encode_create_email_validation_code
+        except Exception as e:
+            return {"ok": False, "error": f"codec:{e}"}
+        body = encode_create_email_validation_code(
+            str(email or "").strip(), str(castle_token or "").strip()
+        )
+        b64 = base64.b64encode(body).decode("ascii")
+        try:
+            page.run_js(
+                """
+window.__force_create_email_result = null;
+const b64 = arguments[0];
+(async () => {
+  try {
+    const raw = atob(b64);
+    const u8 = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) u8[i] = raw.charCodeAt(i);
+    const r = await fetch(
+      'https://accounts.x.ai/auth_mgmt.AuthManagement/CreateEmailValidationCode',
+      {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'content-type': 'application/grpc-web+proto',
+          'x-grpc-web': '1',
+          'x-user-agent': 'connect-es/2.1.1',
+          'accept': '*/*',
+        },
+        body: u8,
+      }
+    );
+    window.__hybrid_create_email_seen = true;
+    window.__hybrid_create_email_status = r.status;
+    window.__hybrid_create_email_ok = (r.status === 200);
+    let grpc = '';
+    try { grpc = r.headers.get('grpc-status') || r.headers.get('Grpc-Status') || ''; } catch (e) {}
+    let len = 0;
+    try {
+      const buf = await r.arrayBuffer();
+      len = buf.byteLength || 0;
+    } catch (e) {}
+    window.__force_create_email_result = {
+      ok: r.status === 200,
+      status: r.status,
+      grpc: grpc,
+      len: len,
+      via: 'page-fetch',
+    };
+  } catch (e) {
+    window.__force_create_email_result = {
+      ok: false,
+      status: 0,
+      err: String(e && e.message ? e.message : e),
+      via: 'page-fetch',
+    };
+  }
+})();
+true;
+""",
+                b64,
+            )
+        except Exception as e:
+            return {"ok": False, "error": f"run_js:{e}"}
+
+        deadline = _time.time() + max(5.0, float(timeout or 20))
+        while _time.time() < deadline:
+            try:
+                r = page.run_js("return window.__force_create_email_result;")
+            except Exception:
+                r = None
+            if isinstance(r, dict) and r.get("via") == "page-fetch":
+                self._lg(
+                    f"[*] force CreateEmail page-fetch status={r.get('status')} "
+                    f"ok={r.get('ok')} grpc={r.get('grpc')!r} len={r.get('len')} "
+                    f"err={r.get('err') or ''}"
+                )
+                return r
+            _time.sleep(0.25)
+        self._lg("[!] force CreateEmail page-fetch timeout")
+        return {"ok": False, "error": "timeout", "via": "page-fetch"}
+
     def browser_user_agent(self) -> str:
+
         from grok_register_ttk import _get_page
 
         page = _get_page()
@@ -614,10 +837,29 @@ window.__hybrid_castles = window.__hybrid_castles || [];
 window.__hybrid_castle_status = window.__hybrid_castle_status || '';
 function pushTok(t) {
   const s = String(t || '');
-  if (s.length < 40) return;
+  // Only long IBYIll counts (forum); short junk must not pollute status
+  if (s.indexOf('IBYIll|') !== 0 || s.length < 800) return;
   window.__hybrid_castle = s;
   window.__hybrid_castles.push(s);
-  window.__hybrid_castle_status = s.indexOf('IBYIll|') === 0 ? 'native-ish' : 'minted';
+  window.__hybrid_castle_status = 'native-ish';
+}
+function tryMintUnderscore() {
+  try {
+    if (typeof window._castle !== 'function') return false;
+    try { window._castle('setAppId', pk); } catch (e0) {
+      try { window._castle('configure', { pk: pk }); } catch (e1) {}
+    }
+    window.__hybrid_castle_status = 'minting:_castle';
+    Promise.resolve(window._castle('createRequestToken')).then(function (t) {
+      pushTok(t);
+    }).catch(function (e) {
+      window.__hybrid_castle_err = String(e);
+      window.__hybrid_castle_status = 'error:_castle';
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 function tryMint(api, label) {
   try {
@@ -646,8 +888,9 @@ function tryMint(api, label) {
     return false;
   }
 }
-// 1) globals
-let hit = false;
+// 1) official CDN v2 API first
+let hit = tryMintUnderscore();
+// 2) legacy globals (often absent on accounts.x.ai)
 const g = [window.Castle, window.castle, window['@castleio/castle-js']];
 for (let i = 0; i < g.length; i++) {
   if (g[i] && tryMint(g[i], 'global' + i)) hit = true;
@@ -790,24 +1033,47 @@ function isVisible(node) {
   const rect = node.getBoundingClientRect();
   return rect.width > 0 && rect.height > 0;
 }
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
-  return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-let submitButton = buttons.find((node) => {
-  const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
-  const t = text.toLowerCase();
-  return text === '注册' || text.includes('注册') || t === 'signup' || t.includes('signup') || t.includes('sign up');
-});
-if (!submitButton) {
-  submitButton = buttons.find((node) => {
-    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
-    const t = text.toLowerCase();
-    return text.includes('继续') || t.includes('continue') || t.includes('next') || node.type === 'submit';
-  });
+function btnText(node) {
+  return [
+    node.innerText, node.textContent, node.getAttribute('aria-label'), node.getAttribute('value')
+  ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
 }
-if (!submitButton) return 'no-button';
+function isSocial(t) {
+  const c = String(t || '').replace(/\s+/g, '').toLowerCase();
+  return c.includes('google') || c.includes('apple') || c.includes('github') || c.includes('microsoft')
+    || c.includes('withx') || c.includes('twitter') || c.includes('withemail') || c.includes('withe-mail');
+}
+function scoreSubmit(node) {
+  const raw = btnText(node);
+  const c = raw.replace(/\s+/g, '');
+  const t = c.toLowerCase();
+  if (isSocial(raw)) return -1;
+  if (c === '注册' || t === 'signup' || t === 'register') return 100;
+  if (c.includes('注册') && !c.includes('邮箱')) return 90;
+  if (t === 'continue' || c === '继续' || t === 'next' || c === '下一步') return 85;
+  if (node.type === 'submit') return 70;
+  if (t.includes('continue') || t.includes('next') || t.includes('submit')) return 60;
+  // exact-ish sign up only — never "sign up with …"
+  if (t === 'signup' || (t.includes('signup') && !t.includes('with'))) return 80;
+  return 0;
+}
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]'))
+  .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true');
+const ranked = buttons.map((n) => ({ n, s: scoreSubmit(n) })).filter((x) => x.s > 0).sort((a, b) => b.s - a.s);
+const submitButton = ranked.length ? ranked[0].n : null;
+if (!submitButton) {
+  const input = document.querySelector('input[type="email"], input[name="email"], input[data-testid="email"]');
+  const form = input && input.closest('form');
+  if (form) {
+    if (form.requestSubmit) form.requestSubmit();
+    else form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    return 'form-submit';
+  }
+  return 'no-button';
+}
+submitButton.focus();
 submitButton.click();
-return 'submitted';
+return 'submitted:' + btnText(submitButton).slice(0, 40);
 """
                 )
                 or ""
@@ -851,6 +1117,8 @@ window.__hybrid_net=[];
 window.__hybrid_create_email_ok=false;
 window.__hybrid_create_email_status=0;
 window.__hybrid_create_email_seen=false;
+window.__hybrid_create_email_wire=false;
+window.__hybrid_create_user_meta=null;
 true;
 """
             )
@@ -863,9 +1131,78 @@ true;
         except Exception:
             pass
 
+        # Warm Castle CDN v2 early so createRequestToken has dwell time / telemetry.
+        # cdn.castle.io is reachable via proxy; page often has no window._castle until load.
+        try:
+            pk = self._extract_castle_pk() or ""
+            self._ensure_castle_sdk(pk)
+            self._lg("[*] pre-email Castle CDN warm started (local-cache→_castle)")
+            warm_deadline = time.time() + 12.0
+            while time.time() < warm_deadline:
+                try:
+                    st = page.run_js(
+                        """
+return {
+  len: String(window.__hybrid_castle||'').length,
+  head: String(window.__hybrid_castle||'').slice(0,12),
+  status: String(window.__hybrid_castle_status||''),
+  has: typeof window._castle==='function',
+  load: String(window.__hybrid_castle_load||''),
+  err: String(window.__hybrid_castle_err||'').slice(0,80)
+};
+"""
+                    )
+                except Exception:
+                    st = None
+                if isinstance(st, dict):
+                    ln = int(st.get("len") or 0)
+                    if ln >= 1000 and str(st.get("head") or "").startswith("IBYIll"):
+                        self._lg(
+                            f"[*] pre-email Castle CDN ready len={ln} "
+                            f"st={st.get('status')} has={st.get('has')} "
+                            f"load={st.get('load')}"
+                        )
+                        break
+                    if st.get("status") in ("sdk-fail", "error", "error:_castle"):
+                        self._lg(
+                            f"[*] pre-email Castle CDN fail st={st.get('status')} "
+                            f"has={st.get('has')} err={st.get('err')}"
+                        )
+                        # retry once: clear script flag and re-ensure
+                        try:
+                            page.run_js("window.__hybrid_castle_script=false; true;")
+                            self._ensure_castle_sdk(pk)
+                        except Exception:
+                            pass
+                time.sleep(0.4)
+            else:
+                self._lg("[*] pre-email Castle CDN warm timeout (continue with React mint)")
+        except Exception as we:
+            self._lg(f"[Debug] pre-email Castle warm: {we}")
+
+        # light human-like dwell + mouse nudge (Castle behavioral features)
+        try:
+            page.run_js(
+                """
+try {
+  const x = 120 + Math.floor(Math.random()*400);
+  const y = 160 + Math.floor(Math.random()*240);
+  const t = document.elementFromPoint(x, y) || document.body;
+  for (const type of ['pointermove','mousemove']) {
+    t.dispatchEvent(new MouseEvent(type, {bubbles:true, clientX:x, clientY:y}));
+  }
+  window.scrollBy(0, 40 + Math.floor(Math.random()*80));
+} catch (e) {}
+true;
+"""
+            )
+            time.sleep(0.4 + (time.time() % 0.5))
+        except Exception:
+            pass
+
         submit_result = ""
         try:
-            # Phase 1: fill email (Plan A style selectors + events)
+            # Phase 1: fill email — execCommand + React props (native setter alone often no-ops CreateEmail)
             filled = page.run_js(
                 """
 const email = arguments[0];
@@ -876,6 +1213,39 @@ function isVisible(node) {
   const rect = node.getBoundingClientRect();
   return rect.width > 0 && rect.height > 0;
 }
+function setReactEmail(input, value) {
+  input.focus();
+  try { input.click(); } catch (e) {}
+  try { input.select(); } catch (e) {}
+  let via = '';
+  try {
+    if (document.execCommand) {
+      document.execCommand('selectAll', false, null);
+      document.execCommand('delete', false, null);
+      document.execCommand('insertText', false, value);
+      via = 'exec';
+    }
+  } catch (e) {}
+  const last = input.value;
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+  const tracker = input._valueTracker;
+  if (tracker) { try { tracker.setValue(last || ''); } catch (e) {} }
+  if (setter) setter.call(input, value); else input.value = value;
+  const rk = Object.keys(input).find((k) => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+  if (rk && input[rk]) {
+    const p = input[rk];
+    const ev = { target: input, currentTarget: input, type: 'input', bubbles: true };
+    try { if (typeof p.onChange === 'function') p.onChange({ ...ev, type: 'change' }); } catch (e) {}
+    try { if (typeof p.onInput === 'function') p.onInput(ev); } catch (e) {}
+    via = (via ? via + '+' : '') + 'react';
+  }
+  try {
+    input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, data: value, inputType: 'insertText' }));
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: value, inputType: 'insertText' }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  } catch (e) {}
+  return via || 'native';
+}
 const input = Array.from(document.querySelectorAll(
   'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
 )).find((node) => isVisible(node) && !node.disabled && !node.readOnly)
@@ -885,79 +1255,82 @@ const input = Array.from(document.querySelectorAll(
       return meta.includes('email') || n.type === 'email';
   }) || null;
 if (!input) return 'no-input';
-input.focus();
-input.click();
-const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-const tracker = input._valueTracker;
-if (tracker) tracker.setValue('');
-if (setter) setter.call(input, email); else input.value = email;
-input.dispatchEvent(new InputEvent('beforeinput', {bubbles:true, data:email, inputType:'insertText'}));
-input.dispatchEvent(new InputEvent('input', {bubbles:true, data:email, inputType:'insertText'}));
-input.dispatchEvent(new Event('change', {bubbles:true}));
-if ((input.value || '').trim() !== email) return 'fill-mismatch';
-input.blur();
-return 'filled';
+const via = setReactEmail(input, email);
+if ((input.value || '').trim() !== email) return 'fill-mismatch:' + via;
+return 'filled:' + via;
 """,
                 email,
             )
             self._lg(f"[*] UI email fill: {filled}")
-            if filled not in ("filled",):
+            if not str(filled or "").startswith("filled"):
                 # last resort: broader helper
                 filled2 = self._set_input_and_submit(email, "email")
                 self._lg(f"[*] UI email fallback submit: {filled2}")
                 submit_result = filled2
             else:
-                # Short probe: full wait only if page exposes Castle / mint activity.
-                self._wait_castle_ready_before_submit(page, max_wait=3.0)
-                time.sleep(0.25)
-                # Phase 2: click 注册 (Plan A) — avoid matching 继续 on other widgets
-                clicked = page.run_js(
-                    r"""
-function isVisible(node) {
-  if (!node) return false;
-  const style = window.getComputedStyle(node);
-  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-  const rect = node.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-}
-const input = Array.from(document.querySelectorAll(
-  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
-)).find((node) => isVisible(node) && !node.disabled) || null;
-if (!input || !(input.value || '').trim()) return 'no-email-value';
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
-  return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-// Prefer 注册 / Sign up (Plan A), then Continue as fallback
-let submitButton = buttons.find((node) => {
-  const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
-  const t = text.toLowerCase();
-  return text === '注册' || text.includes('注册') || t === 'signup' || t.includes('signup') || t.includes('sign up');
-});
-if (!submitButton) {
-  submitButton = buttons.find((node) => {
-    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
-    const t = text.toLowerCase();
-    return text.includes('继续') || t.includes('continue') || t.includes('next') || node.type === 'submit';
-  });
-}
-if (!submitButton) return 'no-button';
-submitButton.click();
-return 'submitted';
-"""
-                )
+                # Prefer long wait when CDN/_castle is live; short bail when still absent.
+                self._wait_castle_ready_before_submit(page, max_wait=8.0)
+                time.sleep(0.35)
+                # Phase 2: score submit (exclude Sign up with Google/Apple/email)
+                clicked = self._click_register_button(page)
                 submit_result = str(clicked or "")
                 self._lg(f"[*] UI email for castle: {submit_result}")
         except Exception as e:
             self._lg(f"[Debug] UI email castle: {e}")
             return ""
 
-        deadline = time.time() + max(15, int(timeout or 40))
+        deadline = time.time() + max(12, min(25, int(timeout or 40)))
         last_diag = ""
         retried_submit = False
         while time.time() < deadline:
             c = self.read_captured_castle()
             if c:
                 self._lg(f"[*] native castle len={len(c)} head={c[:20]}")
+                # Wait briefly so fetch/XHR (or CDP) can stamp CreateEmail status.
+                # Returning instantly left status=0 → hybrid force-fired a 2nd CreateEmail.
+                try:
+                    settle_deadline = time.time() + 2.5
+                    while time.time() < settle_deadline:
+                        st = page.run_js(
+                            """
+return {
+  ok: !!window.__hybrid_create_email_ok,
+  status: Number(window.__hybrid_create_email_status||0),
+  seen: !!window.__hybrid_create_email_seen,
+  wire: !!window.__hybrid_create_email_wire
+};
+"""
+                        )
+                        if isinstance(st, dict) and (
+                            st.get("ok")
+                            or int(st.get("status") or 0) == 200
+                            or st.get("wire")
+                        ):
+                            self._lg(
+                                f"[*] CreateEmail settle ok={st.get('ok')} "
+                                f"status={st.get('status')} wire={st.get('wire')}"
+                            )
+                            break
+                        time.sleep(0.2)
+                    else:
+                        # No status yet — mark wire if we hold long IBYIll from body
+                        if len(c) >= 1000 and str(c).startswith("IBYIll"):
+                            try:
+                                page.run_js(
+                                    """
+window.__hybrid_create_email_seen = true;
+window.__hybrid_create_email_wire = true;
+true;
+"""
+                                )
+                            except Exception:
+                                pass
+                            self._lg(
+                                "[*] CreateEmail settle timeout — marked wire "
+                                f"(castle_len={len(c)})"
+                            )
+                except Exception as se:
+                    self._lg(f"[Debug] CreateEmail settle: {se}")
                 return c
             # CreateEmail fired with empty castle → wait & re-click once
             if not retried_submit:
@@ -1117,6 +1490,15 @@ return {
         self._lg(
             "[!] native castle timeout; no browser CreateEmail success either → empty"
         )
+        # UI click never produced CreateEmail — force RPC from page context.
+        try:
+            fr = self.force_create_email_via_page(email, timeout=18)
+            if isinstance(fr, dict) and fr.get("ok"):
+                self._lg("[*] force CreateEmail OK after UI miss")
+                return ""
+            self._lg(f"[!] force CreateEmail after UI miss: {fr}")
+        except Exception as fe:
+            self._lg(f"[!] force CreateEmail exception: {fe}")
         return ""
 
     def get_castle_token_injected(self, timeout: int = 45) -> str:
@@ -1124,6 +1506,10 @@ return {
         return self._get_castle_token_injected_impl(timeout=timeout)
 
     def close(self):
+        if self.keep_alive or self.reuse:
+            self._lg("[*] BrowserTokenSession keep_alive — not shutting down browser")
+            self._started = False
+            return
         from grok_register_ttk import shutdown_browser
 
         try:
@@ -1163,30 +1549,116 @@ return {
         return jar
 
     def scrape_next_action(self) -> str:
+        """Scrape sign-up Server Action id from live page scripts / loaded chunks.
+
+        Prefer createServerReference bound near createUserAndSession / emailValidationCode.
+        """
         from grok_register_ttk import _get_page
 
         page = _get_page()
+        if page is None:
+            return ""
         try:
             action = page.run_js(
                 r"""
+function pickFromText(t) {
+  if (!t) return '';
+  // named CSR: createServerReference("hash", ..., "default"|createUser...)
+  let m = t.match(/createServerReference\)\("([a-f0-9]{40,})"[^)]{0,260},"([A-Za-z0-9_]+)"\)/);
+  if (m) return m[1];
+  const keys = ['createUserAndSessionRequest', 'emailValidationCode', 'createUserAndSession'];
+  for (const key of keys) {
+    const idx = t.indexOf(key);
+    if (idx < 0) continue;
+    const slice = t.slice(Math.max(0, idx - 500), idx + 500);
+    m = slice.match(/createServerReference\)\("([a-f0-9]{40,})"/);
+    if (m) return m[1];
+    m = slice.match(/["']([a-f0-9]{40,64})["']/);
+    if (m) return m[1];
+  }
+  m = t.match(/next-action["'\s:=]+([a-f0-9]{40,})/i);
+  return m ? m[1] : '';
+}
 const html = document.documentElement.innerHTML || '';
-let m = html.match(/next-action["'\s:=]+([a-f0-9]{40,})/i);
-if (m) return m[1];
+let hit = pickFromText(html);
+if (hit) return hit;
 for (const s of Array.from(document.scripts || [])) {
-  const t = s.textContent || '';
-  const idx = t.indexOf('createUserAndSession');
-  if (idx >= 0) {
-    const slice = t.slice(Math.max(0, idx - 300), idx + 400);
-    const m3 = slice.match(/[a-f0-9]{40,}/);
-    if (m3) return m3[0];
+  hit = pickFromText(s.textContent || s.innerText || '');
+  if (hit) return hit;
+  const src = s.src || '';
+  if (src && /_next\/static\/chunks\//.test(src)) {
+    // mark for async fetch via performance resources is handled in Python fallback
   }
 }
 return '';
 """
             )
-            return str(action or "")
+            act = str(action or "").strip()
+            if act:
+                return act
         except Exception:
-            return ""
+            pass
+        # Fallback: fetch a few page chunk URLs via page fetch (uses browser proxy/cookies)
+        try:
+            act2 = page.run_js(
+                r"""
+return (async () => {
+  const html = document.documentElement.innerHTML || '';
+  const chunks = Array.from(html.matchAll(/\/_next\/static\/chunks\/[^"'\\s]+\.js/g)).map(m => m[0]);
+  const uniq = [...new Set(chunks)].slice(0, 20);
+  const keys = ['createUserAndSessionRequest', 'emailValidationCode', 'castleRequestToken'];
+  for (const c of uniq) {
+    try {
+      const url = c.startsWith('http') ? c : (location.origin + c);
+      const t = await (await fetch(url, {credentials: 'same-origin'})).text();
+      if (!keys.some(k => t.includes(k))) continue;
+      let m = t.match(/createServerReference\)\("([a-f0-9]{40,})"[^)]{0,260},"([A-Za-z0-9_]+)"\)/);
+      if (m) return m[1];
+      m = t.match(/createServerReference\)\("([a-f0-9]{40,})"/);
+      if (m) return m[1];
+    } catch (e) {}
+  }
+  return '';
+})();
+"""
+            )
+            # Drission may not await; if promise-like, try CDP
+            if act2 and not str(act2).startswith("{") and len(str(act2)) >= 40:
+                return str(act2).strip()
+        except Exception:
+            pass
+        try:
+            res = page.run_cdp(
+                "Runtime.evaluate",
+                expression=r"""
+(async () => {
+  const html = document.documentElement.innerHTML || '';
+  const chunks = Array.from(html.matchAll(/\/_next\/static\/chunks\/[^"'\\s]+\.js/g)).map(m => m[0]);
+  const uniq = [...new Set(chunks)].slice(0, 24);
+  const keys = ['createUserAndSessionRequest', 'emailValidationCode', 'castleRequestToken'];
+  for (const c of uniq) {
+    try {
+      const url = c.startsWith('http') ? c : (location.origin + c);
+      const t = await (await fetch(url, {credentials: 'same-origin'})).text();
+      if (!keys.some(k => t.includes(k))) continue;
+      let m = t.match(/createServerReference\)\("([a-f0-9]{40,})"[^)]{0,260},"([A-Za-z0-9_]+)"\)/);
+      if (m) return m[1];
+      m = t.match(/createServerReference\)\("([a-f0-9]{40,})"/);
+      if (m) return m[1];
+    } catch (e) {}
+  }
+  return '';
+})()
+""",
+                awaitPromise=True,
+                returnByValue=True,
+            )
+            val = (res or {}).get("result", {}).get("value") or ""
+            if val and len(str(val)) >= 40:
+                return str(val).strip()
+        except Exception:
+            pass
+        return ""
 
     def _extract_castle_pk(self) -> str:
         from grok_register_ttk import _get_page
@@ -1214,136 +1686,264 @@ return '';
             self._lg(f"[Debug] castle pk: {e}")
         return "pk_p8GGWvD3TmFJZRsX3BQcqAv9aFVispNz"
 
+    def _local_castle_sdk_source(self) -> str:
+        """Prefer local data/cf-cache/castle_v2.js (forum: avoid cross-origin CDN block)."""
+        candidates = [
+            Path(__file__).resolve().parent.parent / "data" / "cf-cache" / "castle_v2.js",
+            Path(__file__).resolve().parent / "data" / "cf-cache" / "castle_v2.js",
+        ]
+        for p in candidates:
+            try:
+                if p.is_file() and p.stat().st_size > 5000:
+                    return p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+        # One-shot download into first candidate path
+        try:
+            dest = candidates[0]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            import urllib.request
+            url = (
+                "https://cdn.castle.io/v2/castle.js"
+                "?pk=pk_p8GGWvD3TmFJZRsX3BQcqAv9aFVispNz"
+            )
+            urllib.request.urlretrieve(url, dest)
+            if dest.is_file() and dest.stat().st_size > 5000:
+                self._lg(f"[*] castle SDK downloaded → {dest} bytes={dest.stat().st_size}")
+                return dest.read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            try:
+                self._lg(f"[Debug] castle SDK download: {e}")
+            except Exception:
+                pass
+        return ""
+
     def _ensure_castle_sdk(self, pk: str) -> bool:
-        """Inject @castleio/castle-js and start createRequestToken (no top-level await)."""
+        """Load Castle CDN v2 and mint via window._castle (NOT window.Castle).
+
+        Forum (2026-07):
+          _castle('setAppId', pk); _castle('createRequestToken') → IBYIll|…
+        Prefer local data/cf-cache/castle_v2.js then fetch+(0,eval); reject short junk.
+        """
         from grok_register_ttk import _get_page
 
         page = _get_page()
-        # already minting / done?
+        if page is None:
+            return False
+        pk = (pk or "").strip() or "pk_p8GGWvD3TmFJZRsX3BQcqAv9aFVispNz"
         try:
             st = page.run_js(
-                "return {s: window.__hybrid_castle_status||'', l:(window.__hybrid_castle||'').length};"
+                """
+return {
+  s: window.__hybrid_castle_status||'',
+  l: String(window.__hybrid_castle||'').length,
+  head: String(window.__hybrid_castle||'').slice(0,8),
+  has: typeof window._castle==='function'
+};
+"""
             )
-            if isinstance(st, dict) and (st.get("s") == "done" or int(st.get("l") or 0) > 40):
+            if (
+                isinstance(st, dict)
+                and int(st.get("l") or 0) >= 1000
+                and str(st.get("head") or "").startswith("IBYIll")
+            ):
                 return True
         except Exception:
             pass
 
-        cdn = "https://cdn.jsdelivr.net/npm/@castleio/castle-js@2.1.8/dist/castle.min.js"
+        local_src = self._local_castle_sdk_source()
+        cdn = f"https://cdn.castle.io/v2/castle.js?pk={pk}"
         try:
             page.run_js(
-                f"""
+                r"""
+const localSrc = String(arguments[0] || '');
+const pk = String(arguments[1] || '');
+const cdn = String(arguments[2] || '');
 window.__hybrid_castle = window.__hybrid_castle || '';
+window.__hybrid_castles = window.__hybrid_castles || [];
 window.__hybrid_castle_status = 'loading-sdk';
 window.__hybrid_castle_err = '';
-(function(){{
-  function mint(C) {{
-    try {{
-      var api = C;
-      if (api && api.default) api = api.default;
-      if (api && typeof api.configure === 'function') {{
-        try {{ api.configure({{pk: {pk!r}}}); }} catch (e1) {{}}
-      }}
-      var fn = null;
-      if (api && typeof api.createRequestToken === 'function') fn = api.createRequestToken.bind(api);
-      if (!fn && typeof C === 'function') {{
-        try {{
-          var inst = C({{pk: {pk!r}}});
-          if (inst && typeof inst.createRequestToken === 'function') fn = inst.createRequestToken.bind(inst);
-        }} catch (e2) {{}}
-      }}
-      if (!fn) {{
-        window.__hybrid_castle_status = 'no-method';
-        window.__hybrid_castle_methods = api ? Object.keys(api) : [];
-        return;
-      }}
-      window.__hybrid_castle_status = 'minting';
-      Promise.resolve(fn()).then(function(t){{
-        window.__hybrid_castle = String(t || '');
-        window.__hybrid_castle_status = (window.__hybrid_castle.length > 20) ? 'done' : 'empty';
-      }}).catch(function(e){{
-        window.__hybrid_castle_err = String(e);
-        window.__hybrid_castle_status = 'error';
-      }});
-    }} catch (e) {{
+function pushTok(t) {
+  const s = String(t || '');
+  if (s.indexOf('IBYIll|') !== 0 || s.length < 800) {
+    window.__hybrid_castle_err = 'reject short/non-IBYIll len=' + s.length;
+    window.__hybrid_castle_status = 'reject-short';
+    return false;
+  }
+  window.__hybrid_castle = s;
+  window.__hybrid_castles = window.__hybrid_castles || [];
+  window.__hybrid_castles.push(s);
+  window.__hybrid_castle_status = 'done-native';
+  return true;
+}
+function mintWithUnderscore() {
+  try {
+    if (typeof window._castle !== 'function') {
+      window.__hybrid_castle_status = 'no-_castle';
+      return false;
+    }
+    try { window._castle('setAppId', pk); } catch (e0) {
+      try { window._castle('configure', { pk: pk }); } catch (e1) {}
+    }
+    window.__hybrid_castle_status = 'minting';
+    const ret = window._castle('createRequestToken');
+    Promise.resolve(ret).then(function (t) {
+      if (!pushTok(t)) {
+        if (window.__hybrid_castle_status !== 'reject-short') {
+          window.__hybrid_castle_status = 'empty';
+          window.__hybrid_castle_err = 'createRequestToken empty';
+        }
+      }
+    }).catch(function (e) {
       window.__hybrid_castle_err = String(e);
-      window.__hybrid_castle_status = 'exception';
-    }}
-  }}
-  var existing = window.Castle || window.castle || window['@castleio/castle-js'] || null;
-  if (existing) {{ mint(existing); return; }}
-  if (window.__hybrid_castle_script) {{ return; }}
-  window.__hybrid_castle_script = true;
-  var s = document.createElement('script');
-  s.src = {cdn!r};
-  s.onload = function(){{
-    var C = window.Castle || window.castle || window['@castleio/castle-js'] || null;
-    mint(C);
-  }};
-  s.onerror = function(){{
-    window.__hybrid_castle_err = 'sdk script load failed';
-    window.__hybrid_castle_status = 'sdk-fail';
-  }};
-  document.head.appendChild(s);
-}})();
-true;
-"""
+      window.__hybrid_castle_status = 'error';
+    });
+    return true;
+  } catch (e) {
+    window.__hybrid_castle_err = String(e);
+    window.__hybrid_castle_status = 'exception';
+    return false;
+  }
+}
+function evalSrc(src, label) {
+  try {
+    (0, eval)(src);
+    window.__hybrid_castle_load = label;
+  } catch (eEval) {
+    window.__hybrid_castle_err = 'eval:' + label + ':' + String(eEval);
+    return false;
+  }
+  return typeof window._castle === 'function';
+}
+if (typeof window._castle === 'function') {
+  mintWithUnderscore();
+  return true;
+}
+if (localSrc && localSrc.length > 5000) {
+  if (evalSrc(localSrc, 'local-cache')) {
+    mintWithUnderscore();
+    return true;
+  }
+}
+if (window.__hybrid_castle_script) return true;
+window.__hybrid_castle_script = true;
+fetch(cdn, { credentials: 'omit', mode: 'cors', cache: 'force-cache' })
+  .then(function (r) { return r.text(); })
+  .then(function (src) {
+    if (evalSrc(src, 'cdn-fetch')) {
+      mintWithUnderscore();
+      return;
+    }
+    const s = document.createElement('script');
+    s.src = cdn;
+    s.async = true;
+    s.onload = function () { mintWithUnderscore(); };
+    s.onerror = function () {
+      window.__hybrid_castle_err = 'sdk script load failed';
+      window.__hybrid_castle_status = 'sdk-fail';
+    };
+    document.head.appendChild(s);
+  })
+  .catch(function (e) {
+    window.__hybrid_castle_err = 'fetch:' + String(e);
+    const s = document.createElement('script');
+    s.src = cdn;
+    s.async = true;
+    s.onload = function () { mintWithUnderscore(); };
+    s.onerror = function () {
+      window.__hybrid_castle_status = 'sdk-fail';
+      window.__hybrid_castle_err = 'sdk script load failed';
+    };
+    document.head.appendChild(s);
+  });
+return true;
+""",
+                local_src,
+                pk,
+                cdn,
             )
+            if local_src:
+                self._lg(f"[*] castle SDK local-cache bytes={len(local_src)}")
             return True
         except Exception as e:
             self._lg(f"[Debug] ensure castle sdk: {e}")
             return False
 
     def _get_castle_token_injected_impl(self, timeout: int = 45) -> str:
-        """Mint Castle request token via injected SDK (page has no window.Castle)."""
+        """Mint Castle request token via CDN v2 window._castle API."""
         from grok_register_ttk import _get_page
 
         page = _get_page()
+        if page is None:
+            return ""
         pk = self._extract_castle_pk()
-        self._lg(f"[*] castle pk={pk[:16]}...")
+        self._lg(f"[*] castle pk={pk[:20]}... (CDN v2 _castle)")
+        # force reload path when previous attempt used wrong API
+        try:
+            page.run_js(
+                "window.__hybrid_castle_script=false;"
+                "if(window.__hybrid_castle_status==='loading-sdk'||window.__hybrid_castle_status==='no-method')"
+                "{window.__hybrid_castle_status='';}"
+                "true;"
+            )
+        except Exception:
+            pass
         self._ensure_castle_sdk(pk)
         deadline = time.time() + timeout
         last_status = ""
+        best = ""
         while time.time() < deadline:
             try:
                 data = page.run_js(
                     """
 let castle = '';
 try {
-  // prefer native-captured long token if present
   if (window.__hybrid_castles && window.__hybrid_castles.length) {
     for (const t of window.__hybrid_castles) {
-      if (String(t||'').length > String(castle||'').length) castle = String(t);
+      const s = String(t||'');
+      if (s.length > castle.length) castle = s;
     }
   }
-  if ((!castle || castle.length < 1000) && window.__hybrid_castle) castle = String(window.__hybrid_castle);
+  if (window.__hybrid_castle && String(window.__hybrid_castle).length > castle.length)
+    castle = String(window.__hybrid_castle);
 } catch (e) {}
-const el = document.querySelector('input[name*="castle" i], textarea[name*="castle" i]');
-if (!castle && el) castle = String(el.value || '').trim();
 return {
   castle: castle || '',
   status: String(window.__hybrid_castle_status || ''),
   err: String(window.__hybrid_castle_err || ''),
-  methods: window.__hybrid_castle_methods || []
+  hasUnderscore: typeof window._castle === 'function',
+  hasCastle: !!(window.Castle || window.castle)
 };
 """
                 )
                 if isinstance(data, dict):
                     castle = str(data.get("castle") or "")
-                    last_status = f"{data.get('status')}|{data.get('err')}|{data.get('methods')}"
-                    # accept short injected tokens only as last resort
-                    if len(castle) >= 40:
-                        self._lg(f"[*] castle token len={len(castle)}")
+                    last_status = (
+                        f"{data.get('status')}|{data.get('err')}|"
+                        f"_castle={data.get('hasUnderscore')}|Castle={data.get('hasCastle')}"
+                    )
+                    # Prefer long IBYIll; accept shorter only if no better
+                    if castle.startswith("IBYIll|") and len(castle) >= 800:
+                        self._lg(f"[*] castle token IBYIll len={len(castle)}")
                         return castle
+                    if len(castle) > len(best):
+                        best = castle
                     st = str(data.get("status") or "")
-                    if st in ("no-method", "sdk-fail", "error", "exception", "empty"):
+                    if st in ("no-_castle", "sdk-fail", "error", "exception", "empty"):
                         page.run_js(
-                            "window.__hybrid_castle_script=false; window.__hybrid_castle_status=''; true;"
+                            "window.__hybrid_castle_script=false; "
+                            "window.__hybrid_castle_status=''; true;"
                         )
                         self._ensure_castle_sdk(pk)
             except Exception:
                 pass
-            time.sleep(0.5)
+            time.sleep(0.45)
+        if best and len(best) >= 40:
+            self._lg(
+                f"[*] castle token fallback len={len(best)} "
+                f"head={best[:16]} last={last_status}"
+            )
+            return best
         self._lg(f"[!] castle token timeout last={last_status}")
         return ""
 
@@ -1387,7 +1987,11 @@ return '';
         return "0x4AAAAAAAhr9JGVDZbrZOo0"
 
     def inject_turnstile_widget(self, sitekey: str = "") -> bool:
-        """Mount a standalone Turnstile widget (turnstilePatch can auto-solve)."""
+        """Mount a visible Turnstile widget (aligned with main-3 inject).
+
+        main-3 / turnstile_mint.py: fixed .cf-turnstile host top-left, explicit
+        render, callback writes cf-turnstile-response + __hybrid_turnstile.
+        """
         from grok_register_ttk import _get_page
 
         page = _get_page()
@@ -1398,38 +2002,90 @@ return '';
                 f"""
 window.__hybrid_turnstile = '';
 window.__hybrid_turnstile_status = 'init';
+window.__hybrid_turnstile_err = '';
 (function(){{
   var sitekey = {sk!r};
+  function onToken(t) {{
+    var tok = String(t || '');
+    window.__hybrid_turnstile = tok;
+    window.__hybrid_turnstile_status = 'done';
+    var i = document.querySelector('input[name="cf-turnstile-response"]');
+    if (!i) {{
+      i = document.createElement('input');
+      i.type = 'hidden';
+      i.name = 'cf-turnstile-response';
+      document.body.appendChild(i);
+    }}
+    try {{
+      var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+      if (setter && setter.set) setter.set.call(i, tok); else i.value = tok;
+      i.dispatchEvent(new Event('input', {{ bubbles: true }}));
+      i.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    }} catch (e) {{
+      i.value = tok;
+    }}
+  }}
+  function ensureHost() {{
+    // 去掉页面原生/残留 widget，避免双 Turnstile 触发 300010
+    try {{
+      document.querySelectorAll('.cf-turnstile, [data-sitekey]').forEach(function(el) {{
+        if (el && el.id !== 'hybrid-turnstile-host') {{
+          try {{ el.remove(); }} catch (e1) {{
+            try {{ el.innerHTML = ''; el.style.display = 'none'; }} catch (e2) {{}}
+          }}
+        }}
+      }});
+    }} catch (e0) {{}}
+    var host = document.getElementById('hybrid-turnstile-host');
+    if (!host) {{
+      host = document.createElement('div');
+      host.id = 'hybrid-turnstile-host';
+      host.className = 'cf-turnstile';
+      host.setAttribute('data-sitekey', sitekey);
+      // 低调可见宿主（去掉红框调试样式）
+      host.style.cssText = 'position:fixed;top:12px;left:12px;z-index:2147483646;'
+        + 'background:transparent;padding:0;border:0;width:300px;min-height:65px;'
+        + 'opacity:1;visibility:visible;';
+      document.body.appendChild(host);
+    }} else {{
+      try {{ host.innerHTML = ''; }} catch (e) {{}}
+      host.className = 'cf-turnstile';
+      host.setAttribute('data-sitekey', sitekey);
+      host.style.cssText = 'position:fixed;top:12px;left:12px;z-index:2147483646;'
+        + 'background:transparent;padding:0;border:0;width:300px;min-height:65px;'
+        + 'opacity:1;visibility:visible;';
+    }}
+    return host;
+  }}
   function renderWhenReady() {{
     if (!window.turnstile || typeof turnstile.render !== 'function') {{
       window.__hybrid_turnstile_status = 'waiting-api';
       return false;
     }}
-    var host = document.getElementById('hybrid-turnstile-host');
-    if (!host) {{
-      host = document.createElement('div');
-      host.id = 'hybrid-turnstile-host';
-      host.style.cssText = 'position:fixed;right:8px;bottom:8px;z-index:2147483647;background:#111;padding:8px;';
-      document.body.appendChild(host);
-    }} else {{
-      host.innerHTML = '';
-    }}
+    var host = ensureHost();
     try {{
-      turnstile.render(host, {{
+      // 若已 render 过，先 remove 避免叠多个失败控件
+      try {{
+        if (window.__hybrid_turnstile_wid != null && turnstile.remove) {{
+          turnstile.remove(window.__hybrid_turnstile_wid);
+        }}
+      }} catch (e0) {{}}
+      var wid = turnstile.render(host, {{
         sitekey: sitekey,
-        theme: 'dark',
-        size: 'flexible',
-        callback: function(token) {{
-          window.__hybrid_turnstile = String(token || '');
-          window.__hybrid_turnstile_status = 'done';
-        }},
-        'error-callback': function() {{
+        theme: 'light',
+        size: 'normal',
+        retry: 'auto',
+        'retry-interval': 8000,
+        callback: onToken,
+        'error-callback': function(code) {{
           window.__hybrid_turnstile_status = 'error';
+          window.__hybrid_turnstile_err = String(code || 'error');
         }},
         'expired-callback': function() {{
           window.__hybrid_turnstile_status = 'expired';
         }}
       }});
+      window.__hybrid_turnstile_wid = wid;
       window.__hybrid_turnstile_status = 'rendered';
       return true;
     }} catch (e) {{
@@ -1442,16 +2098,17 @@ window.__hybrid_turnstile_status = 'init';
   if (!document.getElementById('hybrid-cf-script')) {{
     var s = document.createElement('script');
     s.id = 'hybrid-cf-script';
-    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    // main-3: non-explicit api.js + turnstile.render (matches turnstile_mint.py)
+    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
     s.async = true;
-    s.onload = function(){{ renderWhenReady(); }};
+    s.onload = function(){{ setTimeout(function(){{ renderWhenReady(); }}, 800); }};
     s.onerror = function(){{ window.__hybrid_turnstile_status = 'script-fail'; }};
     document.head.appendChild(s);
   }}
   var n = 0;
   var t = setInterval(function(){{
     n += 1;
-    if (renderWhenReady() || n > 40) clearInterval(t);
+    if (renderWhenReady() || n > 50) clearInterval(t);
   }}, 250);
 }})();
 true;
@@ -1461,6 +2118,227 @@ true;
         except Exception as e:
             self._lg(f"[Debug] inject turnstile: {e}")
             return False
+
+    def _human_idle_before_turnstile(self) -> None:
+        """轻量拟人：滚动 + 随机鼠标移动，降低「页面一开就点 checkbox」画像。"""
+        from grok_register_ttk import _get_page
+        import secrets
+
+        page = _get_page()
+        try:
+            page.run_js(
+                """
+try {
+  window.scrollTo(0, Math.floor(40 + Math.random() * 120));
+  setTimeout(function(){ window.scrollTo(0, 0); }, 200);
+} catch (e) {}
+true;
+"""
+            )
+        except Exception:
+            pass
+        try:
+            from grok_register_ttk import _engine
+
+            eng = _engine()
+            fn = getattr(eng, "_cdp_human_click", None)
+            # 只移动不点：在页面空白处轻微划动
+            if callable(fn):
+                x = 200 + secrets.randbelow(400)
+                y = 180 + secrets.randbelow(200)
+                # 用 mouseMoved 序列（通过点击偏移路径实现移动）
+                try:
+                    page.run_cdp(
+                        "Input.dispatchMouseEvent",
+                        type="mouseMoved",
+                        x=float(x),
+                        y=float(y),
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(0.6 + secrets.randbelow(9) / 10.0)
+
+    def _read_hybrid_turnstile_state(self) -> dict:
+        from grok_register_ttk import _get_page
+
+        page = _get_page()
+        try:
+            st = page.run_js(
+                """
+var hv = String(window.__hybrid_turnstile || '').trim();
+var inputs = Array.from(document.querySelectorAll('input[name="cf-turnstile-response"]'));
+var iv = '';
+for (const inp of inputs) {
+  const v = String(inp.value || '').trim();
+  if (v.length > iv.length) iv = v;
+}
+var api = '';
+try {
+  if (window.turnstile && typeof turnstile.getResponse === 'function') {
+    api = String(turnstile.getResponse() || '').trim();
+  }
+} catch (e) {}
+var host = document.getElementById('hybrid-turnstile-host')
+  || document.querySelector('.cf-turnstile[data-sitekey], .cf-turnstile');
+var box = null;
+if (host) {
+  const r = host.getBoundingClientRect();
+  box = {x: r.left, y: r.top, w: r.width, h: r.height};
+}
+// 检测 Verification failed UI（截图红框态）
+var failText = false;
+try {
+  const bodyText = (document.body && document.body.innerText) || '';
+  failText = /verification failed|验证失败/i.test(bodyText);
+} catch (e) {}
+return {
+  tok: hv || iv || api,
+  status: String(window.__hybrid_turnstile_status || ''),
+  err: String(window.__hybrid_turnstile_err || ''),
+  inpLen: iv.length,
+  host: !!host,
+  box: box,
+  failUi: !!failText
+};
+"""
+            )
+            return st if isinstance(st, dict) else {}
+        except Exception:
+            return {}
+
+    def _mouse_click_turnstile_center(self) -> str:
+        """Mouse click checkbox region of inject .cf-turnstile host.
+
+        Prefer left-side checkbox coords (not pure center). main-3 also uses
+        mouse path; left bias matches real Turnstile checkbox placement.
+        """
+        from grok_register_ttk import _get_page
+        import secrets
+
+        page = _get_page()
+        try:
+            box = page.run_js(
+                """
+const sels = [
+  '#hybrid-turnstile-host',
+  '.cf-turnstile[data-sitekey]',
+  '.cf-turnstile',
+  '[data-sitekey]'
+];
+for (const sel of sels) {
+  const e = document.querySelector(sel);
+  if (!e) continue;
+  const r = e.getBoundingClientRect();
+  if (r.width >= 20 && r.height >= 20) {
+    // checkbox is on the left of the widget
+    const ox = Math.min(42, Math.max(26, r.width * 0.12));
+    return {
+      x: r.left + ox,
+      y: r.top + r.height * 0.5,
+      w: r.width,
+      h: r.height,
+      sel: sel
+    };
+  }
+}
+return null;
+"""
+            )
+        except Exception as e:
+            return f"box-err:{e}"
+        if not isinstance(box, dict):
+            return "no-box"
+        try:
+            cx = float(box.get("x") or 0) + (secrets.randbelow(5) - 2)
+            cy = float(box.get("y") or 0) + (secrets.randbelow(5) - 2)
+            # Prefer engine CDP human click when available
+            try:
+                from grok_register_ttk import _engine
+
+                eng = _engine()
+                fn = getattr(eng, "_cdp_human_click", None)
+                if callable(fn):
+                    fn(cx, cy)
+                    return f"cdp-human:{int(cx)},{int(cy)}:{box.get('sel')}"
+            except Exception:
+                pass
+            # Local CDP path (main-3 mouse path)
+            sx = cx - (25 + secrets.randbelow(20))
+            sy = cy - (8 + secrets.randbelow(12))
+            for i in range(1, 9):
+                t = i / 8.0
+                x = sx + (cx - sx) * t
+                y = sy + (cy - sy) * t
+                page.run_cdp(
+                    "Input.dispatchMouseEvent",
+                    type="mouseMoved",
+                    x=float(x),
+                    y=float(y),
+                )
+                time.sleep(0.01)
+            page.run_cdp(
+                "Input.dispatchMouseEvent",
+                type="mousePressed",
+                x=float(cx),
+                y=float(cy),
+                button="left",
+                buttons=1,
+                clickCount=1,
+            )
+            time.sleep(0.05)
+            page.run_cdp(
+                "Input.dispatchMouseEvent",
+                type="mouseReleased",
+                x=float(cx),
+                y=float(cy),
+                button="left",
+                buttons=0,
+                clickCount=1,
+            )
+            return f"cdp:{int(cx)},{int(cy)}:{box.get('sel')}"
+        except Exception as e:
+            return f"click-err:{e}"
+
+    def _preflight_turnstile_network(self) -> None:
+        """Warn when proxy cannot reach challenges.cloudflare.com (root cause of tokenLen=0)."""
+        try:
+            import urllib.request
+
+            url = "https://challenges.cloudflare.com/turnstile/v0/api.js"
+            # Prefer whatever proxy the process already uses via env; also try common local.
+            proxies = []
+            for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+                v = (os.environ.get(key) or "").strip()
+                if v:
+                    proxies.append(v)
+            # register default local proxy
+            proxies.append("http://127.0.0.1:2080")
+            seen = set()
+            for px in proxies:
+                if not px or px in seen:
+                    continue
+                seen.add(px)
+                try:
+                    handler = urllib.request.ProxyHandler({"http": px, "https": px})
+                    opener = urllib.request.build_opener(handler)
+                    req = urllib.request.Request(url, method="GET")
+                    with opener.open(req, timeout=8) as resp:
+                        code = getattr(resp, "status", None) or resp.getcode()
+                        self._lg(
+                            f"[*] turnstile preflight via proxy {px}: HTTP {code} OK"
+                        )
+                        return
+                except Exception as e:
+                    self._lg(
+                        f"[Warn] turnstile preflight FAIL via {px}: {type(e).__name__}: {e}. "
+                        "若 challenges.cloudflare.com 被代理墙/白名单漏掉，"
+                        "inject 会 render 但 click 后 error、tokenLen 恒为 0。"
+                        "请在代理规则放行 challenges.cloudflare.com / *.cloudflare.com。"
+                    )
+        except Exception as e:
+            self._lg(f"[Debug] turnstile preflight: {e}")
 
     def get_turnstile_token(
         self,
@@ -1473,69 +2351,226 @@ true;
         from grok_register_ttk import _get_page, getTurnstileToken
 
         page = _get_page()
-        if inject:
-            self.inject_turnstile_widget()
-
-        # 必须把 timeout/fast 传下去（旧代码默认 50s 且无视 fast）
+        # One-shot network warning (avoid spam on short-path retry)
+        if not getattr(self, "_ts_preflight_done", False):
+            self._ts_preflight_done = True
+            self._preflight_turnstile_network()
+        inject_failed_hard = False
+        last_err_code = ""
+        # 无论是否 inject：先拟人停顿（贴近手动打开注册页）
         try:
-            tok = getTurnstileToken(
-                timeout=int(timeout or 50),
-                log_callback=self.log,
-                fast=bool(fast),
-                auto_wait_cap=auto_wait_cap,
-            )
-            if tok and len(str(tok)) >= 80:
-                return str(tok)
-        except TypeError:
-            # 旧 shim 不认 fast / auto_wait_cap
+            self._human_idle_before_turnstile()
+        except Exception:
+            pass
+        if not inject:
+            # 原生 managed：只等自动 token + 最多一次 shadow，不 inject、不 CDP 狂点
+            self._lg("[*] turnstile mode=native (no inject)")
+            deadline = time.time() + max(12.0, float(timeout or 50))
+            clicks = 0
+            while time.time() < deadline:
+                st = self._read_hybrid_turnstile_state()
+                val = str(st.get("tok") or "").strip()
+                if len(val) >= 80:
+                    self._lg(f"[*] turnstile native token len={len(val)}")
+                    return val
+                # 中段试一次 shadow（手动有时要点一下）
+                elapsed = float(timeout or 50) - (deadline - time.time())
+                if clicks < 1 and elapsed >= 8.0:
+                    try:
+                        from grok_register_ttk import _engine
+                        eng = _engine()
+                        fn = getattr(eng, "_try_turnstile_shadow_click_main2", None)
+                        if callable(fn) and fn():
+                            clicks += 1
+                            self._lg("[*] turnstile native shadow-click ok")
+                            time.sleep(2.0)
+                            continue
+                    except Exception:
+                        pass
+                    clicks += 1
+                time.sleep(0.5)
+            self._lg("[!] turnstile native timeout (no token)")
+            return ""
+        if inject:
+            # 先试页面原生 Turnstile 自动通过（不 inject、不点），有时比二次 render 更稳
             try:
-                tok = getTurnstileToken(timeout=int(timeout or 50), log_callback=self.log)
+                self._human_idle_before_turnstile()
+                native_deadline = time.time() + (10.0 if not fast else 4.0)
+                while time.time() < native_deadline:
+                    st0 = self._read_hybrid_turnstile_state()
+                    val0 = str(st0.get("tok") or "").strip()
+                    if len(val0) >= 80:
+                        self._lg(f"[*] turnstile native auto len={len(val0)}")
+                        return val0
+                    time.sleep(0.5)
+            except Exception:
+                pass
+            try:
+                self._human_idle_before_turnstile()
+            except Exception:
+                pass
+            self.inject_turnstile_widget()
+            # managed 优先自动通过；CDP 点 checkbox 在本环境会直接 Verification failed
+            wait_inj = min(45, max(22, int(timeout or 30) // 2))
+            if fast:
+                wait_inj = min(20, wait_inj)
+            t_end = time.time() + wait_inj
+            clicks = 0
+            reinjects = 0
+            last_status = ""
+            rendered_at = 0.0
+            auto_wait_s = 22.0 if not fast else 8.0
+            time.sleep(1.2)
+            while time.time() < t_end:
+                try:
+                    st = self._read_hybrid_turnstile_state()
+                    val = str(st.get("tok") or "").strip()
+                    status = str(st.get("status") or "")
+                    err = str(st.get("err") or "")
+                    fail_ui = bool(st.get("failUi"))
+                    if status and status != last_status:
+                        self._lg(
+                            f"[*] turnstile inject status={status} "
+                            f"host={st.get('host')} inpLen={st.get('inpLen')} "
+                            f"err={err!r} failUi={fail_ui} box={st.get('box')}"
+                        )
+                        last_status = status
+                        if status == "rendered":
+                            rendered_at = time.time()
+                    if len(val) >= 80:
+                        self._lg(
+                            f"[*] turnstile inject callback len={len(val)} "
+                            f"status={status}"
+                        )
+                        return val
+                    if status in ("script-fail", "render-fail", "error", "expired") or fail_ui:
+                        if status == "error" or fail_ui:
+                            inject_failed_hard = True
+                            last_err_code = err or last_err_code
+                        if reinjects < 1 and err not in ("300010", "600010"):
+                            # 300010/600010 = bot/challenge fail，重挂同一会话通常仍失败
+                            reinjects += 1
+                            clicks = 0
+                            rendered_at = 0.0
+                            self._lg(
+                                f"[*] turnstile inject {status or 'failUi'} "
+                                f"err={err!r} → clean reload+re-render #{reinjects} "
+                                "(no CDP click this round)"
+                            )
+                            try:
+                                self.open_signup()
+                                time.sleep(1.2)
+                                self._human_idle_before_turnstile()
+                            except Exception as re:
+                                self._lg(f"[Debug] reload signup: {re}")
+                            self.inject_turnstile_widget()
+                            time.sleep(1.5)
+                            continue
+                        self._lg(
+                            f"[!] turnstile inject hard-fail err={err!r} failUi={fail_ui} — "
+                            "stop re-render/CDP (300010/600010≈bot or challenge fail). "
+                            "Need cleaner browser/IP or external solver."
+                        )
+                        break
+                    # Prefer managed auto-pass
+                    if status == "rendered" and rendered_at:
+                        waited = time.time() - rendered_at
+                        if waited < auto_wait_s:
+                            time.sleep(0.45)
+                            continue
+                    if status in ("rendered", "waiting-api", "init") or (
+                        not status and time.time() + 1 < t_end
+                    ):
+                        # 最多 2 次 shadow；避免 CDP 宿主坐标（本环境易 Verification failed）
+                        if clicks < 2:
+                            clicks += 1
+                            shadow_ok = False
+                            try:
+                                from grok_register_ttk import _engine
+
+                                eng = _engine()
+                                fn = getattr(
+                                    eng, "_try_turnstile_shadow_click_main2", None
+                                )
+                                if callable(fn):
+                                    shadow_ok = bool(fn())
+                            except Exception:
+                                shadow_ok = False
+                            if shadow_ok:
+                                self._lg(
+                                    f"[*] turnstile inject shadow-click #{clicks} ok"
+                                )
+                                time.sleep(3.5 if not fast else 1.5)
+                            else:
+                                self._lg(
+                                    f"[*] turnstile inject shadow-click #{clicks} "
+                                    "miss — keep waiting (no CDP)"
+                                )
+                                time.sleep(2.0 if not fast else 1.0)
+                            continue
+                except Exception as e:
+                    self._lg(f"[Debug] inject poll: {e}")
+                time.sleep(0.4)
+
+        # inject 已 300010/Verification failed：禁止 getTurnstileToken 的 CDP 连点刷屏
+        if inject_failed_hard:
+            self._lg(
+                f"[*] skip getTurnstileToken CDP path after hard-fail "
+                f"err={last_err_code!r}"
+            )
+        else:
+            page_timeout = int(timeout or 50)
+            try:
+                tok = getTurnstileToken(
+                    timeout=page_timeout,
+                    log_callback=self.log,
+                    fast=bool(fast),
+                    auto_wait_cap=auto_wait_cap,
+                )
                 if tok and len(str(tok)) >= 80:
                     return str(tok)
+            except TypeError:
+                try:
+                    tok = getTurnstileToken(
+                        timeout=page_timeout, log_callback=self.log
+                    )
+                    if tok and len(str(tok)) >= 80:
+                        return str(tok)
+                except Exception as e:
+                    self._lg(f"[Debug] getTurnstileToken: {e}")
             except Exception as e:
                 self._lg(f"[Debug] getTurnstileToken: {e}")
-        except Exception as e:
-            self._lg(f"[Debug] getTurnstileToken: {e}")
 
-        deadline = time.time() + max(5, int(timeout or 50))
-        while time.time() < deadline:
-            try:
-                tok = page.run_js(
-                    """
-let tok = '';
-try { if (window.__hybrid_turnstile) tok = String(window.__hybrid_turnstile); } catch (e) {}
-if (!tok) {
-  const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
-  if (byInput) tok = byInput;
-}
-try {
-  if (!tok && window.turnstile && typeof turnstile.getResponse === 'function') {
-    tok = String(turnstile.getResponse() || '').trim();
-  }
-} catch (e) {}
-return {
-  tok: tok || '',
-  status: String(window.__hybrid_turnstile_status || ''),
-  err: String(window.__hybrid_turnstile_err || '')
-};
-"""
-                )
-                if isinstance(tok, dict):
-                    status = tok.get("status")
-                    val = str(tok.get("tok") or "").strip()
+        if inject_failed_hard:
+            self._lg("[*] skip late CDP clicks after inject hard-fail")
+        else:
+            deadline = time.time() + max(5, min(20, int(timeout or 50)))
+            retry_clicks = 0
+            while time.time() < deadline:
+                try:
+                    st = self._read_hybrid_turnstile_state()
+                    val = str(st.get("tok") or "").strip()
+                    status = str(st.get("status") or "")
                     if len(val) >= 80:
                         self._lg(f"[*] turnstile len={len(val)} status={status}")
                         return val
-                    if status in ("script-fail", "render-fail", "error"):
+                    if status in ("script-fail", "render-fail") and inject:
                         self.inject_turnstile_widget()
-                else:
-                    val = str(tok or "").strip()
-                    if len(val) >= 80:
-                        self._lg(f"[*] turnstile len={len(val)}")
-                        return val
-            except Exception:
-                pass
-            time.sleep(1)
+                    if inject and retry_clicks < 1:
+                        # 只 shadow 一次
+                        try:
+                            from grok_register_ttk import _engine
+
+                            eng = _engine()
+                            fn = getattr(eng, "_try_turnstile_shadow_click_main2", None)
+                            if callable(fn) and fn():
+                                retry_clicks += 1
+                                self._lg("[*] turnstile late shadow-click ok")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                time.sleep(1)
         # 外置 Solver / YesCaptcha 兜底（设置页开关或 env）
         try:
             from turnstile_solver_client import solve_turnstile, solver_enabled, yescaptcha_key
@@ -1667,8 +2702,9 @@ return 'filled-no-button';
                 self._lg(f"[Debug] reopen signup: {e}")
             page = _get_page()
 
-        deadline = time.time() + timeout
+        deadline = time.time() + min(25, int(timeout or 90))  # 协议验码后勿死等 OTP 页
         email_done = code_done = False
+        no_code_force = 0
         while time.time() < deadline:
             try:
                 page = _get_page() or page
@@ -1732,8 +2768,40 @@ return {pw:!!pw, cf:!!cf, email:!!email, code:!!code, given:!!given, url: locati
                         code_done = True
                         time.sleep(2.0)
                         continue
+                    no_code_force += 1
+                    # 协议已 VerifyEmail 时页面常无 OTP；再 force 只会刷屏
+                    if no_code_force >= 2:
+                        # cf 已挂载则视为可求解（不必强行等 profile 表单）
+                        try:
+                            st2 = page.run_js(
+                                """
+return {
+  cf: !!document.querySelector(
+    'input[name="cf-turnstile-response"], div.cf-turnstile, [data-sitekey],'
+    + 'iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]'
+  ),
+  api: typeof turnstile !== 'undefined'
+};
+"""
+                            )
+                        except Exception:
+                            st2 = {}
+                        if isinstance(st2, dict) and (st2.get("cf") or st2.get("api")):
+                            self._lg(
+                                "[!] no OTP UI (protocol verify path) — "
+                                f"Turnstile present cf={st2.get('cf')} api={st2.get('api')}, "
+                                "ready for inject/solve"
+                            )
+                            return True
+                        self._lg(
+                            "[!] no OTP UI (protocol verify path) — "
+                            "skip profile prep, use inject Turnstile"
+                        )
+                        return False
                 except Exception:
-                    pass
+                    no_code_force += 1
+                    if no_code_force >= 2:
+                        return False
 
             if isinstance(state, dict) and not state.get("email") and not state.get("code"):
                 try:
@@ -1746,6 +2814,338 @@ return {pw:!!pw, cf:!!cf, email:!!email, code:!!code, given:!!given, url: locati
         self._lg("[!] profile step timeout")
         return False
 
+    def submit_create_user_server_action(
+        self,
+        *,
+        email: str,
+        code: str,
+        given_name: str,
+        family_name: str,
+        password: str,
+        turnstile_token: str,
+        castle_token: str,
+        next_action: str = "",
+        conversion_id: str = "",
+        timeout: float = 40.0,
+    ) -> dict:
+        """POST CreateUser Server Action from the live page (same cookies/proxy as browser).
+
+        Avoids curl session missing CF cookies / wrong deploy action id binding.
+        Returns {ok, sso, status, text, action}.
+        """
+        from grok_register_ttk import _get_page
+        import uuid as _uuid
+
+        page = _get_page()
+        if page is None:
+            return {"ok": False, "sso": "", "status": 0, "text": "no page", "action": ""}
+        act = str(next_action or self.scrape_next_action() or "").strip()
+        if not act:
+            return {"ok": False, "sso": "", "status": 0, "text": "no action", "action": ""}
+        clean = str(code or "").replace("-", "").strip()
+        conv = str(conversion_id or _uuid.uuid4())
+        payload = [
+            {
+                "emailValidationCode": clean,
+                "createUserAndSessionRequest": {
+                    "email": email,
+                    "givenName": given_name,
+                    "familyName": family_name,
+                    "clearTextPassword": password,
+                    "tosAcceptedVersion": 1,
+                },
+                "turnstileToken": turnstile_token,
+                "conversionId": conv,
+                "castleRequestToken": castle_token,
+            }
+        ]
+        import json as _json
+
+        body = _json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        # scrape router state from page if present
+        try:
+            tree = page.run_js(
+                r"""
+const html = document.documentElement.innerHTML || '';
+// flight payload often embeds f:[[[,"(app)",...sign-up...
+const m = html.match(/"f":\[\[\[[\s\S]{0,800}?sign-up[\s\S]{0,400}?\]\]/);
+if (m) {
+  try { return encodeURIComponent(m[0].slice(5)); } catch (e) {}
+}
+return '';
+"""
+            ) or ""
+        except Exception:
+            tree = ""
+        if not tree:
+            tree = (
+                "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22sign-up%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C16%5D"
+            )
+        expr = f"""
+(async () => {{
+  const action = {act!r};
+  const body = {body!r};
+  const tree = {str(tree)!r};
+  const url = location.href.includes('sign-up')
+    ? location.href
+    : 'https://accounts.x.ai/sign-up?redirect=grok-com';
+  try {{
+    const r = await fetch(url, {{
+      method: 'POST',
+      headers: {{
+        'content-type': 'text/plain;charset=UTF-8',
+        'accept': 'text/x-component',
+        'next-action': action,
+        'Next-Action': action,
+        'next-router-state-tree': tree,
+      }},
+      body: body,
+      credentials: 'include',
+      redirect: 'manual',
+    }});
+    const text = await r.text();
+    const cookie = document.cookie || '';
+    let sso = '';
+    const m = cookie.match(/(?:^|;\\s*)sso=([^;]+)/);
+    if (m) sso = decodeURIComponent(m[1]);
+    if (!sso) {{
+      const m2 = cookie.match(/(?:^|;\\s*)sso-rw=([^;]+)/);
+      if (m2) sso = decodeURIComponent(m2[1]);
+    }}
+    // also scan set-cookie-like JWT in body
+    if (!sso) {{
+      const jm = text.match(/(eyJ[a-zA-Z0-9_-]+\\.[a-zA-Z0-9_-]+\\.[a-zA-Z0-9_-]+)/);
+      if (jm && /session|sso/i.test(text)) sso = jm[1];
+    }}
+    return JSON.stringify({{
+      status: r.status,
+      text: text.slice(0, 1500),
+      sso: sso,
+      action: action,
+      url: url,
+    }});
+  }} catch (e) {{
+    return JSON.stringify({{status: 0, text: String(e), sso: '', action: action}});
+  }}
+}})()
+"""
+        try:
+            res = page.run_cdp(
+                "Runtime.evaluate",
+                expression=expr,
+                awaitPromise=True,
+                returnByValue=True,
+            )
+            raw = (res or {}).get("result", {}).get("value") or "{}"
+            if isinstance(raw, dict):
+                data = raw
+            else:
+                import json as _json2
+
+                data = _json2.loads(str(raw))
+        except Exception as e:
+            self._lg(f"[!] browser server-action: {e}")
+            return {"ok": False, "sso": "", "status": 0, "text": str(e), "action": act}
+        sso = str(data.get("sso") or "")
+        # re-export cookies in case Set-Cookie went to jar
+        if not sso:
+            try:
+                ck = self.export_cookies() or {}
+                sso = str(ck.get("sso") or ck.get("sso-rw") or "")
+            except Exception:
+                pass
+        self._lg(
+            f"[*] browser SA status={data.get('status')} sso_len={len(sso)} "
+            f"action={str(act)[:16]} body={(str(data.get('text') or ''))[:80]!r}"
+        )
+        return {
+            "ok": bool(sso),
+            "sso": sso,
+            "status": int(data.get("status") or 0),
+            "text": str(data.get("text") or "")[:2000],
+            "action": act,
+        }
+
+    def submit_profile_and_wait_sso(
+        self,
+        *,
+        given_name: str,
+        family_name: str,
+        password: str,
+        timeout: float = 45.0,
+    ) -> str:
+        """Fill profile fields + click submit; wait for sso cookie (browser-native Server Action).
+
+        Use when protocol next-action POST returns 200/404 without Set-Cookie sso.
+        """
+        from grok_register_ttk import _get_page
+
+        page = _get_page()
+        if page is None:
+            self._lg("[!] submit_profile: page is None")
+            return ""
+        given_name = str(given_name or "").strip() or "Alex"
+        family_name = str(family_name or "").strip() or "Smith"
+        password = str(password or "").strip()
+        if not password:
+            self._lg("[!] submit_profile: empty password")
+            return ""
+
+        filled = page.run_js(
+            r"""
+const given = arguments[0], family = arguments[1], password = arguments[2];
+function isVisible(n) {
+  if (!n) return false;
+  const s = window.getComputedStyle(n);
+  if (s.display === 'none' || s.visibility === 'hidden') return false;
+  const r = n.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+function setVal(input, value) {
+  if (!input) return false;
+  input.focus();
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+  const tracker = input._valueTracker;
+  if (tracker) { try { tracker.setValue(input.value || ''); } catch (e) {} }
+  if (setter) setter.call(input, value); else input.value = value;
+  const rk = Object.keys(input).find((k) => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+  if (rk && input[rk]) {
+    const p = input[rk];
+    const ev = { target: input, currentTarget: input, bubbles: true };
+    try { if (typeof p.onChange === 'function') p.onChange({ ...ev, type: 'change' }); } catch (e) {}
+    try { if (typeof p.onInput === 'function') p.onInput({ ...ev, type: 'input' }); } catch (e) {}
+  }
+  try {
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  } catch (e) {}
+  return (input.value || '') === value;
+}
+const g = Array.from(document.querySelectorAll(
+  'input[name="givenName"], input[autocomplete="given-name"], input[data-testid="givenName"]'
+)).find(isVisible)
+  || Array.from(document.querySelectorAll('input[type="text"]')).filter(isVisible)[0];
+const f = Array.from(document.querySelectorAll(
+  'input[name="familyName"], input[autocomplete="family-name"], input[data-testid="familyName"]'
+)).find(isVisible)
+  || Array.from(document.querySelectorAll('input[type="text"]')).filter(isVisible)[1];
+const p = Array.from(document.querySelectorAll(
+  'input[type="password"], input[name="password"], input[autocomplete="new-password"]'
+)).find(isVisible);
+const og = setVal(g, given);
+const of = setVal(f, family);
+const op = setVal(p, password);
+return {og, of, op, hasG:!!g, hasF:!!f, hasP:!!p};
+""",
+            given_name,
+            family_name,
+            password,
+        )
+        self._lg(f"[*] profile fill: {filled}")
+
+        # Kick CDN/page castle mint so React CreateUser may bind a fresh token
+        try:
+            self._kick_page_castle_mint(page)
+            time.sleep(0.6)
+        except Exception:
+            pass
+
+        # Prefer submit button (Create account / Sign up / Continue)
+        # Include "Complete sign up" (accounts.x.ai 2026 profile CTA)
+        clicked = ""
+        for label in (
+            "Complete sign up",
+            "Complete Sign up",
+            "Create account",
+            "Create Account",
+            "Sign up",
+            "Sign Up",
+            "Continue",
+            "Submit",
+            "注册",
+            "创建账号",
+            "继续",
+        ):
+            try:
+                el = page.ele(
+                    f"xpath://button[normalize-space(.)='{label}']", timeout=0.4
+                )
+                if el:
+                    try:
+                        el.click(by_js=False)
+                    except Exception:
+                        el.click()
+                    clicked = label
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            try:
+                clicked = page.run_js(
+                    r"""
+function isVisible(n) {
+  if (!n) return false;
+  const s = window.getComputedStyle(n);
+  if (s.display === 'none' || s.visibility === 'hidden') return false;
+  const r = n.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+const deny = /google|apple|github|x\.com|twitter|sign\s*in|log\s*in/i;
+const ok = /complete|create|sign\s*up|continue|submit|注册|创建|继续/i;
+const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]')).filter(isVisible);
+const t = btns.find((b) => {
+  const text = (b.innerText || b.value || b.textContent || '').trim();
+  if (!text || deny.test(text)) return false;
+  return ok.test(text);
+});
+if (t) { t.click(); return (t.innerText || t.value || '').trim().slice(0, 40); }
+return '';
+"""
+                ) or ""
+            except Exception as e:
+                self._lg(f"[!] profile submit js: {e}")
+        self._lg(f"[*] profile submit click={clicked!r}")
+        # Log whether fetch-hook patched CreateUser castle/conversionId
+        try:
+            meta = page.run_js("return window.__hybrid_create_user_meta || null;")
+            if meta:
+                self._lg(f"[*] createUser wire meta: {meta}")
+        except Exception:
+            pass
+
+        deadline = time.time() + max(15.0, float(timeout or 45))
+        while time.time() < deadline:
+            try:
+                cookies = self.export_cookies() or {}
+            except Exception:
+                cookies = {}
+            sso = str(cookies.get("sso") or cookies.get("sso-rw") or "").strip()
+            if sso and len(sso) > 40:
+                self._lg(f"[*] profile submit got sso len={len(sso)}")
+                try:
+                    meta = page.run_js("return window.__hybrid_create_user_meta || null;")
+                    if meta:
+                        self._lg(f"[*] createUser wire meta final: {meta}")
+                except Exception:
+                    pass
+                return sso
+            # also read document.cookie
+            try:
+                page = _get_page() or page
+                js_sso = page.run_js(
+                    r"""
+const m = document.cookie.match(/(?:^|;\s*)sso=([^;]+)/);
+return m ? decodeURIComponent(m[1]) : '';
+"""
+                )
+                if js_sso and len(str(js_sso)) > 40:
+                    self._lg(f"[*] profile submit sso from document.cookie len={len(str(js_sso))}")
+                    return str(js_sso)
+            except Exception:
+                pass
+            time.sleep(0.8)
+        self._lg("[!] profile submit: no sso cookie")
+        return ""
 
 
 def harvest_tokens(
